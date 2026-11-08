@@ -48,6 +48,14 @@ pub async fn answer(state: &AppState, request: &NativeRequest<'_>) -> Result<Opt
         return Ok(Some(radio));
     }
 
+    // The personal playlists overlay: the detail, tracks, moves and additions of
+    // /api/playlist/{id}... Before the safety net, because it reads only query parameters — an
+    // id in the path or the body never reaches it, and a DELETE .../tracks?id=<registry id>
+    // would be swallowed as an empty ok.
+    if let Some(playlist) = super::personal_playlists::answer_native(state, request).await? {
+        return Ok(Some(playlist));
+    }
+
     // Safety net (client-agnostic): any endpoint we don't explicitly handle,
     // called with one of our external ids, would relay to Navidrome and come
     // back "data not found": Navidrome has no such id. Degrade to a graceful
