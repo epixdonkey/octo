@@ -602,14 +602,17 @@ fn ytm_row(id: &str, title: &str, artist: &str, seconds: Option<i32>) -> YtmRow 
     }
 }
 
-/// The interleave carries the rows that match the query to the top (D2): for K3KHA - Lost in
-/// Sound the songs catalog answers other artists' tracks of the same name while the videos
-/// filter has the song itself, and that video leads the answer (PoC-1's measured case).
+/// The query's own rows lead the answer, the video ahead of the song (W3): for K3KHA - Lost in
+/// Sound the videos filter has the upload the query means while the songs catalog answers the
+/// release of the same recording (and other artists' tracks of the same name) — a video and a
+/// song are two different rows, so the video leads and the song follows it (PoC-1's measured
+/// case, re-ruled by the Admiral's order).
 #[test]
-fn the_interleave_carries_the_querys_own_rows_to_the_top() {
+fn the_querys_own_rows_lead_and_the_video_precedes_the_song() {
     let songs = vec![
         ytm_row("jenks111111", "Lost In The Sound", "Jenks (UK)", Some(360)),
         ytm_row("keyeff22222", "Lost in the Sound", "Key Eff", Some(312)),
+        ytm_row("rwqD5PrajEA", "Lost in Sound", "K3KHA", Some(619)),
     ];
     let videos = vec![
         ytm_row("vBvDiLKTDWA", "Lost in Sound", "K3KHA", Some(619)),
@@ -621,15 +624,22 @@ fn the_interleave_carries_the_querys_own_rows_to_the_top() {
         ),
     ];
 
-    let interleaved = interleave_ytm_rows("K3KHA - Lost in Sound", songs, videos);
+    let (exact, rest) = split_ytm_rows("K3KHA - Lost in Sound", songs, videos);
 
-    let ids: Vec<&str> = interleaved.iter().map(|row| row.video_id.as_str()).collect();
-    assert_eq!(ids[0], "vBvDiLKTDWA", "{ids:?}");
+    let exact_ids: Vec<&str> = exact.iter().map(|(row, _)| row.video_id.as_str()).collect();
+    // W3: the upload the query means is the answer, ahead of the release of the same recording.
+    assert_eq!(exact_ids, ["vBvDiLKTDWA", "rwqD5PrajEA"], "{exact_ids:?}");
+    let rest_ids: Vec<&str> = rest.iter().map(|(row, _)| row.video_id.as_str()).collect();
     // The rest keep the interleaved order: songs[i] before videos[i], row by row.
-    assert_eq!(ids[1..], ["jenks111111", "keyeff22222", "R-JnkBpJuNs"], "{ids:?}");
+    assert_eq!(
+        rest_ids,
+        ["jenks111111", "keyeff22222", "R-JnkBpJuNs"],
+        "{rest_ids:?}"
+    );
 }
 
-/// One YouTube-origin row of the dedup: the song as registered, and the video it was minted with.
+/// One YouTube-origin row of the dedup: the song as registered, the video it was minted with,
+/// and the service it came from.
 fn you_tube_row(
     artist: &str,
     title: &str,
@@ -637,62 +647,86 @@ fn you_tube_row(
     isrc: Option<&str>,
     music_brainz: Option<&str>,
     you_tube_id: Option<&str>,
+    origin: RowOrigin,
 ) -> YouTubeSong {
+    let mut song = Song {
+        artist: artist.into(),
+        title: title.into(),
+        duration,
+        isrc: isrc.map(str::to_string),
+        music_brainz_recording_id: music_brainz.map(str::to_string),
+        ..Default::default()
+    };
+    song.suggested_by = Some(origin.label().to_string());
     YouTubeSong {
-        song: Song {
-            artist: artist.into(),
-            title: title.into(),
-            duration,
-            isrc: isrc.map(str::to_string),
-            music_brainz_recording_id: music_brainz.map(str::to_string),
-            ..Default::default()
-        },
+        song,
         you_tube_id: you_tube_id.map(str::to_string),
+        origin,
     }
 }
 
-/// The three-stage dedup folds the duplicates and keeps the versions apart (D3, PoC-1's
-/// outcome): three duplicates of the original fold into one enriched row — the same video, a
-/// shared ISRC, the same key with a close length — and the winner keeps its video and its
-/// length, taking only what it lacks. Six versions stay six rows.
+/// The version-aware dedup folds only what it may (Correction B, re-ruled by the Admiral's
+/// order): the video and the song of the same recording stay two rows — one YouTube Music
+/// upload and one release, the user's choice, not the algorithm's — while the very same video
+/// seen from two services folds into one enriched row and the songs catalog folds its own
+/// duplicates (a shared ISRC, the same key with a close length). The winner keeps its video,
+/// its length and its service's label, taking only what it lacks. Six versions stay six rows.
 #[test]
-fn the_dedup_folds_duplicates_and_keeps_versions_apart() {
+fn the_dedup_folds_only_what_it_may_and_keeps_versions_apart() {
     let rows = vec![
-        // The official video hit, without its MusicBrainz recording yet.
-        you_tube_row(
-            "K3KHA",
-            "Lost in Sound (Original Mix)",
-            Some(619),
-            Some("USK3K2600001"),
-            None,
-            Some("vBvDiLKTDWA"),
-        ),
-        // The same video from the fallback: folds (stage 1) and fills the recording id.
-        you_tube_row(
-            "K3KHA",
-            "K3KHA - Lost in Sound (Original Mix)",
-            Some(619),
-            None,
-            Some("mb-rec-k3kha-orig"),
-            Some("vBvDiLKTDWA"),
-        ),
-        // The catalog's row of the same recording, by ISRC: folds (stage 2).
+        // The videos filter's hit: the upload the query means (W3's row), without its
+        // MusicBrainz recording yet.
         you_tube_row(
             "K3KHA",
             "Lost in Sound",
             Some(619),
             Some("USK3K2600001"),
             None,
-            None,
+            Some("vBvDiLKTDWA"),
+            RowOrigin::Videos,
         ),
-        // The same key, a close length: folds (stage 3).
+        // The songs catalog's release of the same recording: its own row. A video and a song
+        // never merge, whatever the shared ISRC and the equal length say.
         you_tube_row(
             "K3KHA",
-            "Lost in Sound (Original Mix)",
-            Some(625),
+            "Lost in Sound",
+            Some(619),
+            Some("USK3K2600001"),
+            None,
+            Some("rwqD5PrajEA"),
+            RowOrigin::Songs,
+        ),
+        // The same video from the fallback (D11): folds into the video row (the same upload)
+        // and fills the recording it lacked.
+        you_tube_row(
+            "K3KHA",
+            "K3KHA - Lost in Sound",
+            Some(619),
+            None,
+            Some("mb-rec-k3kha-orig"),
+            Some("vBvDiLKTDWA"),
+            RowOrigin::YouTube,
+        ),
+        // The songs catalog's own duplicate by ISRC: folds into the song row (Correction B).
+        you_tube_row(
+            "K3KHA",
+            "Lost in Sound",
+            Some(619),
+            Some("USK3K2600001"),
+            None,
+            Some("atvRelVid007"),
+            RowOrigin::Songs,
+        ),
+        // The songs catalog's own duplicate by key and a close length: folds too, and the
+        // song row keeps the length it arrived with.
+        you_tube_row(
+            "K3KHA",
+            "Lost in Sound",
+            Some(621),
             None,
             None,
-            None,
+            Some("atvRelVid008"),
+            RowOrigin::Songs,
         ),
         // Versions: each keeps its own row.
         you_tube_row(
@@ -702,6 +736,7 @@ fn the_dedup_folds_duplicates_and_keeps_versions_apart() {
             None,
             None,
             Some("extMixVid01"),
+            RowOrigin::Songs,
         ),
         you_tube_row(
             "K3KHA",
@@ -710,6 +745,7 @@ fn the_dedup_folds_duplicates_and_keeps_versions_apart() {
             None,
             None,
             Some("radEditVid2"),
+            RowOrigin::Songs,
         ),
         you_tube_row(
             "K3KHA",
@@ -718,6 +754,7 @@ fn the_dedup_folds_duplicates_and_keeps_versions_apart() {
             None,
             None,
             Some("liveVerVid3"),
+            RowOrigin::Videos,
         ),
         you_tube_row(
             "K3KHA",
@@ -726,6 +763,7 @@ fn the_dedup_folds_duplicates_and_keeps_versions_apart() {
             None,
             None,
             Some("remixVerVd4"),
+            RowOrigin::Songs,
         ),
         you_tube_row(
             "K3KHA",
@@ -734,23 +772,60 @@ fn the_dedup_folds_duplicates_and_keeps_versions_apart() {
             None,
             None,
             Some("R-JnkBpJuNs"),
+            RowOrigin::Videos,
         ),
     ];
 
     let deduped = dedupe_you_tube_songs(rows);
 
+    let ids: Vec<&str> = deduped
+        .iter()
+        .map(|r| r.you_tube_id.as_deref().unwrap_or(""))
+        .collect();
     assert_eq!(
         deduped.len(),
-        6,
+        7,
         "{:?}",
         deduped.iter().map(|r| r.song.title.clone()).collect::<Vec<_>>()
     );
-    // The winner keeps its own video and its own length, and takes the recording it lacked.
-    assert_eq!(deduped[0].you_tube_id.as_deref(), Some("vBvDiLKTDWA"));
+    // The video and the song of the same recording are two rows, the video first, each with
+    // its service's label and its own video.
+    assert_eq!(ids[0], "vBvDiLKTDWA", "{ids:?}");
+    assert_eq!(
+        deduped[0].song.suggested_by.as_deref(),
+        Some("YouTube Music (video)")
+    );
     assert_eq!(deduped[0].song.duration, Some(619));
+    // The fallback's copy of the same video folded in and filled the recording it lacked.
     assert_eq!(
         deduped[0].song.music_brainz_recording_id.as_deref(),
         Some("mb-rec-k3kha-orig")
+    );
+    assert_eq!(ids[1], "rwqD5PrajEA", "{ids:?}");
+    assert_eq!(
+        deduped[1].song.suggested_by.as_deref(),
+        Some("YouTube Music (song)")
+    );
+    assert_eq!(deduped[1].song.duration, Some(619));
+    // The versions stay apart, each with its service's label.
+    assert_eq!(
+        ids[2..],
+        [
+            "extMixVid01",
+            "radEditVid2",
+            "liveVerVid3",
+            "remixVerVd4",
+            "R-JnkBpJuNs"
+        ],
+        "{ids:?}"
+    );
+    assert_eq!(
+        deduped[2].song.suggested_by.as_deref(),
+        Some("YouTube Music (song)")
+    );
+    assert_eq!(
+        deduped[6].song.suggested_by.as_deref(),
+        Some("YouTube Music (video)")
     );
 }
 
@@ -760,16 +835,19 @@ const K3KHA_VIDEOS: &str = r#"{"tracks":[
     {"videoId":"R-JnkBpJuNs","title":"K3KHA – Deep Minimal Techno Set 2025","artists":["K3KHA"],"durationSeconds":3403}
 ]}"#;
 
-/// Without a Last.fm key the search still answers, from YouTube Music alone (D4): the videos
-/// hit the interleave carries to the top is registered with its video and its length, and the
-/// id it goes out under is the one its routing hashes to (W3's case, seed-stable D6/D13).
+/// Without a Last.fm key the search still answers, from YouTube Music alone (D4): the video
+/// hit the query means is registered with its video and its length under the id its routing
+/// hashes to (W3's row, seed-stable D6/D13), and the songs catalog's release of the same
+/// recording answers as its own row beside it — a video and a song never merge, and each row
+/// carries its service's label.
 #[tokio::test]
-async fn a_search_without_a_last_fm_key_answers_from_you_tube_music() {
+async fn a_search_without_a_last_fm_key_answers_video_and_song_as_two_rows() {
     let shim = MockServer::start().await;
     Mock::given(path("/ytm/search"))
         .and(query_param("filter", "songs"))
         .respond_with(ResponseTemplate::new(200).set_body_string(
             r#"{"tracks":[
+                {"videoId":"rwqD5PrajEA","title":"Lost in Sound","artists":["K3KHA"],"durationSeconds":619,"album":"Weightless Orbit","videoType":"MUSIC_VIDEO_TYPE_ATV"},
                 {"videoId":"jenks111111","title":"Lost In The Sound","artists":["Jenks (UK)"],"durationSeconds":360},
                 {"videoId":"keyeff22222","title":"Lost in the Sound","artists":["Key Eff"],"durationSeconds":312}
             ]}"#,
@@ -794,19 +872,94 @@ async fn a_search_without_a_last_fm_key_answers_from_you_tube_music() {
 
     assert_eq!(
         songs.len(),
-        4,
+        5,
         "{:?}",
         songs.iter().map(|s| (&s.artist, &s.title)).collect::<Vec<_>>()
     );
-    assert_eq!(songs[0].artist, "K3KHA");
+    // W3: the video first, the song after it — two rows of one recording, the user's choice.
     assert_eq!(songs[0].title, "Lost in Sound");
     assert_eq!(songs[0].duration, Some(619));
+    assert_eq!(songs[0].suggested_by.as_deref(), Some("YouTube Music (video)"));
+    assert_eq!(songs[1].title, "Lost in Sound");
+    assert_eq!(songs[1].album, "Weightless Orbit");
+    assert_eq!(songs[1].duration, Some(619));
+    assert_eq!(songs[1].suggested_by.as_deref(), Some("YouTube Music (song)"));
+    // The unrelated rows keep the interleaved order behind the query's own.
+    let rest: Vec<&str> = songs[2..].iter().map(|s| s.title.as_str()).collect();
+    assert_eq!(
+        rest,
+        [
+            "Lost In The Sound",
+            "K3KHA – Deep Minimal Techno Set 2025",
+            "Lost in the Sound"
+        ]
+    );
+    // Both rows are registered with their own video and their own length, seed-stable.
+    for (row, video) in [&songs[0], &songs[1]].iter().zip(["vBvDiLKTDWA", "rwqD5PrajEA"]) {
+        let routing = search.id_registry.lookup(&row.id).expect("registered").snapshot();
+        assert_eq!(routing.you_tube_id.as_deref(), Some(video));
+        assert_eq!(routing.duration, Some(619));
+        assert_eq!(ExternalIdRegistry::make_short_id(&routing), row.id);
+    }
+}
+
+/// A query neither the catalogs nor YouTube Music answers with its own row falls back to
+/// plain YouTube (D11): the fallback's hit — a set the catalogs do not have — answers with
+/// YouTube's label, behind the matched rows (there are none, or it would not run) and ahead
+/// of the unrelated ones.
+#[tokio::test]
+async fn a_query_the_catalogs_dont_have_falls_back_to_you_tube_behind_the_matched_rows() {
+    let shim = MockServer::start().await;
+    Mock::given(path("/ytm/search"))
+        .and(query_param("filter", "songs"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"tracks":[
+                {"videoId":"jenks111111","title":"Other Song","artists":["Jenks (UK)"],"durationSeconds":360}
+            ]}"#,
+        ))
+        .mount(&shim)
+        .await;
+    Mock::given(path("/ytm/search"))
+        .and(query_param("filter", "videos"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"tracks":[
+                {"videoId":"unrelVid0001","title":"Another Upload","artists":["Someone"],"durationSeconds":120}
+            ]}"#,
+        ))
+        .mount(&shim)
+        .await;
+    Mock::given(path("/search/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"hits":[{"video_id":"setVid12345","title":"Deep Minimal Set","duration":3403,"channel":"K3KHA"}]}"#,
+        ))
+        .mount(&shim)
+        .await;
+    let search = ExternalSearchService::new(
+        Arc::new(FakeMetadata::default()),
+        None,
+        waiting(false),
+        Arc::new(YouTubeMusicClient::with_shim_url(Some(&shim.uri()))),
+        Arc::new(YouTubeResolver::with_base_url(Some(&shim.uri()))),
+        Arc::new(ExternalIdRegistry::in_memory()),
+    );
+
+    let songs = search.get("K3KHA Deep Minimal Set").await;
+
+    let titles: Vec<&str> = songs.iter().map(|s| s.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        ["Deep Minimal Set", "Other Song", "Another Upload"],
+        "{titles:?}"
+    );
+    assert_eq!(songs[0].suggested_by.as_deref(), Some("YouTube"));
     let routing = search
         .id_registry
         .lookup(&songs[0].id)
         .expect("registered")
         .snapshot();
-    assert_eq!(routing.you_tube_id.as_deref(), Some("vBvDiLKTDWA"));
-    assert_eq!(routing.duration, Some(619));
-    assert_eq!(ExternalIdRegistry::make_short_id(&routing), songs[0].id);
+    assert_eq!(routing.you_tube_id.as_deref(), Some("setVid12345"));
+    assert_eq!(routing.duration, Some(3403));
+    // The unrelated YouTube Music rows keep their own labels behind the fallback's hit.
+    assert_eq!(songs[1].suggested_by.as_deref(), Some("YouTube Music (song)"));
+    assert_eq!(songs[2].suggested_by.as_deref(), Some("YouTube Music (video)"));
 }
