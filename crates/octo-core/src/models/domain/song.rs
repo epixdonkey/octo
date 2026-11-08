@@ -174,8 +174,9 @@ pub struct Song {
     #[serde(skip)]
     pub verification: Option<Box<VerificationResult>>,
 
-    /// Which radio source suggested this song, as the apps show it ("YouTube Music"). Only radio
-    /// answers set it; never stored.
+    /// Which source suggested this song, as the apps show it ("YouTube Music"). Radio answers
+    /// set it, and so does the outside search, which labels each row's origin ("YouTube Music
+    /// (song)", "YouTube Music (video)", "YouTube"). Never stored.
     #[serde(skip)]
     pub suggested_by: Option<String>,
 }
