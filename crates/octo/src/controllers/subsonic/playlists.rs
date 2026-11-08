@@ -1311,7 +1311,7 @@ async fn library_song_json(call: &SubsonicCall, id: &str) -> Option<Value> {
 }
 
 /// An outside song in the shape every outside song has.
-async fn outside_song_json(state: &AppState, id: &str) -> Option<Value> {
+pub(crate) async fn outside_song_json(state: &AppState, id: &str) -> Option<Value> {
     let (external, provider, external_id) = state.local_library.parse_song_id(id);
     if !external {
         return None;

@@ -155,6 +155,7 @@ use crate::services::soulseek::{
     SoulseekStartupValidator,
 };
 use crate::services::spotiflac::SpotiflacClient;
+use crate::services::subsonic::personal_playlist_store::PersonalPlaylistStore;
 use crate::services::subsonic::{
     CredentialCheck, NavidromeIdentityService, RecentScrobbles, RequestIdentity, SearchSongOrderCache,
     SubsonicDiscoveryService, SubsonicProxyService, SyncCatalogService,
@@ -548,6 +549,9 @@ pub struct AppInner {
     pub family_saved: Arc<SavedStore>,
     /// `family-playlists.json`: playlists every member can add to.
     pub family_playlists: Arc<FamilyPlaylistStore>,
+    /// `personal-playlists.json`: the owner's mixed personal playlists, each position keeping
+    /// both of its sources at once (D5).
+    pub personal_playlists: Arc<PersonalPlaylistStore>,
     /// Where family playlist additions that wait for approval are reported.
     pub family_playlist_requests: crate::services::family::family_playlists::PlaylistAddHook,
     /// `family-pool.json`: the one copy of each member download and who links it.
@@ -1348,6 +1352,7 @@ struct Stores {
     family_requests: Arc<RequestStore>,
     family_saved: Arc<SavedStore>,
     family_playlists: Arc<FamilyPlaylistStore>,
+    personal_playlists: Arc<PersonalPlaylistStore>,
     family_pool: Arc<FamilyPoolStore>,
     listening: Arc<crate::services::listening::ListeningLog>,
 }
@@ -1471,6 +1476,9 @@ impl Stores {
             family_saved: Arc::new(SavedStore::new(Some(config_dir.join("family-saved.json")))),
             family_playlists: Arc::new(FamilyPlaylistStore::new(Some(
                 config_dir.join("family-playlists.json"),
+            ))),
+            personal_playlists: Arc::new(PersonalPlaylistStore::new(Some(
+                config_dir.join("personal-playlists.json"),
             ))),
             family_pool: Arc::new(FamilyPoolStore::new(Some(config_dir.join("family-pool.json")))),
             listening: Arc::new(crate::services::listening::ListeningLog::new(
@@ -3366,6 +3374,7 @@ impl AppState {
             family_requests: stores.family_requests,
             family_saved: stores.family_saved,
             family_playlists: stores.family_playlists,
+            personal_playlists: stores.personal_playlists,
             family_playlist_requests: Default::default(),
             family_pool: stores.family_pool,
             listening: stores.listening,
@@ -3808,6 +3817,7 @@ impl AppState {
             family_requests: stores.family_requests,
             family_saved: stores.family_saved,
             family_playlists: stores.family_playlists,
+            personal_playlists: stores.personal_playlists,
             family_playlist_requests: Default::default(),
             family_pool: stores.family_pool,
             listening: stores.listening,
