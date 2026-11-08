@@ -163,6 +163,9 @@ impl YouTubeResolver {
     /// Rows one YouTube Music lookup asks for.
     pub const MUSIC_ROWS: i32 = 5;
 
+    /// Hits the multi-hit fallback asks the shim for (its `/search/list` ceiling is ten).
+    pub const SEARCH_MANY_LIMIT: usize = 5;
+
     /// YouTube Music lookups sent to the shim at once.
     pub const MUSIC_AT_ONCE: usize = 3;
 
@@ -346,6 +349,36 @@ impl YouTubeResolver {
             } else {
                 Failure::Other
             })
+        })
+    }
+
+    /// The multi-hit search behind the discovery fallback: the shim's `/search/list`, a flat
+    /// `ytsearch{limit}` playlist with no URL resolution and no length ranking of its own (the
+    /// caller ranks, in the version-aware dedup, D11). At most ten hits (the shim's ceiling).
+    /// A query that is blank, an unreachable shim, a busy answer (503 `{"error":"busy"}`) or
+    /// any other failure is no hits, never an error: the caller's search still answers from its
+    /// other sources (degradation, not panic).
+    pub async fn search_many(&self, query: &str, limit: usize) -> Vec<YouTubeHit> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        let limit = limit.clamp(1, 10);
+        let url = format!("{}/search/list?q={}&limit={limit}", self.base_url, escape(query));
+        let outcome: anyhow::Result<Vec<YouTubeHit>> = async {
+            let resp = self.search_client.get(&url).send().await?;
+            let status = resp.status();
+            let body = resp.text().await?;
+            if !status.is_success() {
+                debug!("shim /search/list HTTP {} for '{query}'", status.as_u16());
+                return Ok(Vec::new());
+            }
+            let root: Value = serde_json::from_str(&body)?;
+            search_list_hits(&root)
+        }
+        .await;
+        outcome.unwrap_or_else(|e| {
+            debug!("shim /search/list failed for '{query}': {e}");
+            Vec::new()
         })
     }
 
@@ -829,6 +862,20 @@ fn parse_hit(root: &Value, with_channel: bool) -> anyhow::Result<Option<YouTubeH
         stream: parse_stream(root),
         pick,
     }))
+}
+
+/// The hits in a `/search/list` answer: its `hits` array, each read as a `/search` hit is (a
+/// row without a video id is no hit); an answer without the array is no hits.
+fn search_list_hits(root: &Value) -> anyhow::Result<Vec<YouTubeHit>> {
+    let Some(Value::Array(list)) = root.get("hits") else {
+        return Ok(Vec::new());
+    };
+    list.iter()
+        .filter_map(|hit| match parse_hit(hit, true) {
+            Ok(hit) => hit.map(Ok),
+            Err(e) => Some(Err(e)),
+        })
+        .collect()
 }
 
 /// The stream facts in a /search or /facts answer (`size`, `itag`, `ext`, `abr`, and, once a play
