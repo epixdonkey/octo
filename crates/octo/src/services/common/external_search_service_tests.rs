@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::FutureExt;
+use octo_core::radio::radio_provider;
 use octo_core::settings::{AppSettings, LastFmSettings, SubsonicSettings};
 use tokio::sync::watch;
 use wiremock::matchers::{any, path, query_param};
@@ -900,6 +901,257 @@ async fn a_search_without_a_last_fm_key_answers_video_and_song_as_two_rows() {
         assert_eq!(routing.you_tube_id.as_deref(), Some(video));
         assert_eq!(routing.duration, Some(619));
         assert_eq!(ExternalIdRegistry::make_short_id(&routing), row.id);
+    }
+}
+
+/// A catalog pair covered ONLY by a video row keeps its place in the answer (the Admiral's
+/// order, review-2's elephant 6): the videos filter has the upload of the query's own
+/// recording while the songs catalog answers nothing of it, and the catalog's own row of that
+/// recording stays beside the video row — a video row (or a plain YouTube hit) covers no
+/// catalog twin, so nothing is removed. The fallback does not run (a source matched), so no
+/// row of it appears either.
+#[tokio::test]
+async fn a_catalog_pair_covered_only_by_a_video_row_keeps_its_place_in_the_answer() {
+    let (last_fm, _server) = last_fm_with_catalog_pair().await;
+    let shim = MockServer::start().await;
+    Mock::given(path("/ytm/search"))
+        .and(query_param("filter", "songs"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"tracks":[
+                {"videoId":"jenks111111","title":"Lost In The Sound","artists":["Jenks (UK)"],"durationSeconds":360}
+            ]}"#,
+        ))
+        .mount(&shim)
+        .await;
+    Mock::given(path("/ytm/search"))
+        .and(query_param("filter", "videos"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"tracks":[
+                {"videoId":"vBvDiLKTDWA","title":"Lost in Sound","artists":["K3KHA"],"durationSeconds":619},
+                {"videoId":"R-JnkBpJuNs","title":"K3KHA – Deep Minimal Techno Set 2025","artists":["K3KHA"],"durationSeconds":3403}
+            ]}"#,
+        ))
+        .mount(&shim)
+        .await;
+    // The fallback is answered for (its hit would be a third row of the same recording) so
+    // the test says it is never ASKED to speak while a source has matched.
+    Mock::given(path("/search/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"hits":[{"video_id":"fbVid0000001","title":"K3KHA Lost in Sound","duration":619,"channel":"K3KHA"}]}"#,
+        ))
+        .mount(&shim)
+        .await;
+    let metadata = Arc::new(FakeMetadata::default());
+    metadata.hits.lock().insert(
+        ("K3KHA".into(), "Lost in Sound".into()),
+        Song {
+            artist: "K3KHA".into(),
+            title: "Lost in Sound".into(),
+            album: String::new(),
+            is_local: false,
+            ..Default::default()
+        },
+    );
+    let search = ExternalSearchService::new(
+        metadata,
+        Some(last_fm),
+        waiting(false),
+        Arc::new(YouTubeMusicClient::with_shim_url(Some(&shim.uri()))),
+        Arc::new(YouTubeResolver::with_base_url(Some(&shim.uri()))),
+        Arc::new(ExternalIdRegistry::in_memory()),
+    );
+
+    let songs = search.get("K3KHA - Lost in Sound").await;
+
+    // The catalog pair's own row and the video row, side by side: the answer keeps both, and
+    // the unrelated rows behind them.
+    assert_eq!(
+        songs.len(),
+        4,
+        "{:?}",
+        songs
+            .iter()
+            .map(|s| (&s.title, &s.suggested_by))
+            .collect::<Vec<_>>()
+    );
+    let lost: Vec<&Song> = songs.iter().filter(|s| s.title == "Lost in Sound").collect();
+    assert_eq!(
+        lost.len(),
+        2,
+        "{:?}",
+        songs.iter().map(|s| &s.title).collect::<Vec<_>>()
+    );
+    // The catalog row: the pair's own row, minted a placeholder with no length of its own —
+    // and no service label (the label is the YouTube half's alone).
+    let catalog = lost
+        .iter()
+        .find(|s| s.suggested_by.is_none())
+        .expect("the catalog row carries no service label");
+    assert_eq!(catalog.duration, None);
+    // The video row beside it: its own upload and length, the videos filter's label.
+    let video = lost
+        .iter()
+        .find(|s| s.suggested_by.as_deref() == Some("YouTube Music (video)"))
+        .expect("the video row is labeled");
+    assert_eq!(video.duration, Some(619));
+    let video_routing = search
+        .id_registry
+        .lookup(&video.id)
+        .expect("registered")
+        .snapshot();
+    assert_eq!(video_routing.you_tube_id.as_deref(), Some("vBvDiLKTDWA"));
+    assert_eq!(video_routing.duration, Some(619));
+    // The fallback never ran: its hit is nowhere in the answer.
+    assert!(
+        songs.iter().all(|s| s.suggested_by.as_deref() != Some("YouTube")),
+        "the fallback answered nothing while a source had matched: {:?}",
+        songs.iter().map(|s| &s.suggested_by).collect::<Vec<_>>()
+    );
+}
+
+/// Last.fm answering one track.search row — the catalog pair of the query's own recording —
+/// and no top tracks.
+async fn last_fm_with_catalog_pair() -> (Arc<LastFmService>, MockServer) {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(move |request: &Request| {
+            let body = if request.url.to_string().contains("method=track.search") {
+                r#"{"results":{"trackmatches":{"track":[{"name":"Lost in Sound","artist":"K3KHA"}]}}}"#
+                    .to_string()
+            } else {
+                r#"{"toptracks":{"track":[]}}"#.to_string()
+            };
+            ResponseTemplate::new(200).set_body_string(body)
+        })
+        .mount(&server)
+        .await;
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+        last_fm: LastFmSettings {
+            api_key: "key".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    (
+        Arc::new(LastFmService::with_base_url(
+            settings,
+            &format!("{}/", server.uri()),
+        )),
+        server,
+    )
+}
+
+/// A shim that cannot answer leaves the catalogs' answer standing (the degradation edge): a
+/// busy YouTube Music (503 `{"error":"busy"}`) and a failed fallback (502) are no rows from
+/// either, never a failure — the answer is the catalog's alone, with no service label on it
+/// and no video minted.
+#[tokio::test]
+async fn a_shim_that_cannot_answer_leaves_the_catalogs_answer_standing() {
+    let (last_fm, _server) = one_hit_last_fm().await;
+    let shim = MockServer::start().await;
+    Mock::given(path("/ytm/search"))
+        .respond_with(ResponseTemplate::new(503).set_body_string(r#"{"error":"busy"}"#))
+        .mount(&shim)
+        .await;
+    Mock::given(path("/search/list"))
+        .respond_with(ResponseTemplate::new(502).set_body_string(r#"{"error":"search_failed"}"#))
+        .mount(&shim)
+        .await;
+    let search = ExternalSearchService::new(
+        one_song_metadata(),
+        Some(last_fm),
+        waiting(false),
+        Arc::new(YouTubeMusicClient::with_shim_url(Some(&shim.uri()))),
+        Arc::new(YouTubeResolver::with_base_url(Some(&shim.uri()))),
+        Arc::new(ExternalIdRegistry::in_memory()),
+    );
+
+    let songs = search.get("song").await;
+
+    // The catalog's row answers; the YouTube half contributed nothing to label.
+    assert_eq!(
+        songs.len(),
+        1,
+        "{:?}",
+        songs.iter().map(|s| &s.title).collect::<Vec<_>>()
+    );
+    assert_eq!(songs[0].title, "Song");
+    assert_eq!(songs[0].suggested_by, None);
+    assert!(
+        songs.iter().all(|s| s.suggested_by.is_none()),
+        "no row carries a service label: {:?}",
+        songs.iter().map(|s| &s.suggested_by).collect::<Vec<_>>()
+    );
+}
+
+/// The rows a search folds keep what they lack from the row folded in: a songs-catalog
+/// duplicate that arrives with the album fills the winner's blank one, and nothing the winner
+/// already had is replaced ("wzbogaca, nic nie znika").
+#[test]
+fn the_dedup_fills_a_blank_album_from_the_row_it_folds() {
+    let blank = you_tube_row(
+        "K3KHA",
+        "Lost in Sound",
+        Some(619),
+        Some("USK3K2600001"),
+        None,
+        Some("vidNoAlbum1"),
+        RowOrigin::Songs,
+    );
+    let with_album = YouTubeSong {
+        song: Song {
+            artist: "K3KHA".into(),
+            title: "Lost in Sound".into(),
+            album: "Weightless Orbit".into(),
+            duration: Some(621),
+            ..Default::default()
+        },
+        you_tube_id: Some("atvRelVid009".into()),
+        origin: RowOrigin::Songs,
+    };
+
+    let deduped = dedupe_you_tube_songs(vec![blank, with_album]);
+
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].song.album, "Weightless Orbit");
+    // What the winner already had stays its own.
+    assert_eq!(deduped[0].you_tube_id.as_deref(), Some("vidNoAlbum1"));
+    assert_eq!(deduped[0].song.duration, Some(619));
+}
+
+/// The discovery labels never read as a radio provider's name: the radio paths that read a
+/// row's `suggested_by` back (`from_display_name`) must not mistake a YouTube Music song,
+/// a YouTube Music video or a plain YouTube hit for the radio's "YouTube Music" source.
+#[test]
+fn the_discovery_labels_are_not_radio_provider_names() {
+    for label in [
+        RowOrigin::Songs.label(),
+        RowOrigin::Videos.label(),
+        RowOrigin::YouTube.label(),
+    ] {
+        assert!(
+            radio_provider::from_display_name(Some(label)).is_none(),
+            "'{label}' must not name a radio provider"
+        );
+    }
+    // And the radio's own YouTube Music name is none of the discovery labels, so the two
+    // vocabularies stay apart in both directions.
+    let radio_names = [
+        "Last.fm",
+        "YouTube Music",
+        "ListenBrainz",
+        "Sounds alike",
+        "Your library",
+    ];
+    for label in [
+        RowOrigin::Songs.label(),
+        RowOrigin::Videos.label(),
+        RowOrigin::YouTube.label(),
+    ] {
+        assert!(
+            !radio_names.contains(&label),
+            "'{label}' collides with a radio name"
+        );
     }
 }
 

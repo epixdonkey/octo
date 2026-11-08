@@ -2246,3 +2246,44 @@ async fn a_row_minted_with_a_video_keeps_it_through_enrichment_and_the_durations
     assert_eq!(routing.duration, Some(619));
     assert_eq!(h.calls("ytm/search?q=k3kha"), 0);
 }
+
+/// The foreground durations pass never replaces a row's pinned video (D13): a row minted
+/// with its upload keeps it even when the shim WOULD answer with another video of the song
+/// — `keep_video` has no `pin_video(.., replace = true)` to reach for it, and the shim is
+/// not even asked. The asking itself is the bug this pins down: the guard sits before the
+/// pass's targets, so a wrongly targeted pinned row would come back with the other video.
+#[tokio::test]
+async fn the_foreground_durations_pass_never_replaces_a_pinned_video() {
+    // YouTube Music would answer the song's lookup with a different upload, close enough in
+    // length to be the pick the pass wants.
+    let h = build_service(vec![(
+        "ytm/search?q=k3kha%20lost%20in%20sound",
+        r#"{"tracks":[{"videoId":"otherVid9999","title":"Lost in Sound","artists":["K3KHA"],
+            "durationSeconds":620,"videoType":"MUSIC_VIDEO_TYPE_ATV"}]}"#,
+    )])
+    .await;
+    let (pinned, routing) = song_and_routing(&you_tube_music_row(
+        "vBvDiLKTDWA",
+        "Lost in Sound",
+        "K3KHA",
+        Some(619),
+    ));
+    let pinned = register_you_tube_row(&h.registry, (pinned, routing));
+    let mut songs = vec![pinned];
+
+    let still_running = h
+        .service
+        .resolve_top_durations_within(&mut songs, Duration::from_millis(500))
+        .await;
+    if let Some(pass) = still_running {
+        let _ = pass.await;
+    }
+
+    // The pinned video stands, with the length it arrived with, and the shim was never
+    // asked about the row's song.
+    let routing = h.lookup(&songs[0].id);
+    assert_eq!(routing.you_tube_id.as_deref(), Some("vBvDiLKTDWA"));
+    assert_eq!(routing.duration, Some(619));
+    assert_eq!(songs[0].duration, Some(619));
+    assert_eq!(h.calls("ytm/search?q=K3KHA%20Lost"), 0);
+}

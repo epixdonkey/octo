@@ -928,3 +928,7 @@ fn sanitize(text: &str) -> String {
         text.replace(['/', '\\'], "_")
     }
 }
+
+#[cfg(test)]
+#[path = "native_tests.rs"]
+mod tests;

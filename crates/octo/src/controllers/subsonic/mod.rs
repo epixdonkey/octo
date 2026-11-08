@@ -37,6 +37,8 @@ mod test_app;
 #[cfg(test)]
 mod cover_cache_tests;
 #[cfg(test)]
+mod discovery_search_tests;
+#[cfg(test)]
 mod extensions_tests;
 #[cfg(test)]
 mod family_lists_tests;
