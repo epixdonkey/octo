@@ -15,6 +15,11 @@ Endpoints:
       With a hint it picks the closest-length of several flat candidates
       (cheap, no per-video extraction), then resolves the winner's URL.
 
+  GET /search/list?q=<query>[&limit=<1..10>]
+      The multi-hit variant for Octo's discovery fallback: a flat-playlist
+      ytsearch returning {"hits": [{video_id, title, duration, channel}]},
+      no URL resolution and no ranking (the caller ranks).
+
   GET /facts?id=<videoId>
       The stream /stream would send for a video: format id (itag), exact
       size in bytes, container and bit rate. /search carries the same fields
@@ -237,6 +242,42 @@ def _run_with_client(args: list[str], label: str, bg: bool, timeout: int = 15) -
     if not client or (out and stream_info.split_run(out)[2]):
         return out
     fallback = _run(args, timeout=timeout, label=f"{label}-default", bg=bg)
+    if fallback and stream_info.split_run(fallback)[2]:
+        log.warning("player client %s gave no URL where yt-dlp's own did; leaving it out for %ds",
+                    _PLAYER_CLIENT, _PLAYER_CLIENT_REST_SEC)
+        _PLAYER_CLIENT_RESTING_UNTIL = time.time() + _PLAYER_CLIENT_REST_SEC
+    return fallback or out
+
+
+# The fast profile's skip segments, for stream resolves only (D7): the webpage, its configs and
+# initial data, translated subtitles and DASH formats are nothing a resolve needs, and skipping
+# them cuts the time to the URL. Kept in ONE --extractor-args together with the player client,
+# because a second --extractor-args on the command line would overwrite the client choice.
+_FAST_SKIP_ARGS = "player_skip=webpage,configs,initial_data;skip=translated_subs,dash"
+
+
+def _fast_args() -> list[str]:
+    """The stream-resolve run's --extractor-args: the skips always, the player client while it
+    is not resting, in one argument (_client_args' pattern)."""
+    if not _PLAYER_CLIENT or time.time() < _PLAYER_CLIENT_RESTING_UNTIL:
+        return ["--extractor-args", f"youtube:{_FAST_SKIP_ARGS}"]
+    return ["--extractor-args", f"youtube:player_client={_PLAYER_CLIENT};{_FAST_SKIP_ARGS}"]
+
+
+def _run_fast(args: list[str], label: str, bg: bool, timeout: int = 15) -> Optional[str]:
+    """A format-selecting run on the fast profile — stream resolves only. The replacement run
+    after the client gives no URL keeps the skip segments alone (_run_with_client's fallback
+    pattern); nothing but /stream's resolve ever runs on this profile, and the ytsearch* runs
+    keep their own, unchanged shape."""
+    global _PLAYER_CLIENT_RESTING_UNTIL
+    client_in = bool(_PLAYER_CLIENT) and time.time() >= _PLAYER_CLIENT_RESTING_UNTIL
+    out = _run([*_fast_args(), *args], timeout=timeout, label=label, bg=bg)
+    if not client_in or (out and stream_info.split_run(out)[2]):
+        return out
+    fallback = _run(
+        ["--extractor-args", f"youtube:{_FAST_SKIP_ARGS}", *args],
+        timeout=timeout, label=f"{label}-default", bg=bg,
+    )
     if fallback and stream_info.split_run(fallback)[2]:
         log.warning("player client %s gave no URL where yt-dlp's own did; leaving it out for %ds",
                     _PLAYER_CLIENT, _PLAYER_CLIENT_REST_SEC)
@@ -820,6 +861,38 @@ def meta():
     return jsonify(**payload, rank=_RANK)
 
 
+@app.get("/search/list")
+def search_list():
+    """Multi-hit search for Octo's discovery fallback (D11): a flat-playlist
+    `ytsearch{limit}` run, NO url resolution, NO length ranking of its own (the caller ranks,
+    in its version-aware dedup) and no cache. A blank `q` is a 400; a failed yt-dlp run is a
+    502; no hits is an empty list."""
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify(error="missing q"), 400
+    limit = _arg_int("limit", 5, 1, 10)
+    out = _run(
+        [f"ytsearch{limit}:{q}", "--flat-playlist", "--print", "%(.{id,title,duration,channel})j"],
+        timeout=20,
+        label="search-list",
+        bg=_is_bg(),
+    )
+    if out is None:
+        return jsonify(error="search_failed"), 502
+    hits = []
+    for ln in out.strip().split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            data = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if data.get("id"):
+            hits.append(_payload_from(data))
+    return jsonify(hits=hits)
+
+
 def _resolve_url(video_id: str, bg: bool = False) -> Optional[str]:
     cached = _url_cache_get(video_id)
     if cached:
@@ -845,8 +918,10 @@ def _resolve_url(video_id: str, bg: bool = False) -> Optional[str]:
         cached = _url_cache_get(video_id)
         if cached:
             return cached
-        # The same URL `-g` printed, plus the picked format's facts from the same run.
-        out = _run_with_client(
+        # The same URL `-g` printed, plus the picked format's facts from the same run. On the
+        # fast profile (D7): the resolve needs neither the webpage nor translated subtitles, and
+        # its skips cut the time to the URL.
+        out = _run_fast(
             [
                 "-f", _AUDIO_FORMAT,
                 "--print", stream_info.FORMAT_PRINT,
