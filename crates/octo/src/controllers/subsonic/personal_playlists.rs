@@ -148,13 +148,7 @@ fn routing_song(routing: &SoulseekRouting) -> octo_core::models::domain::Song {
 /// Navidrome with Octo's admin sign-in, so a native-mode client (which signs in with a header)
 /// keeps its local positions described too.
 async fn read_library_song(state: &AppState, id: &str) -> Option<octo_core::models::domain::Song> {
-    let row = read_library_song_row(
-        state,
-        &state.subsonic_proxy,
-        &auth_of(state, &Parameters::new()),
-        id,
-    )
-    .await?;
+    let row = read_library_song_row(&state.subsonic_proxy, &auth_of(state, &Parameters::new()), id).await?;
     Some(octo_core::models::domain::Song {
         id: row
             .get("id")
@@ -188,7 +182,6 @@ async fn read_library_song(state: &AppState, id: &str) -> Option<octo_core::mode
 /// One library song's Subsonic row, read through `proxy` with `auth`: the caller's own sign-in
 /// when the request carries one, else the admin's.
 async fn read_library_song_row(
-    state: &AppState,
     proxy: &crate::services::subsonic::SubsonicProxyService,
     auth: &[(String, String)],
     id: &str,
@@ -459,7 +452,7 @@ pub(crate) async fn rest_get_playlist(state: &AppState, call: &SubsonicCall, id:
     let mut outside_ids: Vec<String> = Vec::new();
     for entry in &playlist.entries {
         let song = match &entry.library_id {
-            Some(library) => match read_library_song_row(state, &call.proxy, &auth, library).await {
+            Some(library) => match read_library_song_row(&call.proxy, &auth, library).await {
                 Some(song) => Some(song),
                 None => match &entry.outside_id {
                     Some(outside) => outside_song_json(state, outside).await,
