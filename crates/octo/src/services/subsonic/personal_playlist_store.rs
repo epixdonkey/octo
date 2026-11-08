@@ -101,20 +101,20 @@ impl PersonalPlaylist {
         }
     }
 
-    /// The display comment, with the `#folder:` tag first (D9's third carrier).
+    /// The display comment, with the `#folder:` tag first (D9's third carrier). The tag keeps
+    /// the folder as it is stored (`#folder:Techno/Peak Time`), while the name's prefix spells
+    /// it out with ` / `.
     pub fn display_comment(&self) -> String {
-        match self.display_folder() {
-            Some(folder) => {
-                let tag = Self::folder_tag(&folder);
-                if self.comment.contains(&tag) {
-                    self.comment.clone()
-                } else if self.comment.is_empty() {
-                    tag
-                } else {
-                    format!("{} {tag}", self.comment)
-                }
-            }
-            None => self.comment.clone(),
+        let Some(folder) = self.folder.as_deref().map(str::trim).filter(|f| !f.is_empty()) else {
+            return self.comment.clone();
+        };
+        let tag = Self::folder_tag(folder);
+        if self.comment.contains(&tag) {
+            self.comment.clone()
+        } else if self.comment.is_empty() {
+            tag
+        } else {
+            format!("{} {tag}", self.comment)
         }
     }
 
@@ -189,7 +189,10 @@ pub enum ServeSource {
     /// The library's song, by its Navidrome id, with the outside id as the fallback.
     Library { id: String, outside: Option<String> },
     /// The outside version, by the registry's short id and the video it pinned.
-    Outside { outside_id: String, you_tube_id: Option<String> },
+    Outside {
+        outside_id: String,
+        you_tube_id: Option<String>,
+    },
 }
 
 /// The routing that minted `outside_id`, found by playing the candidates back against the
@@ -255,9 +258,7 @@ impl PersonalPlaylistStore {
 
     fn save(&self) {
         let path = self.path.as_deref();
-        store_file::save_with(path, &self.save_lock, || {
-            self.playlists.lock().clone()
-        });
+        store_file::save_with(path, &self.save_lock, || self.playlists.lock().clone());
     }
 
     /// Whether the playlist with Navidrome's own `id` is one of ours.
