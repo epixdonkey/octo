@@ -48,7 +48,7 @@ pub struct PersonalPlaylistEntry {
 }
 
 /// One personal playlist, on its real Navidrome id.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct PersonalPlaylist {
     /// Navidrome's own playlist id, unmodified: prefixing it would break clients (Fakt A1).
@@ -70,21 +70,6 @@ pub struct PersonalPlaylist {
     pub entries: Vec<PersonalPlaylistEntry>,
     #[serde(with = "octo_core::json::datetime::utc")]
     pub changed: DateTime<Utc>,
-}
-
-impl Default for PersonalPlaylist {
-    fn default() -> Self {
-        PersonalPlaylist {
-            id: String::new(),
-            owner: String::new(),
-            name: String::new(),
-            comment: String::new(),
-            public: false,
-            folder: None,
-            entries: Vec::new(),
-            changed: DateTime::<Utc>::default(),
-        }
-    }
 }
 
 impl PersonalPlaylist {

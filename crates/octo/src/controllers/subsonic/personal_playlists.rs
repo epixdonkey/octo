@@ -963,7 +963,7 @@ fn native_tracks(state: &AppState, playlist: &PersonalPlaylist) -> Response {
     }
     state.radio_queues.register(outside_ids.iter().cloned());
     let body = serde_json::to_vec(&rows).unwrap_or_default();
-    let mut response = SubsonicReply::file(body.into(), "application/json").into_response();
+    let mut response = SubsonicReply::file(body, "application/json").into_response();
     response.headers_mut().insert(
         HeaderName::from_static("x-total-count"),
         HeaderValue::from(rows.len()),
@@ -973,18 +973,18 @@ fn native_tracks(state: &AppState, playlist: &PersonalPlaylist) -> Response {
 
 fn native_ok(body: Value) -> Response {
     let body = serde_json::to_vec(&body).unwrap_or_default();
-    SubsonicReply::file(body.into(), "application/json").into_response()
+    SubsonicReply::file(body, "application/json").into_response()
 }
 
 fn native_error(status: StatusCode, message: &str) -> Response {
     let body = serde_json::to_vec(&json!({ "error": message })).unwrap_or_default();
-    let mut response = SubsonicReply::file(body.into(), "application/json").into_response();
+    let mut response = SubsonicReply::file(body, "application/json").into_response();
     *response.status_mut() = status;
     response
 }
 
 fn native_status(status: u16, body: &[u8]) -> Response {
-    let mut response = SubsonicReply::file(body.to_vec().into(), "application/json").into_response();
+    let mut response = SubsonicReply::file(body.to_vec(), "application/json").into_response();
     *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     response
 }
