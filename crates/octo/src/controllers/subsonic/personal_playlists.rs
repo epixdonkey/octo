@@ -866,14 +866,19 @@ pub(crate) async fn answer_native(
     let known = state.personal_playlists.knows(id);
     let body = native_body(request);
     let ids = native_ids(&body);
+    let track_ids = native_track_ids(&body);
     let is_get = request.method == axum::http::Method::GET;
     if !known && is_get {
         return Ok(None);
     }
-    if !known
-        && !ids.iter().any(|id| state.local_library.parse_song_id(id).0)
-        && body.as_ref().and_then(|body| body.get("tracks")).is_none()
-    {
+    // The gate is the create's own, symmetric: the overlay takes a plain playlist over only
+    // when the body really carries a registry id — the one thing Navidrome would refuse whole
+    // (Fakt A1). A purely local body, a `tracks` row list or not, is an ordinary edit:
+    // Navidrome's own to do, a faithful passthrough — so the 403 of an unreachable adoption
+    // never stands between a client and an edit Navidrome could have made.
+    let mut carried = ids.iter().chain(track_ids.iter());
+    let carries_a_registry_id = carried.any(|id| state.local_library.parse_song_id(id).0);
+    if !known && !carries_a_registry_id {
         return Ok(None);
     }
     let mut playlist = if known {
@@ -1015,7 +1020,8 @@ pub(crate) async fn answer_native(
                 .and_then(Value::as_bool);
             let asks_to_download = comment.as_deref().is_some_and(comment_asks_to_download);
             // A `tracks` row list is a whole-list replacement — even an empty one clears the
-            // playlist — so the presence of the key is the gate, not the ids it carried.
+            // playlist — so the key's presence decides the replacement; the adoption gate above
+            // already settled whether the overlay handles this playlist at all.
             let replaces = body
                 .as_ref()
                 .and_then(|body| body.get("tracks"))
@@ -1023,9 +1029,8 @@ pub(crate) async fn answer_native(
                 .is_some();
             apply_metadata(&mut playlist, name.as_deref(), comment.as_deref(), public);
             if replaces {
-                let media = native_track_ids(&body);
                 playlist.entries.clear();
-                playlist.entries.extend(entries_for(state, &media).await);
+                playlist.entries.extend(entries_for(state, &track_ids).await);
             }
             playlist.changed = chrono::Utc::now();
             let owner = playlist.owner.clone();

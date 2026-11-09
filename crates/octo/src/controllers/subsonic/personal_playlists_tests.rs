@@ -3,9 +3,10 @@
 
 use axum::body::Body;
 use axum::http::{Method, StatusCode};
-use octo_core::settings::{AppSettings, SoulseekSettings};
+use octo_core::settings::{AppSettings, SoulseekSettings, SubsonicSettings};
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
-use wiremock::matchers::{any, path};
+use serde_json::json;
+use wiremock::matchers::{any, method, path};
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
 use crate::app::AppState;
@@ -14,6 +15,10 @@ use crate::http::pipeline::App;
 
 /// The real id Navidrome hands back for an empty create.
 const NEW_PLAYLIST: &str = "nd-mix";
+
+/// A plain playlist only Navidrome holds (never the overlay's), standing in its native list
+/// with one local track — what adoption reads.
+const PLAIN_PLAYLIST: &str = "nd-other";
 
 /// Navidrome for these tests: the token "good" signs in, a `getSong` answers one library song,
 /// and an empty `createPlaylist` (no playlist id — the am-yy move that asks for the real id)
@@ -71,6 +76,65 @@ impl PersonalApp {
             state,
             navidrome,
         }
+    }
+
+    /// The app as above, with the service API's own admin identity (what adoption reads
+    /// Navidrome's native rows by) and `PLAIN_PLAYLIST` standing in the native list with one
+    /// local track: here adoption has everything it needs, so a body carrying a registry id can
+    /// take the playlist over.
+    async fn new_with_a_plain_playlist() -> PersonalApp {
+        let navidrome = MockServer::builder().start().await;
+        Mock::given(any())
+            .respond_with(PlaylistNavidrome)
+            .mount(&navidrome)
+            .await;
+        let settings = AppSettings {
+            soulseek: SoulseekSettings {
+                base_url: Some("http://127.0.0.1:1".into()),
+                ..Default::default()
+            },
+            subsonic: SubsonicSettings {
+                url: Some(navidrome.uri()),
+                admin_username: Some("admin".into()),
+                admin_password: Some("pw".into()),
+                auto_detect_download_path: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let state = state_with(settings, |_| {});
+        let t = PersonalApp {
+            app: app(&state),
+            state,
+            navidrome,
+        };
+        // Navidrome's native rows, answered over the base mock: the admin signs in, the plain
+        // playlist is listed, and its one track with it.
+        Mock::given(method("POST"))
+            .and(path("/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token": "jwt-1", "isAdmin": true, "username": "admin"
+            })))
+            .with_priority(1)
+            .mount(&t.navidrome)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/playlist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "id": PLAIN_PLAYLIST, "name": "Plain List", "ownerName": "admin"
+            }])))
+            .with_priority(1)
+            .mount(&t.navidrome)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/playlist/{PLAIN_PLAYLIST}/tracks")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "id": 1, "mediaFileId": "nd-1" }
+            ])))
+            .with_priority(1)
+            .mount(&t.navidrome)
+            .await;
+        t
     }
 
     /// One outside song in the registry, by its short id.
@@ -170,6 +234,19 @@ impl PersonalApp {
             .iter()
             .filter(|request| request.url.path().ends_with("/rest/getSong"))
             .count()
+    }
+
+    /// The bodies of the requests Navidrome itself received as `method` on the playlist's own
+    /// path, in order — the faithful relay's signature, what a passthrough leaves behind.
+    async fn navidrome_relayed_bodies(&self, method: &str, path: &str) -> Vec<String> {
+        self.navidrome
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.method.as_str() == method && request.url.path() == path)
+            .map(|request| String::from_utf8_lossy(&request.body).to_string())
+            .collect()
     }
 
     /// Makes the playlist's own mirror answer `rows` to the overlay's one bulk read. Mounted
@@ -575,4 +652,88 @@ async fn a_file_that_went_takes_its_position_to_the_stream_at_once() {
         .collect();
     assert_eq!(media, [outside.as_str(), outside.as_str()]);
     assert_eq!(t.get_song_relays().await, 0, "no per-position song reads");
+}
+
+/// A native whole-list replacement on a plain playlist the overlay does not hold, with purely
+/// local rows (`tracks` or an empty `tracks`), is an ordinary edit: the faithful relay takes the
+/// PUT to Navidrome exactly as it came and the store never learns the playlist. The gate is the
+/// create's own — only a registry id takes a playlist over — so the 403 of an unreachable
+/// adoption (this app has no service API identity to adopt by) never stands between the client
+/// and an edit Navidrome could have made itself.
+#[tokio::test]
+async fn a_purely_local_replacement_on_a_plain_playlist_is_navidromes_own() {
+    let t = PersonalApp::new().await;
+    let playlist_path = format!("/api/playlist/{PLAIN_PLAYLIST}");
+
+    let bodies = [
+        r#"{"name":"Plain List","tracks":[{"mediaFileId":"nd-1"},{"mediaFileId":"nd-2"}]}"#,
+        r#"{"tracks":[]}"#,
+    ];
+    for body in bodies {
+        let reply = send(
+            &t.app,
+            Method::PUT,
+            &format!("{playlist_path}?{}", auth("alice", "good", "octo")),
+            &[("content-type", "application/json")],
+            Body::from(body),
+        )
+        .await;
+
+        // Navidrome's own answer came back (the mock's ok envelope, not an overlay detail row),
+        // not a 403: the replacement was executed by Navidrome.
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    }
+
+    // Both replacements reached Navidrome exactly as they were sent, the empty `tracks` too.
+    assert_eq!(
+        t.navidrome_relayed_bodies("PUT", &playlist_path).await,
+        bodies.to_vec(),
+        "the replacements are relayed to Navidrome unchanged"
+    );
+
+    // The overlay adopted nothing: the playlist stays Navidrome's alone.
+    assert!(!t.state.personal_playlists.knows(PLAIN_PLAYLIST));
+    assert!(t.nothing_downloads());
+}
+
+/// The same replacement with a registry id among the rows is the overlay's: Navidrome would
+/// refuse that id whole (Fakt A1), so the playlist is adopted — its own local row kept first,
+/// the mixed list stored, the local half mirrored alone — and the answer is the overlay's own
+/// detail row, while the PUT itself never reaches Navidrome.
+#[tokio::test]
+async fn a_replacement_carrying_a_registry_id_adopts_the_plain_playlist() {
+    let t = PersonalApp::new_with_a_plain_playlist().await;
+    let outside = t.outside_song("Lost in Sound");
+    let playlist_path = format!("/api/playlist/{PLAIN_PLAYLIST}");
+
+    let body = format!(
+        r#"{{"name":"Plain List","tracks":[{{"mediaFileId":"nd-1"}},{{"mediaFileId":"{outside}"}}]}}"#
+    );
+    let reply = send(
+        &t.app,
+        Method::PUT,
+        &format!("{playlist_path}?{}", auth("alice", "good", "octo")),
+        &[("content-type", "application/json")],
+        Body::from(body),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["songCount"], 2, "{}", reply.text());
+    assert_eq!(
+        t.entries_of(PLAIN_PLAYLIST),
+        [(Some("nd-1".to_string()), None), (None, Some(outside.clone())),]
+    );
+    for ids in t.song_ids_mirrored().await {
+        assert!(
+            ids.iter().all(|id| id.starts_with("nd-")),
+            "the mirror carries local ids only: {ids:?}"
+        );
+    }
+    assert!(
+        t.navidrome_relayed_bodies("PUT", &playlist_path).await.is_empty(),
+        "the replacement is the overlay's, not a passthrough"
+    );
+    assert!(t.nothing_downloads());
 }
