@@ -219,9 +219,11 @@ fn take_folder(
     name: Option<&str>,
     comment: Option<&str>,
 ) -> (Option<String>, Option<String>, Option<String>) {
+    // The tag's value is the rest of the comment: the overlay writes the tag last, and a folder
+    // may hold spaces ("Techno/Peak Time") — the first word alone would not carry it (D9).
     let folder_from_tag = comment
         .and_then(|comment| comment.split(FOLDER_TAG).nth(1))
-        .map(|rest| rest.split_whitespace().next().unwrap_or("").trim().to_string())
+        .map(|rest| rest.trim().to_string())
         .filter(|folder| !folder.is_empty());
     let mut base_name = name.map(str::to_string);
     let folder_from_name = name.and_then(|name| {
