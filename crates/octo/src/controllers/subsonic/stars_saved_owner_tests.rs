@@ -38,10 +38,7 @@ struct SavedNavidrome;
 impl Respond for SavedNavidrome {
     fn respond(&self, request: &MockRequest) -> ResponseTemplate {
         let path = request.url.path();
-        let signed_in = request
-            .url
-            .query_pairs()
-            .any(|(k, v)| k == "t" && v == "good");
+        let signed_in = request.url.query_pairs().any(|(k, v)| k == "t" && v == "good");
         if !signed_in {
             return navidrome_json(NAVIDROME_WRONG_PASSWORD);
         }
@@ -192,10 +189,7 @@ impl SavedApp {
 
     /// Nothing waits anywhere: no download queued, none held, none tracked.
     fn nothing_fetching(&self) {
-        assert!(
-            self.state.track_acquisition_queue.is_idle(),
-            "no download queued"
-        );
+        assert!(self.state.track_acquisition_queue.is_idle(), "no download queued");
         assert!(self.state.acquisition_tracker.all().is_empty(), "nothing tracked");
         assert_eq!(self.state.star_on_arrival.held(), 0, "nothing held");
     }
@@ -274,11 +268,7 @@ async fn saved_songs_and_albums_join_the_owners_starred_lists() {
     let saved = t.state.family_saved.list("winters");
     let saved_album = t.state.family_saved.albums("winters");
 
-    let reply = get(
-        &t.app,
-        &format!("/rest/getStarred2.view?{}&f=json", owner()),
-    )
-    .await;
+    let reply = get(&t.app, &format!("/rest/getStarred2.view?{}&f=json", owner())).await;
     let starred = reply.envelope()["starred2"].clone();
     let songs = starred["song"].as_array().expect("songs");
     assert_eq!(songs.len(), 2, "{songs:?}");
@@ -320,11 +310,7 @@ async fn an_unstar_removes_the_owners_save() {
     t.nothing_fetching();
 
     // What is gone stays gone from the starred lists.
-    let reply = get(
-        &t.app,
-        &format!("/rest/getStarred2.view?{}&f=json", owner()),
-    )
-    .await;
+    let reply = get(&t.app, &format!("/rest/getStarred2.view?{}&f=json", owner())).await;
     let starred = reply.envelope()["starred2"].clone();
     let songs = starred["song"].as_array().expect("songs");
     assert_eq!(songs.len(), 1, "{songs:?}");
@@ -343,11 +329,7 @@ async fn the_native_song_detail_carries_the_save_moment() {
     .await;
     let saved = t.state.family_saved.list("winters");
 
-    let detail = get(
-        &t.app,
-        &format!("/api/song/{}?{}&f=json", t.song, owner()),
-    )
-    .await;
+    let detail = get(&t.app, &format!("/api/song/{}?{}&f=json", t.song, owner())).await;
     let song = detail.json();
     assert_eq!(song["id"], t.song.as_str(), "{}", detail.text());
     assert_eq!(song["title"], "Teardrop");
@@ -355,11 +337,7 @@ async fn the_native_song_detail_carries_the_save_moment() {
     assert_eq!(song["starred"], expected.as_str(), "{}", detail.text());
     assert_eq!(song["starredAt"], expected.as_str());
 
-    let untouched = get(
-        &t.app,
-        &format!("/api/song/{}?{}&f=json", t.other, owner()),
-    )
-    .await;
+    let untouched = get(&t.app, &format!("/api/song/{}?{}&f=json", t.other, owner())).await;
     let song = untouched.json();
     assert_eq!(song["id"], t.other.as_str(), "{}", untouched.text());
     assert!(song.get("starred").is_none(), "no save, no star: {song}");
@@ -404,7 +382,10 @@ async fn a_managed_members_star_with_downloads_off_goes_where_it_always_went() {
     let t = SavedApp::new(true).await;
     let caller = FamilyCaller::member("alex", Preset::Member, Abilities::preset(Preset::Member));
     let mut request = Request::builder()
-        .uri(format!("/rest/star.view?id={}&u=alex&t=good&s=salt&v=1.16.1&c=test&f=json", t.song))
+        .uri(format!(
+            "/rest/star.view?id={}&u=alex&t=good&s=salt&v=1.16.1&c=test&f=json",
+            t.song
+        ))
         .body(Body::empty())
         .expect("a request");
     request.extensions_mut().insert(caller.clone());
@@ -417,7 +398,11 @@ async fn a_managed_members_star_with_downloads_off_goes_where_it_always_went() {
         t.state.family_saved.list("alex").is_empty(),
         "a member's heart is not a save here"
     );
-    assert_eq!(t.ids_sent_to("star").await, [vec![t.song.clone()]], "relayed as before");
+    assert_eq!(
+        t.ids_sent_to("star").await,
+        [vec![t.song.clone()]],
+        "relayed as before"
+    );
     t.nothing_fetching();
 
     // The album the member stars with album downloads off is ignored, not saved.

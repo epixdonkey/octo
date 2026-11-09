@@ -838,9 +838,11 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
 
     // Whether the caller has one of these ids saved, so an unstar of a streaming favorite is
     // answered by Octo instead of relaying an id Navidrome has never seen.
-    let saves_held = saver
-        .as_deref()
-        .is_some_and(|user| outside.iter().any(|(_, id)| state.family_saved.is_saved(user, id)));
+    let saves_held = saver.as_deref().is_some_and(|user| {
+        outside
+            .iter()
+            .any(|(_, id)| state.family_saved.is_saved(user, id))
+    });
     if !mapped && (outside.is_empty() || (!saves_held && library.is_empty() && held.is_empty())) {
         return match member {
             None => {
@@ -1005,8 +1007,16 @@ async fn with_waiting_hearts(
     let waiting = state
         .star_on_arrival
         .waiting_songs(&StarOnArrival::holder_name(&credential, Some(&who)));
-    let saved_songs = if with_saves { state.family_saved.list(&who) } else { Vec::new() };
-    let saved_albums = if with_saves { state.family_saved.albums(&who) } else { Vec::new() };
+    let saved_songs = if with_saves {
+        state.family_saved.list(&who)
+    } else {
+        Vec::new()
+    };
+    let saved_albums = if with_saves {
+        state.family_saved.albums(&who)
+    } else {
+        Vec::new()
+    };
     if waiting.is_empty() && saved_songs.is_empty() && saved_albums.is_empty() {
         return answer;
     }
