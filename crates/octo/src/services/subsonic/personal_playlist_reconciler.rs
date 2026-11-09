@@ -121,7 +121,10 @@ impl PersonalPlaylistReconciler {
             .filter_map(|entry| entry.library_id.clone())
             .collect();
         let Ok(Some(rows)) = self.navidrome.read_all_tracks(&playlist.id).await else {
-            warn!("Playlist '{}' could not be read to mirror its local songs", playlist.name);
+            warn!(
+                "Playlist '{}' could not be read to mirror its local songs",
+                playlist.name
+            );
             return;
         };
         let current: Vec<(String, String)> = rows
@@ -137,18 +140,34 @@ impl PersonalPlaylistReconciler {
         }
 
         // From the end backwards: removing the last positions leaves the earlier ones in place.
-        let stale: Vec<String> = current[same..].iter().map(|(position, _)| position.clone()).collect();
+        let stale: Vec<String> = current[same..]
+            .iter()
+            .map(|(position, _)| position.clone())
+            .collect();
         let mut end = stale.len();
         while end > 0 {
             let start = end.saturating_sub(REMOVE_CHUNK);
-            if !self.navidrome.remove_positions(&playlist.id, &stale[start..end]).await.unwrap_or(false) {
-                warn!("Playlist '{}' could not drop its stale mirror rows", playlist.name);
+            if !self
+                .navidrome
+                .remove_positions(&playlist.id, &stale[start..end])
+                .await
+                .unwrap_or(false)
+            {
+                warn!(
+                    "Playlist '{}' could not drop its stale mirror rows",
+                    playlist.name
+                );
                 return;
             }
             end = start;
         }
         for chunk in wanted[same..].chunks(ADD_CHUNK) {
-            if !self.navidrome.add_tracks(&playlist.id, chunk).await.unwrap_or(false) {
+            if !self
+                .navidrome
+                .add_tracks(&playlist.id, chunk)
+                .await
+                .unwrap_or(false)
+            {
                 warn!("Playlist '{}' could not add its fresh mirror rows", playlist.name);
                 return;
             }
