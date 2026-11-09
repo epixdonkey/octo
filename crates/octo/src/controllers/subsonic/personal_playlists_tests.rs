@@ -98,16 +98,18 @@ impl PersonalApp {
 
     /// A mixed create of one library song and one outside one, answered by the overlay.
     async fn create_mixed(&self, outside: &str) {
-        let reply = self.create(&format!("name=Mix&songId=nd-2&songId={outside}")).await;
+        let reply = self
+            .create(&format!("name=Mix&songId=nd-2&songId={outside}"))
+            .await;
         assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
     }
 
     /// The held playlist itself.
-    fn held(
-        &self,
-        id: &str,
-    ) -> crate::services::subsonic::personal_playlist_store::PersonalPlaylist {
-        self.state.personal_playlists.find(id).expect("the playlist is held")
+    fn held(&self, id: &str) -> crate::services::subsonic::personal_playlist_store::PersonalPlaylist {
+        self.state
+            .personal_playlists
+            .find(id)
+            .expect("the playlist is held")
     }
 
     /// The entries of a held playlist, as their (library id, outside id) halves.
@@ -139,8 +141,7 @@ impl PersonalApp {
 
     // The Boundary Rule of adding to a playlist: nothing was ever queued to download.
     fn nothing_downloads(&self) -> bool {
-        self.state.acquisition_tracker.all().is_empty()
-            && self.state.track_acquisition_queue.is_idle()
+        self.state.acquisition_tracker.all().is_empty() && self.state.track_acquisition_queue.is_idle()
     }
 
     /// Polls until `external_id` is in flight on the acquisition queue (what a star on a
@@ -168,17 +169,12 @@ async fn a_mixed_create_adopts_navidromes_real_id_and_mirrors_only_local_ids() {
     let t = PersonalApp::new().await;
     let outside = t.outside_song("Lost in Sound");
 
-    let reply = t
-        .create(&format!("name=Mix&songId=nd-2&songId={outside}"))
-        .await;
+    let reply = t.create(&format!("name=Mix&songId=nd-2&songId={outside}")).await;
 
     assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
     assert_eq!(
         t.entries_of(NEW_PLAYLIST),
-        [
-            (Some("nd-2".to_string()), None),
-            (None, Some(outside.clone())),
-        ]
+        [(Some("nd-2".to_string()), None), (None, Some(outside.clone())),]
     );
     let playlist = t.held(NEW_PLAYLIST);
     let entry = &playlist.entries[1];
@@ -208,15 +204,10 @@ async fn a_create_with_a_playlist_id_replaces_the_whole_list() {
     let outside = t.outside_song("Lost in Sound");
     t.create_mixed(&outside).await;
 
-    let reply = t
-        .create(&format!("playlistId={NEW_PLAYLIST}&songId=nd-9"))
-        .await;
+    let reply = t.create(&format!("playlistId={NEW_PLAYLIST}&songId=nd-9")).await;
 
     assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
-    assert_eq!(
-        t.entries_of(NEW_PLAYLIST),
-        [(Some("nd-9".to_string()), None)]
-    );
+    assert_eq!(t.entries_of(NEW_PLAYLIST), [(Some("nd-9".to_string()), None)]);
     assert!(t.nothing_downloads());
 }
 
@@ -241,10 +232,7 @@ async fn an_update_renames_folders_adds_and_removes() {
     // The local first position is removed, the outside one stays, the new local one is last.
     assert_eq!(
         t.entries_of(NEW_PLAYLIST),
-        [
-            (None, Some(outside.clone())),
-            (Some("nd-9".to_string()), None),
-        ]
+        [(None, Some(outside.clone())), (Some("nd-9".to_string()), None),]
     );
     let playlist = t.held(NEW_PLAYLIST);
     assert_eq!(playlist.name, "Mix");
@@ -443,12 +431,7 @@ async fn a_native_move_carries_the_occurrence_ids_along() {
     assert_eq!(ids, [1, 2, 3]);
     let media: Vec<String> = rows
         .iter()
-        .map(|row| {
-            row["mediaFileId"]
-                .as_str()
-                .expect("a source id")
-                .to_string()
-        })
+        .map(|row| row["mediaFileId"].as_str().expect("a source id").to_string())
         .collect();
     assert_eq!(media, ["nd-3", "nd-2", outside.as_str()]);
 }

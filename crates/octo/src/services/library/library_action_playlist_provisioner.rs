@@ -381,13 +381,6 @@ mod tests {
         }))
     }
 
-    fn creates(requests: &[wiremock::Request]) -> usize {
-        requests
-            .iter()
-            .filter(|r| r.url.path() == "/rest/createPlaylist")
-            .count()
-    }
-
     /// How many creates carried `title` (the query string, matched exactly).
     fn creates_of(requests: &[wiremock::Request], title: &str) -> usize {
         requests
