@@ -553,6 +553,29 @@ pub(crate) fn correct_playlist_rows(state: &AppState, body: &[u8], format: &str)
     corrected.then(|| root.to_xml_string().into_bytes())
 }
 
+/// The native list's playlist rows (`GET /api/playlist`, a bare JSON array) with the counts the
+/// overlay holds — not the local-only mirror's; the native twin of [`correct_playlist_rows`],
+/// which walks the Subsonic envelope instead. A row the overlay does not hold keeps Navidrome's
+/// own counts (a plain playlist's passthrough).
+pub(crate) fn correct_native_playlist_rows(state: &AppState, rows: &mut [Node]) {
+    for row in rows {
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        let Some(id) = object.get("id").and_then(Node::as_str) else {
+            continue;
+        };
+        let Some(playlist) = state.personal_playlists.find(id) else {
+            continue;
+        };
+        object.insert(
+            "songCount".into(),
+            Node::Number(playlist.entries.len().to_string()),
+        );
+        object.insert("duration".into(), Node::Number(seconds_of(&playlist).to_string()));
+    }
+}
+
 /// How long a playlist's positions last, as its counts say them: the snapshot each position
 /// kept.
 fn seconds_of(playlist: &PersonalPlaylist) -> i64 {
@@ -810,14 +833,22 @@ fn error_response(state: &AppState, call: &SubsonicCall, code: i32, message: &st
         .into_response()
 }
 
-/// The native playlist answers (`/api/playlist/{id}...`): the detail, its tracks, the moves and
-/// the additions Feishin makes in Navidrome mode. `Ok(None)` when the call is none of the
-/// overlay's business. The list itself (`GET /api/playlist`) and the create (`POST /api/playlist`)
-/// stay with the native radio handler, which relays them as they came.
+/// The native playlist answers in Navidrome mode: the collection's create (`POST
+/// /api/playlist`) and the detail, its tracks, the moves and the additions of
+/// `/api/playlist/{id}`. `Ok(None)` when the call is none of the overlay's business; the list
+/// itself (`GET /api/playlist`) stays with the native radio handler, which corrects the held
+/// playlists' counts in its rows.
 pub(crate) async fn answer_native(
     state: &AppState,
     request: &NativeRequest<'_>,
 ) -> Result<Option<Response>, crate::http::error::AppError> {
+    const COLLECTION: &str = "api/playlist";
+    if request.endpoint.eq_ignore_ascii_case(COLLECTION) {
+        if *request.method == axum::http::Method::POST {
+            return native_create(state, request).await;
+        }
+        return Ok(None);
+    }
     const PREFIX: &str = "api/playlist/";
     if !octo_core::common::dotnet::starts_with_ignore_case(request.endpoint, PREFIX)
         || request.endpoint.len() == PREFIX.len()
@@ -983,23 +1014,16 @@ pub(crate) async fn answer_native(
                 .and_then(|body| body.get("public"))
                 .and_then(Value::as_bool);
             let asks_to_download = comment.as_deref().is_some_and(comment_asks_to_download);
-            let replacement = body
+            // A `tracks` row list is a whole-list replacement — even an empty one clears the
+            // playlist — so the presence of the key is the gate, not the ids it carried.
+            let replaces = body
                 .as_ref()
                 .and_then(|body| body.get("tracks"))
                 .and_then(Value::as_array)
-                .cloned();
+                .is_some();
             apply_metadata(&mut playlist, name.as_deref(), comment.as_deref(), public);
-            if let Some(rows) = replacement {
-                let media: Vec<String> = rows
-                    .iter()
-                    .map(|row| {
-                        row.get("mediaFileId")
-                            .or_else(|| row.get("id"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string()
-                    })
-                    .collect();
+            if replaces {
+                let media = native_track_ids(&body);
                 playlist.entries.clear();
                 playlist.entries.extend(entries_for(state, &media).await);
             }
@@ -1023,6 +1047,61 @@ pub(crate) async fn answer_native(
     }
 }
 
+/// `POST /api/playlist`: the native create. A body whose `tracks` rows carry an outside id is
+/// the overlay's — Navidrome would refuse the registry's id whole (Fakt A1) — so the empty
+/// playlist is made in Navidrome first (no song id on that create, am-yy's move), the real id
+/// comes back, and the overlay keeps every position with the local half mirrored alone. A body
+/// without `tracks`, or a purely local one, is none of the overlay's business (`None`: the
+/// faithful relay takes the create to Navidrome as it came).
+async fn native_create(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+) -> Result<Option<Response>, crate::http::error::AppError> {
+    let body = native_body(request);
+    let tracks = native_track_ids(&body);
+    if tracks.is_empty() || !tracks.iter().any(|id| state.local_library.parse_song_id(id).0) {
+        return Ok(None);
+    }
+    let name = body
+        .as_ref()
+        .and_then(|body| body.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let comment = body
+        .as_ref()
+        .and_then(|body| body.get("comment"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let public = body
+        .as_ref()
+        .and_then(|body| body.get("public"))
+        .and_then(Value::as_bool);
+    let auth = auth_of(state, request.parameters);
+    let Some(id) = create_empty_playlist(request.proxy, &auth, name.as_deref()).await else {
+        return Ok(Some(native_error(
+            StatusCode::BAD_GATEWAY,
+            "Navidrome made no playlist",
+        )));
+    };
+    let owner =
+        super::caller_checks::listener_name_of(state, request.parameters, request.proxy, request.headers)
+            .await;
+    let mut playlist = PersonalPlaylist {
+        id,
+        owner,
+        ..Default::default()
+    };
+    apply_metadata(&mut playlist, name.as_deref(), comment.as_deref(), public);
+    playlist.entries.extend(entries_for(state, &tracks).await);
+    playlist.changed = chrono::Utc::now();
+    state.personal_playlists.upsert(playlist.clone());
+    mirror_local_ids(state, request.proxy, request.parameters, &playlist).await;
+    if backfill_local_snapshots(state, request.proxy, request.parameters, &mut playlist).await {
+        state.personal_playlists.upsert(playlist.clone());
+    }
+    Ok(Some(native_detail(&playlist)))
+}
+
 /// The request's JSON body, when it carries one (POST/PUT/PATCH, `IncomingRequest::raw_body`).
 fn native_body(request: &NativeRequest<'_>) -> Option<Value> {
     request
@@ -1040,6 +1119,27 @@ fn native_ids(body: &Option<Value>) -> Vec<String> {
         .map(|ids| {
             ids.iter()
                 .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The song ids a native body's `tracks` rows carried — `mediaFileId` (what a native client
+/// sends on a create or a list replacement) or `id` — blanks left out.
+fn native_track_ids(body: &Option<Value>) -> Vec<String> {
+    body.as_ref()
+        .and_then(|body| body.get("tracks"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.get("mediaFileId")
+                        .or_else(|| row.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .filter(|id| !id.is_empty())
                 .collect()
         })
         .unwrap_or_default()
