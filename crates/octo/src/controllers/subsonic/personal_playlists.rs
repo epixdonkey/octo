@@ -18,13 +18,12 @@ use octo_subsonic::Parameters;
 use octo_subsonic::SubsonicReply;
 use octo_subsonic::xml::XElement;
 use serde_json::{Value, json};
-use tracing::{info, warn};
+use tracing::warn;
 
 use super::action_helpers::{SubsonicCall, is_octo_playlist_id, is_successful_subsonic_response};
 use super::native::NativeRequest;
 use super::playlists::outside_song_json;
 use crate::app::AppState;
-use crate::services::common::AcquisitionTarget;
 use crate::services::subsonic::personal_playlist_store::{
     PersonalPlaylist, PersonalPlaylistEntry, seed_matching,
 };
@@ -269,27 +268,6 @@ fn apply_metadata(
     }
     playlist.set_folder(folder.as_deref());
     playlist.changed = chrono::Utc::now();
-}
-
-/// Queues the playlist's still-outside positions through the heart's coordinator: the explicit
-/// "download the missing ones" of R-5 operation 4, straight to the queue (no request playlist,
-/// no family request). Positions with a library file are left alone.
-pub(crate) fn queue_missing(state: &AppState, playlist: &PersonalPlaylist, requested_by: Option<&str>) {
-    for outside_id in playlist.missing_tracks_for_explicit_download() {
-        let (_, provider, external_id) = state.local_library.parse_song_id(&outside_id);
-        let provider = provider.unwrap_or_else(|| "soulseek".to_string());
-        let external_id = external_id.unwrap_or_else(|| outside_id.clone());
-        info!(
-            "Playlist '{}': fetching its missing song {outside_id}",
-            playlist.name
-        );
-        state.heart_acquisition_coordinator.queue_track_for(
-            &provider,
-            &external_id,
-            requested_by,
-            AcquisitionTarget::Shared,
-        );
-    }
 }
 
 /// Mirrors the playlist to Navidrome: local ids only, in the stored order, by `createPlaylist`
@@ -592,7 +570,7 @@ pub(crate) async fn rest_mutate(
     mirror_local_ids(state, &call.proxy, &call.parameters, &playlist).await;
     if asks_to_download {
         let requested_by = super::caller_checks::requester_for(state, Some(owner.as_str()));
-        queue_missing(state, &playlist, requested_by.as_deref());
+        super::playlists::queue_missing(state, &playlist, requested_by.as_deref());
     }
     Some(ok_response(state, call, "updatePlaylist"))
 }
@@ -902,7 +880,7 @@ pub(crate) async fn answer_native(
             mirror_local_ids(state, request.proxy, request.parameters, &playlist).await;
             if asks_to_download {
                 let requested_by = super::caller_checks::requester_for(state, Some(owner.as_str()));
-                queue_missing(state, &playlist, requested_by.as_deref());
+                super::playlists::queue_missing(state, &playlist, requested_by.as_deref());
             }
             Ok(Some(native_detail(&playlist)))
         }

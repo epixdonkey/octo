@@ -1102,6 +1102,34 @@ async fn owner_action_playlist(state: &AppState, call: &SubsonicCall, id: &str) 
     )
 }
 
+/// Queues a held personal playlist's still-outside positions through the heart's coordinator:
+/// the explicit "download the missing ones" of R-5 operation 4, straight to the queue (no
+/// request playlist, no family request). Positions with a library file are left alone. The
+/// queue call lives here rather than in the overlay, so the overlay itself never downloads
+/// anything (the Boundary Rule); `stars.rs`'s star-on-a-playlist and the overlay's `[download]`
+/// tag branch both go through this one door.
+pub(crate) fn queue_missing(
+    state: &AppState,
+    playlist: &crate::services::subsonic::personal_playlist_store::PersonalPlaylist,
+    requested_by: Option<&str>,
+) {
+    for outside_id in playlist.missing_tracks_for_explicit_download() {
+        let (_, provider, external_id) = state.local_library.parse_song_id(&outside_id);
+        let provider = provider.unwrap_or_else(|| "soulseek".to_string());
+        let external_id = external_id.unwrap_or_else(|| outside_id.clone());
+        info!(
+            "Playlist '{}': fetching its missing song {outside_id}",
+            playlist.name
+        );
+        state.heart_acquisition_coordinator.queue_track_for(
+            &provider,
+            &external_id,
+            requested_by,
+            AcquisitionTarget::Shared,
+        );
+    }
+}
+
 /// Refuses Octo's own ids, changes family playlists, and relays everything else as
 /// `rest/<last path segment>` in the client's own spelling.
 async fn mutate(state: AppState, req: Request, id_key: &str, _fallback: &str, failure: &str) -> Response {

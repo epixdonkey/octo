@@ -148,7 +148,7 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
                     playlist.name,
                     playlist.missing_tracks_for_explicit_download().len()
                 );
-                super::personal_playlists::queue_missing(&state, &playlist, requested_by.as_deref());
+                super::playlists::queue_missing(&state, &playlist, requested_by.as_deref());
             }
         }
         if rest.is_empty() {
