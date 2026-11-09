@@ -1878,6 +1878,10 @@ mod family_tests;
 mod hearts_tests;
 
 #[cfg(test)]
+#[path = "stars_saved_owner_tests.rs"]
+mod saved_owner_tests;
+
+#[cfg(test)]
 #[path = "family_library_tests.rs"]
 mod family_library_tests;
 

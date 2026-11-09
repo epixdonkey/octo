@@ -1297,8 +1297,10 @@ impl GeneratedPlaylistService {
     }
 
     /// The listener's saved outside songs join the hearts, one node each: id, title, artist,
-    /// album, duration and the moment it was saved as `starred`. A heart whose library copy
-    /// Navidrome already holds wins the row, so nothing is listed twice.
+    /// album, duration and the moment it was saved as `starred`, marked `isExternal` the way
+    /// the builder marks every outside song so [`Self::overlay`] leaves their own marks alone.
+    /// A heart whose library copy Navidrome already holds wins the row, so nothing is listed
+    /// twice.
     fn append_saved_songs(&self, username: &str, songs: &mut Vec<Node>) {
         let known: std::collections::HashSet<String> = songs
             .iter()
@@ -1314,7 +1316,9 @@ impl GeneratedPlaylistService {
                 "artist": saved.artist,
                 "album": saved.album,
                 "duration": saved.duration,
+                "coverArt": saved.cover_art,
                 "starred": saved.saved.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "isExternal": true,
             })));
         }
     }
