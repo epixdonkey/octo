@@ -10,6 +10,8 @@ use tempfile::TempDir;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+use crate::services::family::SavedStore;
+
 use super::*;
 
 /// A stand-in Navidrome that records the calls it gets.
@@ -170,6 +172,7 @@ fn service(fixture: &Fixture, settings: GeneratedPlaylistSettings) -> Arc<Genera
         Some(fixture.dir.path().join("generated-playlists.json")),
         SubsonicProxyService::new(store.clone()),
         store,
+        Arc::new(SavedStore::in_memory()),
     ))
 }
 
@@ -719,6 +722,7 @@ fn country_service(
             Some(fixture.dir.path().join("generated-playlists.json")),
             SubsonicProxyService::new(store.clone()),
             store,
+            Arc::new(SavedStore::in_memory()),
         )
         .with_countries(library),
     )
@@ -936,6 +940,7 @@ fn service_with_last_fm(
             Some(fixture.dir.path().join("generated-playlists.json")),
             SubsonicProxyService::new(store.clone()),
             store,
+            Arc::new(SavedStore::in_memory()),
         )
         .with_last_fm(last_fm),
     )
