@@ -1,17 +1,25 @@
 //! The personal playlists overlay's tests, through the controller harness: the REST and native
 //! CRUD, the local-only mirror, the heart's own download paths (R4-T4).
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{Method, StatusCode};
+use octo_core::models::domain::Song;
 use octo_core::settings::{AppSettings, SoulseekSettings, SubsonicSettings};
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
 use serde_json::json;
 use wiremock::matchers::{any, method, path};
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
-use crate::app::AppState;
+use crate::app::{AppState, TestServices};
 use crate::controllers::subsonic::test_app::*;
 use crate::http::pipeline::App;
+use crate::services::i_music_metadata_service::IMusicMetadataService;
+use crate::services::imports::test_support::row;
+use crate::services::soulseek::ExternalIdRegistry;
+use crate::services::subsonic::personal_playlist_reconciler::PersonalPlaylistReconciler;
+use crate::services::subsonic::personal_playlist_store::{PersonalPlaylist, PersonalPlaylistEntry};
 
 /// The real id Navidrome hands back for an empty create.
 const NEW_PLAYLIST: &str = "nd-mix";
@@ -71,6 +79,29 @@ impl PersonalApp {
             ..settings(&navidrome.uri())
         };
         let state = state_with(settings, |_| {});
+        PersonalApp {
+            app: app(&state),
+            state,
+            navidrome,
+        }
+    }
+
+    /// The app as `new`, with test services of the test's own: the registry the outside ids are
+    /// minted in before the app exists, the download service the streams come from.
+    async fn new_with_services(services: TestServices) -> PersonalApp {
+        let navidrome = MockServer::builder().start().await;
+        Mock::given(any())
+            .respond_with(PlaylistNavidrome)
+            .mount(&navidrome)
+            .await;
+        let settings = AppSettings {
+            soulseek: SoulseekSettings {
+                base_url: Some("http://127.0.0.1:1".into()),
+                ..Default::default()
+            },
+            ..settings(&navidrome.uri())
+        };
+        let state = AppState::for_tests_with(settings, services);
         PersonalApp {
             app: app(&state),
             state,
@@ -735,5 +766,650 @@ async fn a_replacement_carrying_a_registry_id_adopts_the_plain_playlist() {
         t.navidrome_relayed_bodies("PUT", &playlist_path).await.is_empty(),
         "the replacement is the overlay's, not a passthrough"
     );
+    assert!(t.nothing_downloads());
+}
+
+// ---- The heart's own download doors (D15, R-5 operations 3 and 4) -----------------------
+
+/// A song snapshot as a position keeps it: what the reconciler matches and the counts sum.
+fn snapshot_song(artist: &str, title: &str, seconds: i32) -> Song {
+    Song {
+        artist: artist.to_string(),
+        title: title.to_string(),
+        duration: Some(seconds),
+        ..Default::default()
+    }
+}
+
+/// A `[download]` tag in a held playlist's comment (the REST door) is the explicit "fetch the
+/// missing ones" (R-5 operation 4): only the position without a library file is queued, the tag
+/// itself never stays in the stored comment, and the edit changes no positions.
+#[tokio::test]
+async fn a_download_tag_on_a_held_playlist_fetches_only_its_missing_positions() {
+    let t = PersonalApp::new().await;
+    let outside = t.outside_song("Lost in Sound");
+    t.create_mixed(&outside).await;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/updatePlaylist.view?{}&f=json&playlistId={NEW_PLAYLIST}&comment=please%20%5Bdownload%5D",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    assert!(
+        t.waits_in_flight(&outside).await,
+        "the tag fetches the position without a library file"
+    );
+    assert!(
+        !t.state.track_acquisition_queue.is_in_flight("soulseek", "nd-2"),
+        "the position with a library file is left alone"
+    );
+    let held = t.held(NEW_PLAYLIST);
+    assert_eq!(
+        held.comment, "please",
+        "the tag is read off the comment, not kept in it"
+    );
+    assert_eq!(held.entries.len(), 2, "the comment edit changes no positions");
+}
+
+/// The same `[download]` tag through the native door (a PUT on the playlist's metadata): the
+/// missing position is fetched and the local one is not — both doors of R-5 operation 4 lead to
+/// the heart's one queue.
+#[tokio::test]
+async fn a_native_put_with_the_download_tag_fetches_only_its_missing_positions() {
+    let t = PersonalApp::new().await;
+    let outside = t.outside_song("Lost in Sound");
+    t.create_mixed(&outside).await;
+
+    let reply = send(
+        &t.app,
+        Method::PUT,
+        &format!("/api/playlist/{NEW_PLAYLIST}?{}", auth("alice", "good", "octo")),
+        &[("content-type", "application/json")],
+        Body::from(r#"{"comment":"please [download]"}"#),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert!(
+        t.waits_in_flight(&outside).await,
+        "the tag fetches the missing position"
+    );
+    assert!(
+        !t.state.track_acquisition_queue.is_in_flight("soulseek", "nd-2"),
+        "the local position is left alone"
+    );
+    assert_eq!(t.held(NEW_PLAYLIST).comment, "please");
+}
+
+/// `/rest/download?id=<outside>&save=1` (R-5 operation 3): the fetch is queued beside the
+/// stream, and the answer is the very bytes the plain download streams — `save` changes what is
+/// queued, never what is answered.
+#[tokio::test]
+async fn a_save_one_download_fetches_the_outside_song_and_still_streams_it() {
+    let registry = Arc::new(ExternalIdRegistry::in_memory());
+    let outside = registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("K3KHA".into()),
+        title: Some("Lost in Sound".into()),
+        duration: Some(619),
+        ..Default::default()
+    });
+    let bytes: &'static [u8] = &[7, 7, 7];
+    let downloads = Arc::new(FakeStreams::streaming("soulseek", &outside, bytes, "audio/mp4"));
+    let t = PersonalApp::new_with_services(TestServices {
+        external_id_registry: Some(registry),
+        download_service: Some(downloads.clone()),
+        ..Default::default()
+    })
+    .await;
+
+    let plain = get(
+        &t.app,
+        &format!("/rest/download?{}&id={outside}", auth("alice", "good", "octo")),
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::OK, "{}", plain.text());
+    assert_eq!(plain.body.as_ref(), bytes);
+    assert!(t.nothing_downloads(), "a plain download queues nothing");
+
+    let saved = get(
+        &t.app,
+        &format!(
+            "/rest/download?{}&id={outside}&save=1",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.text());
+    assert_eq!(
+        saved.body.as_ref(),
+        bytes,
+        "the answer is the stream's own bytes, save or not"
+    );
+    assert!(t.waits_in_flight(&outside).await, "save=1 queues the fetch");
+}
+
+/// What the owner puts on their own "Request a copy in FLAC" playlist is fetched straight away
+/// through the heart's queue (R-5 operation 3, D15 — not a family request): the outside song
+/// waiting on the playlist and nothing else, the library songs untouched, and the playlist
+/// emptied afterwards as the fetch is the record. The playlist never becomes the overlay's own.
+#[tokio::test]
+async fn what_the_owner_puts_on_their_flac_playlist_is_fetched_straight_away() {
+    let t = PersonalApp::new().await;
+    let outside = t.outside_song("Lost in Sound");
+    Mock::given(path("/rest/getPlaylist"))
+        .respond_with(navidrome_json(&format!(
+            r#"{{"subsonic-response":{{"status":"ok","playlist":{{"id":"nd-flac","name":"Request a copy in FLAC","entry":[{{"id":"{outside}"}},{{"id":"nd-1"}}]}}}}}}"#
+        )))
+        .with_priority(1)
+        .mount(&t.navidrome)
+        .await;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/updatePlaylist.view?{}&f=json&playlistId=nd-flac&songIdToAdd=nd-9",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    assert!(
+        t.waits_in_flight(&outside).await,
+        "the outside song carried by the playlist is fetched"
+    );
+    assert!(
+        !t.state.track_acquisition_queue.is_in_flight("soulseek", "nd-9")
+            && !t.state.track_acquisition_queue.is_in_flight("soulseek", "nd-1"),
+        "library songs need no fetch"
+    );
+    assert!(
+        t.navidrome
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|request| {
+                request.url.path().ends_with("/rest/updatePlaylist")
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(key, _)| key == "songIndexToRemove")
+            }),
+        "the carried songs are taken off the playlist again: the fetch is the record"
+    );
+    assert!(
+        !t.state.personal_playlists.knows("nd-flac"),
+        "the owner's FLAC playlist never becomes one of the overlay's own"
+    );
+}
+
+// ---- The reconciler, over the container's own parts (R-4, both ways) ---------------------
+
+/// How many mirror writes (a DELETE or a POST of positions) the playlist's own tracks path has
+/// seen: what an idempotent pass leaves untouched.
+async fn mirror_writes(t: &PersonalApp, playlist_id: &str) -> usize {
+    let path = format!("/api/playlist/{playlist_id}/tracks");
+    t.navidrome
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| {
+            request.url.path() == path
+                && (request.method.as_str() == "DELETE" || request.method.as_str() == "POST")
+        })
+        .count()
+}
+
+/// The reconciler's pass, over the container's own parts (the store, the imports' matcher with a
+/// library behind it, the admin playlist API): a position whose song landed in the library gets
+/// its `library_id`; one whose file went loses it and falls back to the stream — neither loses
+/// the outside half it keeps for that fallback, and the mirror carries local ids only (R-4, both
+/// ways in one pass).
+#[tokio::test]
+async fn the_reconciler_binds_a_landed_file_and_releases_a_gone_one() {
+    let t = PersonalApp::new_with_a_plain_playlist().await;
+    let landed = t.outside_song("Lost in Sound");
+    let gone = t.outside_song("Gone Song");
+    t.create_mixed(&landed).await;
+    let mut held = t.held(NEW_PLAYLIST);
+    held.entries = vec![
+        PersonalPlaylistEntry {
+            occurrence_id: "occ-landed".into(),
+            library_id: None,
+            outside_id: Some(landed.clone()),
+            you_tube_id: Some("video-1".into()),
+            song_snapshot: Some(snapshot_song("K3KHA", "Lost in Sound", 619)),
+            seed: None,
+        },
+        PersonalPlaylistEntry {
+            occurrence_id: "occ-gone".into(),
+            library_id: Some("nd-gone".into()),
+            outside_id: Some(gone.clone()),
+            you_tube_id: Some("video-2".into()),
+            song_snapshot: Some(snapshot_song("Gone Artist", "Gone Song", 111)),
+            seed: None,
+        },
+    ];
+    t.state.personal_playlists.upsert(held);
+
+    // The library: the landed song is there now, the gone one is not.
+    let pages = Arc::new(parking_lot::Mutex::new(vec![row(
+        "nd-landed",
+        "K3KHA",
+        "Lost in Sound",
+        Some(619),
+        Some("Peak Hours"),
+        "flac",
+        900,
+    )]));
+    t.state
+        .imports
+        .matcher()
+        .set_read_page(Arc::new(move |start, count| {
+            let page: Vec<_> = pages
+                .lock()
+                .iter()
+                .skip(start as usize)
+                .take(count as usize)
+                .cloned()
+                .collect();
+            let n = page.len();
+            Box::pin(async move { Some((page, n)) })
+        }));
+    // The playlist's mirror as Navidrome holds it: the one local row the create mirrored.
+    let tracks_path = format!("/api/playlist/{NEW_PLAYLIST}/tracks");
+    Mock::given(method("GET"))
+        .and(path(&tracks_path))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": "1", "mediaFileId": "nd-2" }
+        ])))
+        .with_priority(1)
+        .mount(&t.navidrome)
+        .await;
+    for verb in ["DELETE", "POST"] {
+        Mock::given(method(verb))
+            .and(path(&tracks_path))
+            .respond_with(ResponseTemplate::new(200))
+            .with_priority(1)
+            .mount(&t.navidrome)
+            .await;
+    }
+
+    let reconciler = PersonalPlaylistReconciler::new(
+        t.state.personal_playlists.clone(),
+        t.state.imports.matcher().clone(),
+        t.state.navidrome_playlist_api.clone(),
+    );
+    let changed = reconciler.reconcile_once().await;
+    assert!(changed, "the pass moved both positions");
+
+    let held = t.held(NEW_PLAYLIST);
+    assert_eq!(
+        held.entries[0].library_id.as_deref(),
+        Some("nd-landed"),
+        "the landed file is bound"
+    );
+    assert_eq!(held.entries[0].outside_id.as_deref(), Some(landed.as_str()));
+    assert!(held.entries[0].song_snapshot.is_some());
+    assert_eq!(
+        held.entries[1].library_id, None,
+        "the gone file's binding is released"
+    );
+    assert_eq!(held.entries[1].outside_id.as_deref(), Some(gone.as_str()));
+    assert!(held.entries[1].song_snapshot.is_some());
+
+    // The mirror carries the local half only: the stale row is dropped, the landed one added,
+    // and never a registry id.
+    let requests = t.navidrome.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.iter().any(|request| {
+            request.url.path() == tracks_path
+                && request.method.as_str() == "DELETE"
+                && request.url.query_pairs().any(|(key, _)| key == "id")
+        }),
+        "the stale mirror row is dropped"
+    );
+    let added: Vec<String> = requests
+        .into_iter()
+        .filter(|request| request.url.path() == tracks_path && request.method.as_str() == "POST")
+        .map(|request| String::from_utf8_lossy(&request.body).to_string())
+        .collect();
+    assert_eq!(
+        added,
+        [r#"{"ids":["nd-landed"]}"#.to_string()],
+        "the mirror adds the landed local id, and nothing else"
+    );
+    assert!(!added[0].contains(&landed), "never a registry id in the mirror");
+}
+
+/// The pass is idempotent: a playlist the last pass already settled moves nothing, writes
+/// nothing and mirrors nothing.
+#[tokio::test]
+async fn a_reconciler_pass_that_moved_nothing_writes_nothing() {
+    let t = PersonalApp::new_with_a_plain_playlist().await;
+    let landed = t.outside_song("Lost in Sound");
+    t.create_mixed(&landed).await;
+    let mut held = t.held(NEW_PLAYLIST);
+    held.entries = vec![PersonalPlaylistEntry {
+        occurrence_id: "occ-landed".into(),
+        library_id: None,
+        outside_id: Some(landed.clone()),
+        song_snapshot: Some(snapshot_song("K3KHA", "Lost in Sound", 619)),
+        ..Default::default()
+    }];
+    t.state.personal_playlists.upsert(held);
+
+    let pages = Arc::new(parking_lot::Mutex::new(vec![row(
+        "nd-landed",
+        "K3KHA",
+        "Lost in Sound",
+        Some(619),
+        Some("Peak Hours"),
+        "flac",
+        900,
+    )]));
+    t.state
+        .imports
+        .matcher()
+        .set_read_page(Arc::new(move |start, count| {
+            let page: Vec<_> = pages
+                .lock()
+                .iter()
+                .skip(start as usize)
+                .take(count as usize)
+                .cloned()
+                .collect();
+            let n = page.len();
+            Box::pin(async move { Some((page, n)) })
+        }));
+    let tracks_path = format!("/api/playlist/{NEW_PLAYLIST}/tracks");
+    Mock::given(method("GET"))
+        .and(path(&tracks_path))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": "1", "mediaFileId": "nd-landed" }
+        ])))
+        .with_priority(1)
+        .mount(&t.navidrome)
+        .await;
+
+    let reconciler = PersonalPlaylistReconciler::new(
+        t.state.personal_playlists.clone(),
+        t.state.imports.matcher().clone(),
+        t.state.navidrome_playlist_api.clone(),
+    );
+    assert!(reconciler.reconcile_once().await, "the first pass binds the file");
+
+    let writes = mirror_writes(&t, NEW_PLAYLIST).await;
+    let halves_of = |t: &PersonalApp| {
+        t.held(NEW_PLAYLIST)
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.occurrence_id.clone(),
+                    entry.library_id.clone(),
+                    entry.outside_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let settled = halves_of(&t);
+    let again = reconciler.reconcile_once().await;
+    assert!(!again, "an unchanged playlist moves nothing");
+    assert_eq!(
+        mirror_writes(&t, NEW_PLAYLIST).await,
+        writes,
+        "and is neither written nor mirrored again"
+    );
+    assert_eq!(halves_of(&t), settled, "the store keeps exactly what it held");
+}
+
+// ---- getSong's snapshot overlay (D6, the W1 read side) ------------------------------------
+
+/// `getSong` of a position's outside id answers from the snapshot the position kept: the fields
+/// the routing never had come from the store — and the routing's own words are never overwritten
+/// by the snapshot's (the overlay fills, it does not replace).
+#[tokio::test]
+async fn get_song_answers_the_snapshot_a_position_kept_without_overwriting_the_routing() {
+    let t = PersonalApp::new().await;
+    let thin = t.state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("K3KHA".into()),
+        title: Some("Thin Routing".into()),
+        ..Default::default()
+    });
+    let wordy = t.state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("K3KHA".into()),
+        title: Some("Wordy Routing".into()),
+        album: Some("Routing Album".into()),
+        duration: Some(619),
+        ..Default::default()
+    });
+    t.state.personal_playlists.upsert(PersonalPlaylist {
+        id: "nd-1".to_string(),
+        entries: vec![
+            PersonalPlaylistEntry {
+                occurrence_id: "occ-thin".into(),
+                outside_id: Some(thin.clone()),
+                song_snapshot: Some(Song {
+                    artist: "K3KHA".into(),
+                    title: "Thin Routing".into(),
+                    album: "Snapshot Album".into(),
+                    duration: Some(619),
+                    isrc: Some("GB-ABC-25-00001".into()),
+                    year: Some(2025),
+                    genre: Some("Techno".into()),
+                    music_brainz_recording_id: Some("mbid-1".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            PersonalPlaylistEntry {
+                occurrence_id: "occ-wordy".into(),
+                outside_id: Some(wordy.clone()),
+                song_snapshot: Some(Song {
+                    artist: "K3KHA".into(),
+                    title: "Wordy Routing".into(),
+                    album: "Snapshot Album".into(),
+                    duration: Some(700),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+
+    let filled = t
+        .state
+        .music_metadata
+        .get_song("soulseek", &thin)
+        .await
+        .expect("the thin routing answers");
+    assert_eq!(
+        filled.album, "Snapshot Album",
+        "the snapshot's album fills the empty one"
+    );
+    assert_eq!(filled.isrc.as_deref(), Some("GB-ABC-25-00001"));
+    assert_eq!(filled.music_brainz_recording_id.as_deref(), Some("mbid-1"));
+    assert_eq!(filled.year, Some(2025));
+    assert_eq!(filled.genre.as_deref(), Some("Techno"));
+    assert_eq!(
+        filled.duration,
+        Some(619),
+        "the snapshot's length fills the routing's missing one"
+    );
+
+    let kept = t
+        .state
+        .music_metadata
+        .get_song("soulseek", &wordy)
+        .await
+        .expect("the wordy routing answers");
+    assert_eq!(
+        kept.album, "Routing Album",
+        "the routing's own words are never overwritten"
+    );
+    assert_eq!(kept.duration, Some(619));
+
+    // And through the wire: getSong carries the snapshot's words to a client.
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/getSong.view?{}&f=json&id={thin}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    assert_eq!(reply.envelope()["song"]["album"], "Snapshot Album");
+    assert_eq!(reply.envelope()["song"]["year"], 2025);
+}
+
+// ---- The lists' counts (Defekt 2's fix, both protocols) ------------------------------------
+
+/// The native playlist list carries the overlay's counts: a held playlist's row answers the
+/// mixed positions it holds, not the local-only mirror's — and a plain playlist's row keeps
+/// Navidrome's own counts.
+#[tokio::test]
+async fn the_native_playlist_list_carries_the_overlays_counts() {
+    let t = PersonalApp::new().await;
+    let outside = t.outside_song("Lost in Sound");
+    t.create_mixed(&outside).await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/playlist"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": NEW_PLAYLIST, "name": "Mix", "songCount": 1, "duration": 200 },
+            { "id": PLAIN_PLAYLIST, "name": "Plain List", "songCount": 3, "duration": 300 }
+        ])))
+        .with_priority(1)
+        .mount(&t.navidrome)
+        .await;
+
+    let reply = get(
+        &t.app,
+        &format!("/api/playlist?{}", auth("alice", "good", "octo")),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let rows = reply.json().as_array().cloned().expect("a rows array");
+    let row_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no row for {id}: {}", reply.text()))
+    };
+    assert_eq!(row_of(NEW_PLAYLIST)["songCount"], 2, "{}", reply.text());
+    assert_eq!(row_of(NEW_PLAYLIST)["duration"], 619);
+    assert_eq!(
+        row_of(PLAIN_PLAYLIST)["songCount"],
+        3,
+        "a plain playlist keeps Navidrome's own counts"
+    );
+    assert_eq!(reply.header("x-total-count"), Some("2"));
+}
+
+/// The REST `getPlaylists` answer carries the overlay's counts too — the REST twin of the native
+/// list's correction.
+#[tokio::test]
+async fn the_rest_playlists_list_carries_the_overlays_counts() {
+    let t = PersonalApp::new().await;
+    let outside = t.outside_song("Lost in Sound");
+    t.create_mixed(&outside).await;
+
+    Mock::given(path("/rest/getPlaylists"))
+        .respond_with(navidrome_json(&format!(
+            r#"{{"subsonic-response":{{"status":"ok","playlists":{{"playlist":[{{"id":"{NEW_PLAYLIST}","name":"Mix","songCount":1,"duration":200}},{{"id":"{PLAIN_PLAYLIST}","name":"Plain List","songCount":3,"duration":300}}]}}}}}}"#
+        )))
+        .with_priority(1)
+        .mount(&t.navidrome)
+        .await;
+
+    let reply = get(
+        &t.app,
+        &format!("/rest/getPlaylists.view?{}&f=json", auth("alice", "good", "octo")),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    let rows = reply.envelope()["playlists"]["playlist"]
+        .as_array()
+        .cloned()
+        .expect("playlist rows");
+    let row_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no row for {id}: {}", reply.text()))
+    };
+    assert_eq!(row_of(NEW_PLAYLIST)["songCount"], 2, "{}", reply.text());
+    assert_eq!(row_of(NEW_PLAYLIST)["duration"], 619);
+    assert_eq!(
+        row_of(PLAIN_PLAYLIST)["songCount"],
+        3,
+        "a plain playlist keeps Navidrome's own counts"
+    );
+}
+
+// ---- The REST door of the adoption gate ----------------------------------------------------
+
+/// The REST door of the same gate as the native PUT's: an update on a plain playlist the
+/// overlay does not hold, with purely local song ids, is an ordinary edit — the relay takes it
+/// to Navidrome as it came, the overlay's mirror never runs, and the store never learns the
+/// playlist.
+#[tokio::test]
+async fn a_purely_local_rest_update_on_a_plain_playlist_stays_navidromes_own() {
+    let t = PersonalApp::new().await;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/updatePlaylist.view?{}&f=json&playlistId={PLAIN_PLAYLIST}&name=Plain%20List&songIdToAdd=nd-9",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    assert!(
+        t.navidrome
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|request| {
+                request.url.path().ends_with("/rest/updatePlaylist")
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(key, value)| key == "playlistId" && value == PLAIN_PLAYLIST)
+            }),
+        "the edit is Navidrome's to do"
+    );
+    assert!(
+        !t.navidrome
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|request| {
+                request.url.path().ends_with("/rest/createPlaylist")
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(key, value)| key == "playlistId" && value == PLAIN_PLAYLIST)
+            }),
+        "the overlay's mirror never ran"
+    );
+    assert!(!t.state.personal_playlists.knows(PLAIN_PLAYLIST));
     assert!(t.nothing_downloads());
 }
