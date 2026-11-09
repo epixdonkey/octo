@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::http::{Method, StatusCode};
 use octo_core::settings::{AppSettings, SoulseekSettings};
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
-use wiremock::matchers::any;
+use wiremock::matchers::{any, path};
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
 use crate::app::AppState;
@@ -159,6 +159,31 @@ impl PersonalApp {
         }
         false
     }
+
+    /// How many `rest/getSong` relays Navidrome has seen: an answer of the overlay's costs none
+    /// of them — the whole list comes from one read of the playlist's own mirror.
+    async fn get_song_relays(&self) -> usize {
+        self.navidrome
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/rest/getSong"))
+            .count()
+    }
+
+    /// Makes the playlist's own mirror answer `rows` to the overlay's one bulk read. Mounted
+    /// over the base mock with the highest priority, so it is the one Navidrome answers
+    /// `rest/getPlaylist` with.
+    async fn mirror_answers(&self, rows: &str) {
+        Mock::given(path("/rest/getPlaylist"))
+            .respond_with(navidrome_json(&format!(
+                r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1","playlist":{{"id":"{NEW_PLAYLIST}","entry":{rows}}}}}}}"#
+            )))
+            .with_priority(1)
+            .mount(&self.navidrome)
+            .await;
+    }
 }
 
 /// A mixed create makes the empty playlist in Navidrome first (that call carries no songId —
@@ -187,11 +212,11 @@ async fn a_mixed_create_adopts_navidromes_real_id_and_mirrors_only_local_ids() {
         Some(619)
     );
     // The first create carries no songId at all (the playlist is made empty, for its real id);
-    // the mirror carries the local ids only — never the registry's — and the metadata update
-    // none.
+    // the mirror carries the local ids only — never the registry's — the metadata update and the
+    // mirror's one read-back (the local snapshot's bulk fill) none.
     assert_eq!(
         t.song_ids_mirrored().await,
-        [Vec::new(), vec!["nd-2".to_string()], Vec::new()]
+        [Vec::new(), vec!["nd-2".to_string()], Vec::new(), Vec::new()]
     );
     assert!(t.nothing_downloads());
 }
@@ -434,4 +459,120 @@ async fn a_native_move_carries_the_occurrence_ids_along() {
         .map(|row| row["mediaFileId"].as_str().expect("a source id").to_string())
         .collect();
     assert_eq!(media, ["nd-3", "nd-2", outside.as_str()]);
+}
+
+/// One read of the playlist's own mirror decides every position's source at the moment of the
+/// answer, in both protocols at once: the row the mirror still holds plays the library (and the
+/// REST answer is that live row) — and not one `rest/getSong` is relayed for any of it, however
+/// many positions the list holds (the store's `resolve_playback_sources` is the one mechanism
+/// both answers go by).
+#[tokio::test]
+async fn both_protocols_pick_their_sources_from_one_mirror_read() {
+    let t = PersonalApp::new().await;
+    let outside = t.outside_song("Lost in Sound");
+    t.create_mixed(&outside).await;
+    // A mixed first position: one place holding the library file and the stream it can fall
+    // back to (what a download landing, then the file leaving, leaves behind — R-4).
+    let mut held = t.held(NEW_PLAYLIST);
+    held.entries[0].outside_id = Some(outside.clone());
+    t.state.personal_playlists.upsert(held);
+
+    // The mirror still holds nd-2's row: the file is there.
+    t.mirror_answers(
+        r#"[{"id":"nd-2","title":"Local FLAC song","artist":"Someone","album":"Somewhere","duration":200}]"#,
+    )
+    .await;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/getPlaylist.view?{}&f=json&id={NEW_PLAYLIST}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    let entries = reply.envelope()["playlist"]["entry"]
+        .as_array()
+        .cloned()
+        .expect("the playlist's entries");
+    assert_eq!(entries.len(), 2, "{}", reply.text());
+    assert_eq!(entries[0]["id"], "nd-2", "the library's own live row");
+    assert_eq!(entries[0]["title"], "Local FLAC song");
+    assert_eq!(entries[1]["id"], outside.as_str(), "the outside position");
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/api/playlist/{NEW_PLAYLIST}/tracks?{}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let media: Vec<String> = reply
+        .json()
+        .as_array()
+        .expect("a tracks array")
+        .iter()
+        .map(|row| row["mediaFileId"].as_str().expect("a source id").to_string())
+        .collect();
+    assert_eq!(media, ["nd-2", outside.as_str()]);
+
+    // The whole exchange — create and answers — never relayed a single `rest/getSong`.
+    assert_eq!(t.get_song_relays().await, 0, "no per-position song reads");
+}
+
+/// The mirror's one read no longer lists a position's row the very moment its file went, and
+/// both protocols take the position to the stream at once — the position never disappears, and
+/// no reconciler minute sits in between (the native answer used to hand out the dead library id
+/// until the reconciler's pass).
+#[tokio::test]
+async fn a_file_that_went_takes_its_position_to_the_stream_at_once() {
+    let t = PersonalApp::new().await;
+    let outside = t.outside_song("Lost in Sound");
+    t.create_mixed(&outside).await;
+    // A mixed first position, as above: the library file it had is gone with the row below.
+    let mut held = t.held(NEW_PLAYLIST);
+    held.entries[0].outside_id = Some(outside.clone());
+    t.state.personal_playlists.upsert(held);
+
+    // The mirror holds nothing: the file is gone, and the store still names it.
+    t.mirror_answers("[]").await;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/getPlaylist.view?{}&f=json&id={NEW_PLAYLIST}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    let entries = reply.envelope()["playlist"]["entry"]
+        .as_array()
+        .cloned()
+        .expect("the playlist's entries");
+    assert_eq!(entries.len(), 2, "{}", reply.text());
+    assert_eq!(entries[0]["id"], outside.as_str(), "the stream takes over");
+    assert_eq!(entries[1]["id"], outside.as_str());
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/api/playlist/{NEW_PLAYLIST}/tracks?{}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.header("x-total-count"), Some("2"));
+    let media: Vec<String> = reply
+        .json()
+        .as_array()
+        .expect("a tracks array")
+        .iter()
+        .map(|row| row["mediaFileId"].as_str().expect("a source id").to_string())
+        .collect();
+    assert_eq!(media, [outside.as_str(), outside.as_str()]);
+    assert_eq!(t.get_song_relays().await, 0, "no per-position song reads");
 }

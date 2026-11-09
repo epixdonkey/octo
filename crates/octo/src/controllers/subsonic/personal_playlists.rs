@@ -9,6 +9,8 @@
 //! heart's coordinator (D15). Navidrome is mirrored with local ids only, or it would refuse the
 //! whole call (Fakt A1).
 
+use std::collections::{HashMap, HashSet};
+
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use indexmap::IndexMap;
@@ -25,7 +27,7 @@ use super::native::NativeRequest;
 use super::playlists::outside_song_json;
 use crate::app::AppState;
 use crate::services::subsonic::personal_playlist_store::{
-    PersonalPlaylist, PersonalPlaylistEntry, seed_matching,
+    PersonalPlaylist, PersonalPlaylistEntry, ServeSource, seed_matching,
 };
 
 /// The comment tag that asks for the playlist's missing positions to be fetched (R-5 op. 4).
@@ -76,25 +78,39 @@ fn new_occurrence_id() -> String {
     format!("occ-{}", uuid::Uuid::new_v4().simple())
 }
 
-/// One song id from a client as the position it becomes: a library id keeps its own half, an
-/// outside id (the registry's short id) keeps the outside half — its video, the full snapshot,
-/// and the seed that minted the id, honestly kept out when no candidate hashes to it.
-pub(crate) async fn entry_for(state: &AppState, id: &str) -> Option<PersonalPlaylistEntry> {
-    let id = id.trim();
-    if id.is_empty() {
-        return None;
+/// The song ids a client hands over as the positions they become, in one pass: a library id
+/// keeps its own half — its metadata arrives with the mirror's one bulk read after the mutation,
+/// not as a round-trip per position — and an outside id (the registry's short id) keeps the
+/// outside half: its video, the full snapshot, and the seed that minted the id, honestly kept
+/// out when no candidate hashes to it.
+pub(crate) async fn entries_for(state: &AppState, ids: &[String]) -> Vec<PersonalPlaylistEntry> {
+    let mut entries = Vec::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let (external, _, _) = state.local_library.parse_song_id(id);
+        if !external {
+            entries.push(PersonalPlaylistEntry {
+                occurrence_id: new_occurrence_id(),
+                library_id: Some(id.to_string()),
+                ..Default::default()
+            });
+            continue;
+        }
+        if let Some(entry) = outside_entry_for(state, id).await {
+            entries.push(entry);
+        }
     }
-    let (external, provider, external_id) = state.local_library.parse_song_id(id);
-    if !external {
-        return Some(PersonalPlaylistEntry {
-            occurrence_id: new_occurrence_id(),
-            library_id: Some(id.to_string()),
-            outside_id: None,
-            you_tube_id: None,
-            song_snapshot: read_library_song(state, id).await,
-            seed: None,
-        });
-    }
+    entries
+}
+
+/// One outside id as a position: the registry's routing, the full snapshot (the catalog's answer
+/// first, the routing's own words when it is gone) and the seed that minted the id. Nothing here
+/// asks Navidrome — the registry and the store are the outside half's own keepers.
+async fn outside_entry_for(state: &AppState, id: &str) -> Option<PersonalPlaylistEntry> {
+    let (_, provider, external_id) = state.local_library.parse_song_id(id);
     let provider = provider.unwrap_or_default();
     let external_id = external_id.unwrap_or_default();
     // The registry is what knows the id: its lookup re-registers an evicted entry through the
@@ -143,12 +159,41 @@ fn routing_song(routing: &SoulseekRouting) -> octo_core::models::domain::Song {
     }
 }
 
-/// A library song's own fields, as the snapshot the native rows are built from later. Asked of
-/// Navidrome with Octo's admin sign-in, so a native-mode client (which signs in with a header)
-/// keeps its local positions described too.
-async fn read_library_song(state: &AppState, id: &str) -> Option<octo_core::models::domain::Song> {
-    let row = read_library_song_row(&state.subsonic_proxy, &auth_of(state, &Parameters::new()), id).await?;
-    Some(octo_core::models::domain::Song {
+/// The playlist's local half as its own mirror in Navidrome holds it — one relay, every local
+/// row at once, however long the list. The mirror is the overlay's own copy of the local half,
+/// and Navidrome drops a row when its file goes, so the rows are both the metadata and the
+/// availability of the moment (PREFER_LOCAL, R-4). `None` when Navidrome could not be asked.
+async fn mirror_song_rows(
+    proxy: &crate::services::subsonic::SubsonicProxyService,
+    auth: &[(String, String)],
+    playlist_id: &str,
+) -> Option<HashMap<String, Value>> {
+    if auth.is_empty() {
+        return None;
+    }
+    let mut pairs: Vec<(String, String)> = auth.to_vec();
+    pairs.push(("id".into(), playlist_id.to_string()));
+    pairs.push(("f".into(), "json".into()));
+    let relay = proxy
+        .relay_safe("rest/getPlaylist", pairs.iter().map(|(k, v)| (k, v)))
+        .await?;
+    let answer: Value = serde_json::from_slice(&relay.body).ok()?;
+    let rows = answer.pointer("/subsonic-response/playlist/entry")?.as_array()?;
+    Some(
+        rows.iter()
+            .filter_map(|row| {
+                row.get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_string(), row.clone()))
+            })
+            .collect(),
+    )
+}
+
+/// A library song's own fields, as the snapshot the native rows are built from later. One read
+/// of the mirror answers every local row at once, so this is a mapping, not a round-trip.
+fn song_from_row(row: &Value) -> octo_core::models::domain::Song {
+    octo_core::models::domain::Song {
         id: row
             .get("id")
             .and_then(Value::as_str)
@@ -175,28 +220,125 @@ async fn read_library_song(state: &AppState, id: &str) -> Option<octo_core::mode
             .and_then(|d| i32::try_from(d).ok()),
         is_local: true,
         ..Default::default()
-    })
+    }
 }
 
-/// One library song's Subsonic row, read through `proxy` with `auth`: the caller's own sign-in
-/// when the request carries one, else the admin's.
-async fn read_library_song_row(
+/// The positions' playback sources for one answer: the store's one resolution mechanism
+/// (`resolve_playback_sources`, PREFER_LOCAL) over the mirror's fresh availability — one relay
+/// for the whole list, not one per position. When Navidrome cannot be asked, the store's own
+/// bindings stand in, so the answer keeps every position that still has a source.
+async fn served_sources(
+    state: &AppState,
+    proxy: &crate::services::subsonic::SubsonicProxyService,
+    parameters: &Parameters,
+    playlist: &PersonalPlaylist,
+) -> (Vec<ServeSource>, Option<HashMap<String, Value>>) {
+    let auth = auth_of(state, parameters);
+    match mirror_song_rows(proxy, &auth, &playlist.id).await {
+        Some(rows) => {
+            let available: HashSet<String> = rows.keys().cloned().collect();
+            (playlist.resolve_playback_sources(&available), Some(rows))
+        }
+        None => {
+            let held: HashSet<String> = playlist
+                .entries
+                .iter()
+                .filter_map(|entry| entry.library_id.clone())
+                .collect();
+            (playlist.resolve_playback_sources(&held), None)
+        }
+    }
+}
+
+/// The entries with the source each plays by, in the list's own order: the store's resolution
+/// aligned back onto its entries. A position the resolution leaves out — no file and no stream —
+/// is not listed; a song twice keeps both of its own places.
+fn zipped<'a>(
+    playlist: &'a PersonalPlaylist,
+    sources: &'a [ServeSource],
+) -> Vec<(&'a PersonalPlaylistEntry, &'a ServeSource)> {
+    let mut at = 0;
+    playlist
+        .entries
+        .iter()
+        .filter_map(move |entry| {
+            let source = sources.get(at)?;
+            let same = match source {
+                ServeSource::Library { id, .. } => entry.library_id.as_deref() == Some(id.as_str()),
+                ServeSource::Outside { outside_id, .. } => {
+                    entry.outside_id.as_deref() == Some(outside_id.as_str())
+                }
+            };
+            if same {
+                at += 1;
+                Some((entry, source))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Fills the snapshots of the local positions the mirror just wrote: the same one bulk read, so
+/// a mutation costs it once however many positions it added — and an adopted position (which
+/// arrives with no snapshot at all) fills in here too. True when anything filled.
+async fn backfill_local_snapshots(
+    state: &AppState,
+    proxy: &crate::services::subsonic::SubsonicProxyService,
+    parameters: &Parameters,
+    playlist: &mut PersonalPlaylist,
+) -> bool {
+    // Nothing to fill costs no read at all: a removal, a reorder or a metadata edit does not
+    // ask Navidrome again.
+    if !playlist
+        .entries
+        .iter()
+        .any(|entry| entry.song_snapshot.is_none() && entry.library_id.is_some())
+    {
+        return false;
+    }
+    let auth = auth_of(state, parameters);
+    let Some(rows) = mirror_song_rows(proxy, &auth, &playlist.id).await else {
+        return false;
+    };
+    let mut filled = false;
+    for entry in &mut playlist.entries {
+        if entry.song_snapshot.is_some() {
+            continue;
+        }
+        let Some(row) = entry.library_id.as_deref().and_then(|id| rows.get(id)) else {
+            continue;
+        };
+        entry.song_snapshot = Some(song_from_row(row));
+        filled = true;
+    }
+    filled
+}
+
+/// The empty playlist in Navidrome first (am-yy's move: no song ids on the create), and its
+/// real id back. `None` when Navidrome would not make it.
+async fn create_empty_playlist(
     proxy: &crate::services::subsonic::SubsonicProxyService,
     auth: &[(String, String)],
-    id: &str,
-) -> Option<Value> {
-    let mut pairs: Vec<(String, String)> = auth.to_vec();
-    if pairs.is_empty() {
-        return None;
+    name: Option<&str>,
+) -> Option<String> {
+    let mut create = auth.to_vec();
+    if let Some(name) = name {
+        create.push(("name".into(), name.to_string()));
     }
-    pairs.push(("id".into(), id.to_string()));
-    pairs.push(("f".into(), "json".into()));
-    let relay = proxy
-        .relay("rest/getSong", pairs.iter().map(|(k, v)| (k, v)))
-        .await
-        .ok()?;
-    let answer: Value = serde_json::from_slice(&relay.body).ok()?;
-    answer.pointer("/subsonic-response/song").cloned()
+    create.push(("f".into(), "json".into()));
+    let created = proxy
+        .relay_safe("rest/createPlaylist", create.iter().map(|(k, v)| (k, v)))
+        .await;
+    created
+        .and_then(|relay| serde_json::from_slice::<Value>(&relay.body).ok())
+        .and_then(|answer| {
+            answer
+                .pointer("/subsonic-response/playlist/id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|id| !id.is_empty())
 }
 
 /// The song ids a client's `songId`-shaped parameter carried, in order, blanks left out.
@@ -422,33 +564,36 @@ fn seconds_of(playlist: &PersonalPlaylist) -> i64 {
 }
 
 /// `getPlaylist` for a playlist the overlay holds: every position in its stored order, each with
-/// the source it plays by (`PREFER_LOCAL`): the library's own row when Navidrome still serves
-/// it, else the outside version the position kept. Positions outside are registered for the
-/// scrobble-driven prewarm. `None` when the overlay does not hold the id.
+/// the source it plays by (`PREFER_LOCAL`) — one read of the playlist's own mirror decides every
+/// position at once through the store's `resolve_playback_sources`, so the answer costs one
+/// upstream call however long the list is. The library's own live row when the file is there,
+/// the outside version the position kept when it is not. Positions outside are registered for
+/// the scrobble-driven prewarm. `None` when the overlay does not hold the id.
 pub(crate) async fn rest_get_playlist(state: &AppState, call: &SubsonicCall, id: &str) -> Option<Response> {
     let playlist = state.personal_playlists.find(id)?;
-    let auth = auth_of(state, &call.parameters);
+    let (sources, mirror) = served_sources(state, &call.proxy, &call.parameters, &playlist).await;
     let mut entries: Vec<Node> = Vec::new();
     let mut outside_ids: Vec<String> = Vec::new();
-    for entry in &playlist.entries {
-        let song = match &entry.library_id {
-            Some(library) => match read_library_song_row(&call.proxy, &auth, library).await {
-                Some(song) => Some(song),
-                None => match &entry.outside_id {
-                    Some(outside) => outside_song_json(state, outside).await,
-                    None => None,
-                },
-            },
-            None => match &entry.outside_id {
-                Some(outside) => outside_song_json(state, outside).await,
-                None => None,
-            },
-        };
-        match song {
-            Some(song) => entries.push(Node::from_value(&song)),
-            None => {
-                if let Some(outside) = &entry.outside_id {
+    for source in &sources {
+        match source {
+            ServeSource::Library { id, outside } => {
+                if let Some(row) = mirror.as_ref().and_then(|rows| rows.get(id)) {
+                    entries.push(Node::from_value(row));
+                    continue;
+                }
+                // Navidrome would not tell (or the row went between the read and here): the
+                // stream takes over what the position kept.
+                if let Some(outside) = outside
+                    && let Some(song) = outside_song_json(state, outside).await
+                {
+                    entries.push(Node::from_value(&song));
                     outside_ids.push(outside.clone());
+                }
+            }
+            ServeSource::Outside { outside_id, .. } => {
+                if let Some(song) = outside_song_json(state, outside_id).await {
+                    entries.push(Node::from_value(&song));
+                    outside_ids.push(outside_id.clone());
                 }
             }
         }
@@ -559,15 +704,14 @@ pub(crate) async fn rest_mutate(
             playlist.entries.remove(*index);
         }
     }
-    for id in &adding {
-        if let Some(entry) = entry_for(state, id).await {
-            playlist.entries.push(entry);
-        }
-    }
+    playlist.entries.extend(entries_for(state, &adding).await);
     playlist.changed = chrono::Utc::now();
     let owner = playlist.owner.clone();
     state.personal_playlists.upsert(playlist.clone());
     mirror_local_ids(state, &call.proxy, &call.parameters, &playlist).await;
+    if backfill_local_snapshots(state, &call.proxy, &call.parameters, &mut playlist).await {
+        state.personal_playlists.upsert(playlist.clone());
+    }
     if asks_to_download {
         let requested_by = super::caller_checks::requester_for(state, Some(owner.as_str()));
         super::playlists::queue_missing(state, &playlist, requested_by.as_deref());
@@ -591,24 +735,8 @@ async fn rest_create(
         if !mixed {
             return None;
         }
-        let mut create = auth_of(state, &call.parameters);
-        if let Some(name) = call.param("name") {
-            create.push(("name".into(), name.to_string()));
-        }
-        create.push(("f".into(), "json".into()));
-        let created = call
-            .proxy
-            .relay_safe("rest/createPlaylist", create.iter().map(|(k, v)| (k, v)))
-            .await;
-        let id = created
-            .and_then(|relay| serde_json::from_slice::<Value>(&relay.body).ok())
-            .and_then(|answer| {
-                answer
-                    .pointer("/subsonic-response/playlist/id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .filter(|id| !id.is_empty());
+        let auth = auth_of(state, &call.parameters);
+        let id = create_empty_playlist(&call.proxy, &auth, call.param("name")).await;
         let Some(id) = id else {
             return Some(error_response(state, call, 0, failure));
         };
@@ -648,14 +776,13 @@ async fn rest_create(
         playlist.entries.clear();
         playlist
     };
-    for song in adding {
-        if let Some(entry) = entry_for(state, song).await {
-            playlist.entries.push(entry);
-        }
-    }
+    playlist.entries.extend(entries_for(state, adding).await);
     playlist.changed = chrono::Utc::now();
     state.personal_playlists.upsert(playlist.clone());
     mirror_local_ids(state, &call.proxy, &call.parameters, &playlist).await;
+    if backfill_local_snapshots(state, &call.proxy, &call.parameters, &mut playlist).await {
+        state.personal_playlists.upsert(playlist.clone());
+    }
     Some(ok_response(state, call, "createPlaylist"))
 }
 
@@ -741,19 +868,20 @@ pub(crate) async fn answer_native(
     // The tracks: the list, the additions, the removals, the drag-and-drop move.
     if parts.len() >= 2 && parts[1].eq_ignore_ascii_case("tracks") {
         if is_get {
-            return Ok(Some(native_tracks(state, &playlist)));
+            return Ok(Some(
+                native_tracks(state, request.proxy, request.parameters, &playlist).await,
+            ));
         }
         if request.method == axum::http::Method::POST {
-            let mut added = 0;
-            for song in &ids {
-                if let Some(entry) = entry_for(state, song).await {
-                    playlist.entries.push(entry);
-                    added += 1;
-                }
-            }
+            let fresh = entries_for(state, &ids).await;
+            let added = fresh.len();
+            playlist.entries.extend(fresh);
             playlist.changed = chrono::Utc::now();
             state.personal_playlists.upsert(playlist.clone());
             mirror_local_ids(state, request.proxy, request.parameters, &playlist).await;
+            if backfill_local_snapshots(state, request.proxy, request.parameters, &mut playlist).await {
+                state.personal_playlists.upsert(playlist.clone());
+            }
             return Ok(Some(native_ok(json!({ "id": id, "added": added }))));
         }
         if request.method == axum::http::Method::DELETE {
@@ -862,22 +990,26 @@ pub(crate) async fn answer_native(
                 .cloned();
             apply_metadata(&mut playlist, name.as_deref(), comment.as_deref(), public);
             if let Some(rows) = replacement {
+                let media: Vec<String> = rows
+                    .iter()
+                    .map(|row| {
+                        row.get("mediaFileId")
+                            .or_else(|| row.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect();
                 playlist.entries.clear();
-                for row in rows {
-                    let media = row
-                        .get("mediaFileId")
-                        .or_else(|| row.get("id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if let Some(entry) = entry_for(state, media).await {
-                        playlist.entries.push(entry);
-                    }
-                }
+                playlist.entries.extend(entries_for(state, &media).await);
             }
             playlist.changed = chrono::Utc::now();
             let owner = playlist.owner.clone();
             state.personal_playlists.upsert(playlist.clone());
             mirror_local_ids(state, request.proxy, request.parameters, &playlist).await;
+            if backfill_local_snapshots(state, request.proxy, request.parameters, &mut playlist).await {
+                state.personal_playlists.upsert(playlist.clone());
+            }
             if asks_to_download {
                 let requested_by = super::caller_checks::requester_for(state, Some(owner.as_str()));
                 super::playlists::queue_missing(state, &playlist, requested_by.as_deref());
@@ -930,30 +1062,49 @@ fn native_detail(playlist: &PersonalPlaylist) -> Response {
     }))
 }
 
-/// The playlist's native tracks: one row per position, `id` 1..N (what Feishin moves and
-/// removes by), `mediaFileId` the source it plays by (the library's id while the position has
-/// one, else the outside id), plus whatever the position's snapshot knows. Outside positions
-/// are registered for the prewarm.
-fn native_tracks(state: &AppState, playlist: &PersonalPlaylist) -> Response {
+/// The playlist's native tracks: one row per position, `id` 1..N (what Feishin moves and removes
+/// by), `mediaFileId` the source the position plays by right now — the same one read of the
+/// playlist's mirror and the same store resolution the REST answer goes by, so a file that went
+/// takes its position to the stream at once, without waiting for the reconciler's minute. The
+/// row's words come from the mirror's live row first (an adopted position has no snapshot), else
+/// the position's snapshot. Outside positions are registered for the prewarm.
+async fn native_tracks(
+    state: &AppState,
+    proxy: &crate::services::subsonic::SubsonicProxyService,
+    parameters: &Parameters,
+    playlist: &PersonalPlaylist,
+) -> Response {
+    let (sources, mirror) = served_sources(state, proxy, parameters, playlist).await;
     let mut rows: Vec<Value> = Vec::new();
     let mut outside_ids: Vec<String> = Vec::new();
-    for (at, entry) in playlist.entries.iter().enumerate() {
-        let Some(media) = entry.library_id.clone().or_else(|| entry.outside_id.clone()) else {
-            continue;
+    for (at, (entry, source)) in zipped(playlist, &sources).into_iter().enumerate() {
+        let media = match source {
+            ServeSource::Library { id, .. } => id.clone(),
+            ServeSource::Outside { outside_id, .. } => {
+                outside_ids.push(outside_id.clone());
+                outside_id.clone()
+            }
         };
-        if entry.library_id.is_none()
-            && let Some(outside) = &entry.outside_id
-        {
-            outside_ids.push(outside.clone());
-        }
-        let mut row = match &entry.song_snapshot {
-            Some(snapshot) => json!({
-                "title": snapshot.title,
-                "artist": snapshot.artist,
-                "album": snapshot.album,
-                "duration": snapshot.duration.unwrap_or(0),
+        let live = match source {
+            ServeSource::Library { id, .. } => mirror.as_ref().and_then(|rows| rows.get(id)),
+            ServeSource::Outside { .. } => None,
+        };
+        let mut row = match live {
+            Some(row) => json!({
+                "title": row.get("title").and_then(Value::as_str).unwrap_or_default(),
+                "artist": row.get("artist").and_then(Value::as_str).unwrap_or_default(),
+                "album": row.get("album").and_then(Value::as_str).unwrap_or_default(),
+                "duration": row.get("duration").and_then(Value::as_i64).unwrap_or(0),
             }),
-            None => json!({}),
+            None => match &entry.song_snapshot {
+                Some(snapshot) => json!({
+                    "title": snapshot.title,
+                    "artist": snapshot.artist,
+                    "album": snapshot.album,
+                    "duration": snapshot.duration.unwrap_or(0),
+                }),
+                None => json!({}),
+            },
         };
         let fields = row.as_object_mut().expect("an object");
         fields.insert("id".into(), (at + 1).into());
