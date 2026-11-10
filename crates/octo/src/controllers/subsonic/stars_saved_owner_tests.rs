@@ -15,6 +15,7 @@ use octo_core::models::domain::{Album, Song};
 use octo_core::settings::AppSettings;
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
 use octo_subsonic::SubsonicCredential;
+use parking_lot::Mutex;
 use serde_json::Value;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
@@ -27,9 +28,6 @@ use crate::services::common::test_fakes::FakeMetadata;
 use crate::services::family::test_support::member;
 use crate::services::family::{FamilyCaller, SavedSong};
 
-/// Navidrome's getStarred2 answer in JSON: one library song, hearted long ago.
-const STARRED2_JSON: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","starred2":{"song":[{"id":"nd-7","title":"Library song","starred":"2026-01-01T00:00:00Z"}]}}}"#;
-
 /// The same in XML.
 const STARRED2_XML: &str = r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="navidrome"><starred2><song id="nd-7" title="Library song" starred="2026-01-01T00:00:00Z"></song></starred2></subsonic-response>"#;
 
@@ -37,20 +35,62 @@ const STARRED2_XML: &str = r#"<subsonic-response xmlns="http://subsonic.org/rest
 const STARRED_EMPTY_JSON: &str =
     r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","starred":{}}}"#;
 
+/// Navidrome's refusal of a star, as the `refused_star_id` knob answers it.
+const NAVIDROME_REFUSED_STAR: &str = r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":70,"message":"data not found"}}}"#;
+
 /// Navidrome for these tests: the token "good" signs in, the starred lists answer as above,
-/// and everything else (a star's library part, a ping, an unstar) is a plain ok.
-struct SavedNavidrome;
+/// and everything else (a star's library part, a ping, an unstar) is a plain ok. The knobs:
+/// `double_songs`/`double_albums` are ids whose rows Navidrome's starred answer already carries
+/// (the caller saved them too — a row must not be doubled), and `refused_star_id` is a library
+/// id Navidrome refuses to star.
+#[derive(Default)]
+struct SavedNavidrome {
+    double_songs: Arc<Mutex<Vec<String>>>,
+    double_albums: Arc<Mutex<Vec<String>>>,
+    refused_star_id: Option<String>,
+}
 
 impl Respond for SavedNavidrome {
     fn respond(&self, request: &MockRequest) -> ResponseTemplate {
         let path = request.url.path();
-        let signed_in = request.url.query_pairs().any(|(k, v)| k == "t" && v == "good");
-        if !signed_in {
+        let query = |key: &str| {
+            request
+                .url
+                .query_pairs()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+                .collect::<Vec<String>>()
+        };
+        if !query("t").iter().any(|t| t == "good") {
             return navidrome_json(NAVIDROME_WRONG_PASSWORD);
+        }
+        if (path.ends_with("/rest/star") || path.ends_with("/rest/star.view"))
+            && let Some(refused) = &self.refused_star_id
+            && query("id").iter().any(|id| id == refused)
+        {
+            return navidrome_json(NAVIDROME_REFUSED_STAR);
         }
         if path.ends_with("/rest/getStarred2") || path.ends_with("/rest/getStarred2.view") {
             return if request.url.query_pairs().any(|(k, v)| k == "f" && v == "json") {
-                navidrome_json(STARRED2_JSON)
+                let mut songs = vec![
+                    r#"{"id":"nd-7","title":"Library song","starred":"2026-01-01T00:00:00Z"}"#.to_string(),
+                ];
+                let mut albums: Vec<String> = Vec::new();
+                for id in self.double_songs.lock().iter() {
+                    songs.push(format!(
+                        r#"{{"id":"{id}","title":"Doubled song","starred":"2025-06-01T00:00:00Z"}}"#
+                    ));
+                }
+                for id in self.double_albums.lock().iter() {
+                    albums.push(format!(
+                        r#"{{"id":"{id}","name":"Doubled album","starred":"2025-06-01T00:00:00Z"}}"#
+                    ));
+                }
+                navidrome_json(&format!(
+                    r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1","type":"navidrome","starred2":{{"song":[{}],"album":[{}]}}}}}}"#,
+                    songs.join(","),
+                    albums.join(",")
+                ))
             } else {
                 ResponseTemplate::new(200).set_body_raw(STARRED2_XML.as_bytes().to_vec(), "application/xml")
             };
@@ -72,16 +112,35 @@ struct SavedApp {
     song: String,
     other: String,
     album: String,
+    /// Ids whose song rows Navidrome's starred answers already carry, set per test.
+    double_songs: Arc<Mutex<Vec<String>>>,
+    /// Ids whose album rows Navidrome's starred answers already carry, set per test.
+    double_albums: Arc<Mutex<Vec<String>>>,
     _members: tempfile::TempDir,
 }
 
 impl SavedApp {
     async fn new(family_on: bool) -> SavedApp {
+        SavedApp::with(family_on, false, false, None).await
+    }
+
+    /// An app with chosen heart download sources (the save paths need both off) and an optional
+    /// library id Navidrome refuses to star.
+    async fn with(
+        family_on: bool,
+        song_source: bool,
+        album_source: bool,
+        refused_star_id: Option<String>,
+    ) -> SavedApp {
         let navidrome = MockServer::builder().start().await;
-        Mock::given(any())
-            .respond_with(SavedNavidrome)
-            .mount(&navidrome)
-            .await;
+        let mock = SavedNavidrome {
+            double_songs: Arc::new(Mutex::new(Vec::new())),
+            double_albums: Arc::new(Mutex::new(Vec::new())),
+            refused_star_id,
+        };
+        let double_songs = mock.double_songs.clone();
+        let double_albums = mock.double_albums.clone();
+        Mock::given(any()).respond_with(mock).mount(&navidrome).await;
         let members = tempfile::tempdir().expect("a temp dir");
         let mut settings = AppSettings {
             family: octo_core::settings::FamilySettings {
@@ -91,10 +150,12 @@ impl SavedApp {
             },
             ..settings(&navidrome.uri())
         };
-        settings.subsonic.download_on_star = false;
-        settings.subsonic.download_album_on_star = false;
+        settings.subsonic.download_on_star = song_source;
+        settings.subsonic.download_album_on_star = album_source;
         // A waiting heart is listed only when it becomes a favorite on landing.
         settings.subsonic.star_downloads_for_requester = true;
+        // A source that can queue must not fetch anywhere real in a test.
+        settings.soulseek.base_url = Some("http://127.0.0.1:1".into());
         let metadata = Arc::new(FakeMetadata::default());
         let state = AppState::for_tests_with(
             settings,
@@ -173,6 +234,8 @@ impl SavedApp {
             song,
             other,
             album,
+            double_songs,
+            double_albums,
             _members: members,
         }
     }
@@ -540,4 +603,220 @@ async fn a_managed_members_star_with_downloads_off_goes_where_it_always_went() {
     assert_eq!(answer["subsonic-response"]["status"], "ok", "{answer}");
     assert!(t.state.family_saved.albums("alex").is_empty());
     t.nothing_fetching();
+}
+
+/// The default heart semantics stand: with the song source on, the owner's star of an outside
+/// song queues the download and holds the heart — it saves nothing.
+#[tokio::test]
+async fn a_star_with_the_song_source_on_queues_the_download_and_saves_nothing() {
+    let t = SavedApp::with(false, true, false, None).await;
+    let star = get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&id={}", owner(), t.song),
+    )
+    .await;
+    assert_eq!(star.envelope()["status"], "ok", "{}", star.text());
+
+    assert!(
+        t.state.family_saved.list("winters").is_empty(),
+        "a heart with its source on is not a save"
+    );
+    let downloads: Vec<String> = t
+        .state
+        .acquisition_tracker
+        .for_user("winters")
+        .iter()
+        .map(|row| row.id.clone())
+        .collect();
+    assert!(
+        downloads.contains(&t.song),
+        "the download is queued: {downloads:?}"
+    );
+    assert_eq!(t.state.star_on_arrival.held(), 1, "the heart is held");
+    assert!(
+        t.ids_sent_to("star").await.is_empty(),
+        "the registry id never reached Navidrome"
+    );
+}
+
+/// The sources are read per kind: with songs on but albums off, the owner's album star is a
+/// streaming save, and nothing of the album is queued or held.
+#[tokio::test]
+async fn with_songs_on_and_albums_off_an_album_star_still_saves_the_album() {
+    let t = SavedApp::with(false, true, false, None).await;
+    let star = get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&albumId={}", owner(), t.album),
+    )
+    .await;
+    assert_eq!(star.envelope()["status"], "ok", "{}", star.text());
+
+    let albums = t.state.family_saved.albums("winters");
+    assert_eq!(albums.len(), 1, "{albums:?}");
+    assert_eq!(albums[0].id, t.album);
+    assert_eq!(albums[0].name, "Mezzanine");
+    assert!(
+        t.state.acquisition_tracker.all().is_empty(),
+        "the album is not queued"
+    );
+    assert_eq!(t.state.star_on_arrival.held(), 0);
+}
+
+/// A star Navidrome refuses (its library part failed) saves none of the outside ids it carried:
+/// the refusal is the whole answer, nothing is held, nothing fetched.
+#[tokio::test]
+async fn a_star_navidrome_refuses_saves_nothing_of_its_outside_ids() {
+    let t = SavedApp::with(false, false, false, Some("nd-404".into())).await;
+    let star = get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&id=nd-404&id={}", owner(), t.song),
+    )
+    .await;
+    assert_eq!(star.envelope()["status"], "failed", "{}", star.text());
+    assert_eq!(star.envelope()["error"]["code"], 70);
+
+    assert!(
+        t.state.family_saved.list("winters").is_empty(),
+        "a refused star leaves nothing saved"
+    );
+    t.nothing_fetching();
+    assert_eq!(t.ids_sent_to("star").await, [vec!["nd-404".to_string()]]);
+}
+
+/// An id the caller saved that Navidrome's own starred answer already lists keeps one row: the
+/// list Navidrome sent, without a second row for the save — songs and albums alike.
+#[tokio::test]
+async fn a_saved_id_navidrome_already_lists_is_not_doubled() {
+    let t = SavedApp::new(false).await;
+    get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&id={}", owner(), t.song),
+    )
+    .await;
+    get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&albumId={}", owner(), t.album),
+    )
+    .await;
+    t.double_songs.lock().push(t.song.clone());
+    t.double_albums.lock().push(t.album.clone());
+
+    let reply = get(&t.app, &format!("/rest/getStarred2.view?{}&f=json", owner())).await;
+    let starred = reply.envelope()["starred2"].clone();
+    let songs = starred["song"].as_array().expect("songs");
+    let song_rows = songs.iter().filter(|row| row["id"] == t.song.as_str()).count();
+    assert_eq!(song_rows, 1, "one row per id: {songs:?}");
+    assert_eq!(songs.len(), 2, "nd-7 and the saved id once each: {songs:?}");
+    let albums = starred["album"].as_array().expect("albums");
+    let album_rows = albums.iter().filter(|row| row["id"] == t.album.as_str()).count();
+    assert_eq!(album_rows, 1, "one row per id: {albums:?}");
+}
+
+/// The saved song and album join the XML starred list too, each with its save moment.
+#[tokio::test]
+async fn the_saved_song_and_album_join_the_xml_starred_lists() {
+    let t = SavedApp::new(false).await;
+    get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&id={}", owner(), t.song),
+    )
+    .await;
+    get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&albumId={}", owner(), t.album),
+    )
+    .await;
+    let saved = t.state.family_saved.list("winters");
+    let saved_album = t.state.family_saved.albums("winters");
+
+    let xml = get(&t.app, &format!("/rest/getStarred2.view?{}&f=xml", owner())).await;
+    let text = xml.text();
+    assert_eq!(
+        text.matches(&format!("id=\"{}\"", t.song)).count(),
+        1,
+        "the saved song, once: {text}"
+    );
+    assert!(
+        text.contains(&format!("starred=\"{}\"", starred_time(&saved[0].saved))),
+        "starred at the save moment: {text}"
+    );
+    assert_eq!(
+        text.matches(&format!("<album id=\"{}\"", t.album)).count(),
+        1,
+        "the saved album, once: {text}"
+    );
+    assert!(
+        text.contains(&format!("starred=\"{}\"", starred_time(&saved_album[0].saved))),
+        "the album starred at its save moment: {text}"
+    );
+}
+
+/// An unstar of a save beside a library id takes the save back and relays only the library id:
+/// the registry id never reaches Navidrome.
+#[tokio::test]
+async fn an_unstar_of_a_save_and_a_library_id_relays_only_the_library_id() {
+    let t = SavedApp::new(false).await;
+    get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&id={}", owner(), t.song),
+    )
+    .await;
+    assert_eq!(t.state.family_saved.list("winters").len(), 1);
+
+    let unstar = get(
+        &t.app,
+        &format!("/rest/unstar.view?{}&f=json&id=nd-7&id={}", owner(), t.song),
+    )
+    .await;
+    assert_eq!(unstar.envelope()["status"], "ok", "{}", unstar.text());
+    assert!(t.state.family_saved.list("winters").is_empty());
+    assert_eq!(t.ids_sent_to("unstar").await, [vec!["nd-7".to_string()]]);
+}
+
+/// An unstar takes a saved album back the same way: answered by Octo, relayed nowhere.
+#[tokio::test]
+async fn an_unstar_takes_the_saved_album_back() {
+    let t = SavedApp::new(false).await;
+    get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&albumId={}", owner(), t.album),
+    )
+    .await;
+    assert_eq!(t.state.family_saved.albums("winters").len(), 1);
+
+    let unstar = get(
+        &t.app,
+        &format!("/rest/unstar.view?{}&f=json&albumId={}", owner(), t.album),
+    )
+    .await;
+    assert_eq!(unstar.envelope()["status"], "ok", "{}", unstar.text());
+    assert!(t.state.family_saved.albums("winters").is_empty());
+    assert!(t.ids_sent_to("unstar").await.is_empty());
+}
+
+/// The native song detail shows a save of the requesting user only: another listener's save of
+/// the same song leaves the starred fields away.
+#[tokio::test]
+async fn the_native_song_detail_does_not_show_another_users_save() {
+    let t = SavedApp::new(false).await;
+    get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&id={}", owner(), t.song),
+    )
+    .await;
+    assert_eq!(t.state.family_saved.list("winters").len(), 1);
+
+    let other = get(
+        &t.app,
+        &format!(
+            "/api/song/{}?{}&f=json",
+            t.song,
+            auth("alex", "good", "Symfonium")
+        ),
+    )
+    .await;
+    let song = other.json();
+    assert_eq!(song["id"], t.song.as_str(), "{}", other.text());
+    assert!(song.get("starred").is_none(), "someone else's save: {song}");
+    assert!(song.get("starredAt").is_none(), "someone else's save: {song}");
 }
