@@ -7,25 +7,31 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
+use chrono::Utc;
 use http_body_util::BodyExt;
+use indexmap::IndexMap;
 use octo_core::family::abilities::{Abilities, Preset};
 use octo_core::models::domain::{Album, Song};
 use octo_core::settings::AppSettings;
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
+use octo_subsonic::SubsonicCredential;
 use serde_json::Value;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
-use super::{star, starred_time};
+use super::{star, starred_time, unstar};
 use crate::app::{AppState, TestServices};
 use crate::controllers::subsonic::test_app::*;
 use crate::http::pipeline::App;
 use crate::services::common::test_fakes::FakeMetadata;
-use crate::services::family::FamilyCaller;
+use crate::services::family::{FamilyCaller, SavedSong};
 use crate::services::family::test_support::member;
 
 /// Navidrome's getStarred2 answer in JSON: one library song, hearted long ago.
 const STARRED2_JSON: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","starred2":{"song":[{"id":"nd-7","title":"Library song","starred":"2026-01-01T00:00:00Z"}]}}}"#;
+
+/// The same in XML.
+const STARRED2_XML: &str = r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="navidrome"><starred2><song id="nd-7" title="Library song" starred="2026-01-01T00:00:00Z"></song></starred2></subsonic-response>"#;
 
 /// getStarred, the older list, with nothing starred.
 const STARRED_EMPTY_JSON: &str =
@@ -43,7 +49,12 @@ impl Respond for SavedNavidrome {
             return navidrome_json(NAVIDROME_WRONG_PASSWORD);
         }
         if path.ends_with("/rest/getStarred2") || path.ends_with("/rest/getStarred2.view") {
-            return navidrome_json(STARRED2_JSON);
+            return if request.url.query_pairs().any(|(k, v)| k == "f" && v == "json") {
+                navidrome_json(STARRED2_JSON)
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_raw(STARRED2_XML.as_bytes().to_vec(), "application/xml")
+            };
         }
         if path.ends_with("/rest/getStarred") || path.ends_with("/rest/getStarred.view") {
             return navidrome_json(STARRED_EMPTY_JSON);
@@ -83,6 +94,8 @@ impl SavedApp {
         };
         settings.subsonic.download_on_star = false;
         settings.subsonic.download_album_on_star = false;
+        // A waiting heart is listed only when it becomes a favorite on landing.
+        settings.subsonic.star_downloads_for_requester = true;
         let metadata = Arc::new(FakeMetadata::default());
         let state = AppState::for_tests_with(
             settings,
@@ -288,6 +301,59 @@ async fn saved_songs_and_albums_join_the_owners_starred_lists() {
     assert_eq!(starred["album"][0]["id"], t.album.as_str());
 }
 
+/// A song that is both saved as a streaming favorite and still waiting for its download holds
+/// one row in the starred lists — the save's row, starred at the save moment — in JSON and in
+/// XML alike.
+#[tokio::test]
+async fn a_song_both_saved_and_waiting_is_listed_once() {
+    let t = SavedApp::new(false).await;
+    // The save: a star with every download source off.
+    get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&id={}", owner(), t.song),
+    )
+    .await;
+    let saved = t.state.family_saved.list("winters");
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    // The waiting heart: a star from before the sources went off, its download still pending.
+    let (_, provider, external_id) = t.state.local_library.parse_song_id(&t.song);
+    let mut sign_in = IndexMap::new();
+    sign_in.insert("u".to_string(), "winters".to_string());
+    sign_in.insert("t".to_string(), "good".to_string());
+    sign_in.insert("s".to_string(), "salt".to_string());
+    let credential = SubsonicCredential::from(&sign_in).expect("the owner's sign-in");
+    t.state.star_on_arrival.hold_starred_song(
+        provider.as_deref().unwrap_or_default(),
+        external_id.as_deref().unwrap_or_default(),
+        &t.song,
+        &credential,
+        Some("winters"),
+    );
+
+    let reply = get(&t.app, &format!("/rest/getStarred2.view?{}&f=json", owner())).await;
+    let starred = reply.envelope()["starred2"].clone();
+    let songs = starred["song"].as_array().expect("songs");
+    assert_eq!(songs.len(), 2, "{}", reply.text());
+    let rows: Vec<&Value> = songs
+        .iter()
+        .filter(|row| row["id"] == t.song.as_str())
+        .collect();
+    assert_eq!(rows.len(), 1, "one row per id: {songs:?}");
+    assert_eq!(rows[0]["starred"], starred_time(&saved[0].saved).as_str());
+
+    let xml = get(&t.app, &format!("/rest/getStarred2.view?{}&f=xml", owner())).await;
+    let text = xml.text();
+    assert_eq!(
+        text.matches(&format!("id=\"{}\"", t.song)).count(),
+        1,
+        "one row per id: {text}"
+    );
+    assert!(
+        text.contains(&format!("starred=\"{}\"", starred_time(&saved[0].saved))),
+        "the save's row, at the save moment: {text}"
+    );
+}
+
 /// An unstar takes the owner's save back: the id is answered by Octo and relayed nowhere.
 #[tokio::test]
 async fn an_unstar_removes_the_owners_save() {
@@ -315,6 +381,64 @@ async fn an_unstar_removes_the_owners_save() {
     let songs = starred["song"].as_array().expect("songs");
     assert_eq!(songs.len(), 1, "{songs:?}");
     assert_eq!(songs[0]["id"], "nd-7");
+}
+
+/// A managed member's unstar of an outside id is answered by Octo whether a save of it stands
+/// or not — also for a repeated unstar, with the save already gone — and the registry id is
+/// relayed nowhere.
+#[tokio::test]
+async fn a_managed_members_unstar_is_answered_by_octo_without_a_relay() {
+    let t = SavedApp::new(true).await;
+    let caller = FamilyCaller::member("alex", Preset::Member, Abilities::preset(Preset::Member));
+    let member_unstar = |song: &str| {
+        let mut request = Request::builder()
+            .uri(format!(
+                "/rest/unstar.view?id={song}&u=alex&t=good&s=salt&v=1.16.1&c=test&f=json"
+            ))
+            .body(Body::empty())
+            .expect("a request");
+        request.extensions_mut().insert(caller.clone());
+        request
+    };
+
+    // No save stands: a repeated unstar, or one of an id never saved.
+    let response = unstar(State(t.state.clone()), member_unstar(&t.song)).await;
+    let body = response.into_body().collect().await.expect("read").to_bytes();
+    let answer: Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(answer["subsonic-response"]["status"], "ok", "{answer}");
+    assert!(
+        t.ids_sent_to("unstar").await.is_empty(),
+        "the registry id never reached Navidrome"
+    );
+    t.nothing_fetching();
+
+    // With a save standing: it is taken back by Octo, still without a relay.
+    t.state.family_saved.add(
+        "alex",
+        SavedSong {
+            id: t.song.clone(),
+            title: "Teardrop".into(),
+            artist: "Massive Attack".into(),
+            album: "Mezzanine".into(),
+            cover_art: t.song.clone(),
+            duration: 330,
+            explicit: 0,
+            saved: Utc::now(),
+        },
+    );
+    let response = unstar(State(t.state.clone()), member_unstar(&t.song)).await;
+    let body = response.into_body().collect().await.expect("read").to_bytes();
+    let answer: Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(answer["subsonic-response"]["status"], "ok", "{answer}");
+    assert!(
+        t.state.family_saved.list("alex").is_empty(),
+        "the save is taken back"
+    );
+    assert!(
+        t.ids_sent_to("unstar").await.is_empty(),
+        "the registry id never reached Navidrome"
+    );
+    t.nothing_fetching();
 }
 
 /// The native song detail carries the save moment as Navidrome would (starred and starredAt)

@@ -768,8 +768,8 @@ async fn ask_for_copy(state: &AppState, user: &str, id: &str, kind: RequestKind,
 /// Octo: a saved song or album is forgotten — a family member's, or a caller Octo does not
 /// manage who saved it as a streaming favorite — and a heart still waiting for its download is
 /// dropped, so the song leaves the caller's starred lists. Library ids go to Navidrome
-/// together. A request with no outside id, or only outside ids Octo holds nothing for, goes
-/// where it always went.
+/// together. A request with no outside id, or one from a caller Octo does not manage with only
+/// outside ids Octo holds nothing for, goes where it always went.
 pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::response::Response {
     let member = family_caller(req.extensions())
         .filter(|caller| caller.managed)
@@ -843,7 +843,14 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
             .iter()
             .any(|(_, id)| state.family_saved.is_saved(user, id))
     });
-    if !mapped && (outside.is_empty() || (!saves_held && library.is_empty() && held.is_empty())) {
+    // A member's outside ids are always answered here — Octo holds a save or a waiting heart for
+    // them or holds nothing at all, and either way Navidrome has never seen the id — so the
+    // pass-through shortcut is a caller Octo does not manage's, taken only when nothing of
+    // theirs stands here: no save to take back, no waiting heart, no library id.
+    if !mapped
+        && (outside.is_empty()
+            || (member.is_none() && !saves_held && library.is_empty() && held.is_empty()))
+    {
         return match member {
             None => {
                 if let Some((holder, ids)) = forget
@@ -988,6 +995,8 @@ pub async fn get_starred(State(state): State<AppState>, req: Request) -> axum::r
 
 /// The answer with the caller's waiting hearts added, when it is a plain 200 Navidrome accepted,
 /// and with their saved songs and albums when `with_saves` (a caller Octo does not manage).
+/// Every list keeps at most one row per id across everything it joins: a song both saved and
+/// still waiting for its download keeps its saved row, starred when it was saved.
 async fn with_waiting_hearts(
     state: &AppState,
     call: &SubsonicCall,
@@ -1055,7 +1064,10 @@ async fn with_waiting_hearts(
             }
             let song_list = holder.entry("song").or_insert_with(|| Value::Array(Vec::new()));
             if let Some(list) = song_list.as_array_mut() {
-                let known: Vec<String> = list
+                // One row per id across everything this list joins: each appended row counts as
+                // known from here on, so a song both saved and still waiting for its download
+                // keeps a single row — the save's, starred when it was saved.
+                let mut known: Vec<String> = list
                     .iter()
                     .filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_string))
                     .collect();
@@ -1066,6 +1078,7 @@ async fn with_waiting_hearts(
                     let mut fields = builder.convert_song_to_json(&saved_song(saved));
                     fields.insert("starred".into(), starred_time(&saved.saved).into());
                     list.push(Value::Object(fields));
+                    known.push(saved.id.clone());
                 }
                 for (song, starred) in &songs {
                     if known.contains(&song.id) {
@@ -1089,7 +1102,9 @@ async fn with_waiting_hearts(
             let Some(holder) = root.elements_mut().find(|e| e.name == container) else {
                 return false;
             };
-            let known: Vec<String> = holder
+            // One row per id here too: every appended row counts as known, so a song both
+            // saved and still waiting keeps a single element — the save's.
+            let mut known: Vec<String> = holder
                 .elements()
                 .filter_map(|e| e.attribute("id").map(str::to_string))
                 .collect();
@@ -1108,6 +1123,7 @@ async fn with_waiting_hearts(
                 let mut element = builder.convert_song_to_xml(&saved_song(saved), ns.as_deref());
                 element.set_attr("starred", starred_time(&saved.saved));
                 holder.push(element);
+                known.push(saved.id.clone());
             }
             for (song, starred) in &songs {
                 if known.contains(&song.id) {
