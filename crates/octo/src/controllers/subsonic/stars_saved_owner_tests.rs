@@ -24,8 +24,8 @@ use crate::app::{AppState, TestServices};
 use crate::controllers::subsonic::test_app::*;
 use crate::http::pipeline::App;
 use crate::services::common::test_fakes::FakeMetadata;
-use crate::services::family::{FamilyCaller, SavedSong};
 use crate::services::family::test_support::member;
+use crate::services::family::{FamilyCaller, SavedSong};
 
 /// Navidrome's getStarred2 answer in JSON: one library song, hearted long ago.
 const STARRED2_JSON: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","starred2":{"song":[{"id":"nd-7","title":"Library song","starred":"2026-01-01T00:00:00Z"}]}}}"#;
@@ -52,8 +52,7 @@ impl Respond for SavedNavidrome {
             return if request.url.query_pairs().any(|(k, v)| k == "f" && v == "json") {
                 navidrome_json(STARRED2_JSON)
             } else {
-                ResponseTemplate::new(200)
-                    .set_body_raw(STARRED2_XML.as_bytes().to_vec(), "application/xml")
+                ResponseTemplate::new(200).set_body_raw(STARRED2_XML.as_bytes().to_vec(), "application/xml")
             };
         }
         if path.ends_with("/rest/getStarred") || path.ends_with("/rest/getStarred.view") {
@@ -334,10 +333,7 @@ async fn a_song_both_saved_and_waiting_is_listed_once() {
     let starred = reply.envelope()["starred2"].clone();
     let songs = starred["song"].as_array().expect("songs");
     assert_eq!(songs.len(), 2, "{}", reply.text());
-    let rows: Vec<&Value> = songs
-        .iter()
-        .filter(|row| row["id"] == t.song.as_str())
-        .collect();
+    let rows: Vec<&Value> = songs.iter().filter(|row| row["id"] == t.song.as_str()).collect();
     assert_eq!(rows.len(), 1, "one row per id: {songs:?}");
     assert_eq!(rows[0]["starred"], starred_time(&saved[0].saved).as_str());
 

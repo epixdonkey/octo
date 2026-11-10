@@ -848,8 +848,7 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
     // pass-through shortcut is a caller Octo does not manage's, taken only when nothing of
     // theirs stands here: no save to take back, no waiting heart, no library id.
     if !mapped
-        && (outside.is_empty()
-            || (member.is_none() && !saves_held && library.is_empty() && held.is_empty()))
+        && (outside.is_empty() || (member.is_none() && !saves_held && library.is_empty() && held.is_empty()))
     {
         return match member {
             None => {
