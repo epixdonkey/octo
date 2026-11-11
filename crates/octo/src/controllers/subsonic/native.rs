@@ -573,6 +573,13 @@ fn native_song_object(state: &AppState, song: &Song) -> Value {
     if let Some(genre) = song.genre.as_deref().filter(|genre| !genre.is_empty()) {
         fields.insert("genre".into(), genre.into());
     }
+    // Which service a discovery row came from (a YouTube Music song, a YouTube Music video, or
+    // a plain YouTube hit), under the same name the Subsonic serializer gives it
+    // (`octoSuggestedBy`, the badge the radio answers made a convention): a video and a song
+    // are two different rows, and the choice between the services belongs to the user.
+    if let Some(by) = song.suggested_by.as_deref().filter(|by| !by.is_empty()) {
+        fields.insert("octoSuggestedBy".into(), by.into());
+    }
     object
 }
 
@@ -921,3 +928,7 @@ fn sanitize(text: &str) -> String {
         text.replace(['/', '\\'], "_")
     }
 }
+
+#[cfg(test)]
+#[path = "native_tests.rs"]
+mod tests;

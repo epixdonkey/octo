@@ -19,6 +19,10 @@ use tracing::{debug, info};
 
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::last_fm::LastFmService;
+use crate::services::soulseek::ExternalIdRegistry;
+use crate::services::soulseek::soulseek_metadata_service::{parse_query, register_you_tube_row};
+use crate::services::you_tube::YouTubeResolver;
+use crate::services::you_tube::you_tube_music_client::{YouTubeMusicClient, YtmRow, song_and_routing};
 
 /// Rows built per query, regardless of how many the caller wants.
 ///
@@ -72,6 +76,14 @@ pub struct ExternalSearchService {
     last_fm: Option<Arc<LastFmService>>,
     /// Optional: how long a build waits for lengths, read at every build.
     settings: Option<Arc<SettingsStore>>,
+    /// YouTube Music's search, through the shim's `/ytm` endpoints: the one client the radio
+    /// shares (D14), so discovery and radio spend one shim.
+    you_tube_music: Arc<YouTubeMusicClient>,
+    /// The shim's yt-dlp client, for the multi-hit fallback (`/search/list`, D11).
+    you_tube_resolver: Arc<YouTubeResolver>,
+    /// The registry YouTube rows are minted into: their ids are `make_short_id` of the routing
+    /// they arrive with, so the row plays, opens and stars like any outside song (D6/D13).
+    id_registry: Arc<ExternalIdRegistry>,
     /// The last finished builds, by query.
     recent_songs: Arc<RecentResults<Song>>,
     recent_albums: RecentResults<Album>,
@@ -87,6 +99,9 @@ impl ExternalSearchService {
         metadata: Arc<dyn IMusicMetadataService>,
         last_fm: Option<Arc<LastFmService>>,
         settings: Option<Arc<SettingsStore>>,
+        you_tube_music: Arc<YouTubeMusicClient>,
+        you_tube_resolver: Arc<YouTubeResolver>,
+        id_registry: Arc<ExternalIdRegistry>,
     ) -> Self {
         ExternalSearchService {
             song_builds: SupersedableBuildCoordinator::new(),
@@ -94,6 +109,9 @@ impl ExternalSearchService {
             metadata,
             last_fm,
             settings,
+            you_tube_music,
+            you_tube_resolver,
+            id_registry,
             recent_songs: Arc::new(RecentResults::new(RECENT_RESULTS_TTL, RECENT_RESULTS_MAX)),
             recent_albums: RecentResults::new(RECENT_RESULTS_TTL, RECENT_RESULTS_MAX),
             last_fm_answers: Arc::new(RecentResults::new(RECENT_RESULTS_TTL, RECENT_RESULTS_MAX)),
@@ -142,9 +160,11 @@ impl ExternalSearchService {
         // Only the key, not the radio switch. Discovery in the search bar is a different
         // feature from radio, and gating it on EnableRadio made turning radio off empty
         // the search results too.
-        let Some(last_fm) = self.last_fm.clone().filter(|l| l.has_api_key()) else {
-            return Arc::new(Vec::new());
-        };
+        //
+        // The YouTube half needs no key (D4): without one the catalogs are simply absent and
+        // the build answers from YouTube Music and the yt-dlp fallback alone; with one, the
+        // catalogs keep their priority and YouTube supplements them.
+        let last_fm = self.last_fm.clone().filter(|l| l.has_api_key());
 
         let key = key.to_string();
         if let Some(cached) = self.recent_songs.get(&key, Instant::now()) {
@@ -167,6 +187,11 @@ impl ExternalSearchService {
         let wait = subsonic.effective_search_duration_wait();
         let last_fm_wait = subsonic.effective_search_last_fm_wait();
         let query_text = query.to_string();
+        let you_tube = YouTubeSources {
+            music: Arc::clone(&self.you_tube_music),
+            resolver: Arc::clone(&self.you_tube_resolver),
+            registry: Arc::clone(&self.id_registry),
+        };
         let shared = BuildShared {
             key: key.clone(),
             last_fm_answers: Arc::clone(&self.last_fm_answers),
@@ -182,7 +207,7 @@ impl ExternalSearchService {
                 query.trim(),
                 move |token: CancellationToken| async move {
                     tokio::select! {
-                        (built, source) = build(query_text, last_fm, metadata, wait, last_fm_wait, shared, rows_done) => Ok((Arc::new(built), source)),
+                        (built, source) = build(query_text, last_fm, metadata, wait, last_fm_wait, you_tube, shared, rows_done) => Ok((Arc::new(built), source)),
                         () = token.cancelled() => Err(anyhow::anyhow!("The operation was canceled.")),
                     }
                 },
@@ -377,18 +402,31 @@ struct BuildShared {
 #[allow(clippy::too_many_arguments)]
 async fn build(
     query: String,
-    last_fm: Arc<LastFmService>,
+    last_fm: Option<Arc<LastFmService>>,
     metadata: Arc<dyn IMusicMetadataService>,
     duration_wait: Duration,
     last_fm_wait: Duration,
+    you_tube: YouTubeSources,
     shared: BuildShared,
     rows_done: RowsDone,
 ) -> (Vec<Song>, SongSource) {
     let started = Instant::now();
-    let (collected, source) = song_rows(&query, &last_fm, &metadata, last_fm_wait, &shared).await;
+    let (mut collected, source) = song_rows(&query, &last_fm, &metadata, last_fm_wait, &shared).await;
     let searched = started.elapsed();
 
-    let mut songs = Vec::with_capacity(collected.len());
+    // The YouTube half (D2/D11/D3): rows registered with their video and its length at once,
+    // deduped version-aware. A catalog row the SONGS catalog's row covers is left out rather
+    // than minted: that row is the richer duplicate of the same recording (the video is pinned
+    // and the length is the video's own) and the songs catalog folds its own duplicates
+    // (Correction B). A video row or a YouTube hit covers nothing: a video and a song are two
+    // different rows that never merge, and so are YouTube Music and YouTube — the catalog row
+    // keeps its own place beside them.
+    let you_tube_songs = you_tube_songs(&query, &collected, &you_tube).await;
+    if !you_tube_songs.is_empty() {
+        collected.retain(|(artist, title)| you_tube_songs.iter().all(|row| !row.covers(artist, title)));
+    }
+
+    let mut songs = Vec::with_capacity(collected.len() + you_tube_songs.len());
     for (artist, title) in &collected {
         if let Some(hit) = metadata
             .search_songs_by_artist_title(artist, title, 1, None)
@@ -399,6 +437,8 @@ async fn build(
             songs.push(hit);
         }
     }
+    songs.extend(you_tube_songs.into_iter().map(|row| row.song));
+    songs.truncate(BUILD_SIZE as usize);
     let placed = started.elapsed();
     info!("External search '{query}' -> {} placeholder songs", songs.len());
 
@@ -485,14 +525,18 @@ async fn build(
 }
 
 /// The artist and title of each row, deduped, at most [`BUILD_SIZE`]: Last.fm's, or Deezer's
-/// when Last.fm is late (see [`build`]).
+/// when Last.fm is late (see [`build`]). With no Last.fm key there are no catalog rows at all
+/// (D4): the build's songs are the YouTube half's alone.
 async fn song_rows(
     query: &str,
-    last_fm: &Arc<LastFmService>,
+    last_fm: &Option<Arc<LastFmService>>,
     metadata: &Arc<dyn IMusicMetadataService>,
     last_fm_wait: Duration,
     shared: &BuildShared,
 ) -> (Vec<(String, String)>, SongSource) {
+    let Some(last_fm) = last_fm.as_ref().filter(|l| l.has_api_key()) else {
+        return (Vec::new(), SongSource::Nothing);
+    };
     if let Some(kept) = shared.last_fm_answers.get(&shared.key, Instant::now()) {
         return (last_fm_rows(query, &kept, last_fm).await, SongSource::LastFmKept);
     }
@@ -580,6 +624,288 @@ fn deduped(rows: impl Iterator<Item = (String, String)>) -> Vec<(String, String)
         }
     }
     collected
+}
+
+// ---- The YouTube half (D2/D3/D11) ----------------------------------------------------------
+
+/// The YouTube half's dependencies, into the build.
+#[derive(Clone)]
+struct YouTubeSources {
+    music: Arc<YouTubeMusicClient>,
+    resolver: Arc<YouTubeResolver>,
+    registry: Arc<ExternalIdRegistry>,
+}
+
+/// Which of YouTube's services a row came from. A video and a song are two different things
+/// that never merge into one row, and YouTube Music and plain YouTube are two different
+/// services: the same song sounds different in each, and the choice belongs to the user, not
+/// to the algorithm. So the merge rules and the answer's order both read this: only the very
+/// same upload (the same `videoId`) seen from two services is one row, and only the songs
+/// catalog folds its own duplicates; YouTube Music answers before plain YouTube, which is the
+/// fallback for what the catalogs do not have (mixes, sets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowOrigin {
+    /// YouTube Music's `songs` catalog: a release.
+    Songs,
+    /// YouTube Music's `videos` catalog: an upload.
+    Videos,
+    /// Plain YouTube's own search, through the shim's yt-dlp fallback (D11).
+    YouTube,
+}
+
+impl RowOrigin {
+    /// What the clients show on the row (`octoSuggestedBy`, the badge the radio answers made
+    /// a convention): the user sees what a row is — a YouTube Music song, a YouTube Music
+    /// video, or a YouTube hit — and chooses between the services.
+    fn label(self) -> &'static str {
+        match self {
+            RowOrigin::Songs => "YouTube Music (song)",
+            RowOrigin::Videos => "YouTube Music (video)",
+            RowOrigin::YouTube => "YouTube",
+        }
+    }
+}
+
+/// A YouTube-origin row: the registered song, the video it was minted with, and the service
+/// it came from. The dedup's stages read the video and the origin; the song itself has no
+/// field for either (the source label rides `suggested_by`, which nothing stores).
+struct YouTubeSong {
+    song: Song,
+    you_tube_id: Option<String>,
+    origin: RowOrigin,
+}
+
+/// The YouTube half of a search: YouTube Music's `songs` and `videos` filters asked at once,
+/// the rows that match the query first with the videos filter's rows ahead of the songs
+/// catalog's (the upload the query means is the answer, ahead of the release of the same
+/// recording — W3), and, when neither the catalogs nor YouTube Music answered with a row that
+/// matches the query, the shim's multi-hit yt-dlp search as the fallback (D11) behind the
+/// matched rows and ahead of the unrelated ones. Every row is registered with its video and
+/// its length at once (seed-stable, D6/D13), carries its service's label, and the
+/// version-aware dedup folds only what it may: the same upload, and the songs catalog's own
+/// duplicates. A shim that cannot answer — 502 `ytm_failed`, 503 busy, unreachable — leaves no
+/// rows: the search still answers from its other sources (degradation, not panic).
+async fn you_tube_songs(
+    query: &str,
+    catalog: &[(String, String)],
+    sources: &YouTubeSources,
+) -> Vec<YouTubeSong> {
+    // Both filters at once (D2): the songs catalog answers releases, the videos one uploads,
+    // and the song asked for can sit in either (measured: K3KHA - Lost in Sound is only in
+    // videos). A filter the shim could not answer is no rows from it, never a failure.
+    let (songs, videos) = tokio::join!(
+        sources.music.search(query, "songs"),
+        sources.music.search(query, "videos"),
+    );
+    let (exact, rest) = split_ytm_rows(
+        query,
+        songs.unwrap_or_default().unwrap_or_default(),
+        videos.unwrap_or_default().unwrap_or_default(),
+    );
+    // The fallback only runs when nothing matched: it is the last source, and asking it while
+    // a source already answered with the query's own song only adds duplicates to fold.
+    let matched = !exact.is_empty()
+        || catalog
+            .iter()
+            .any(|(artist, title)| pair_matches_query(query, artist, title));
+    let fallback = fallback_rows(query, matched, sources).await;
+    let rows = exact.into_iter().chain(fallback).chain(rest);
+    let registered = rows
+        .map(|(row, origin)| {
+            let (song, routing) = song_and_routing(&row);
+            let you_tube_id = routing.you_tube_id.clone();
+            let mut song = register_you_tube_row(&sources.registry, (song, routing));
+            song.suggested_by = Some(origin.label().to_string());
+            YouTubeSong {
+                song,
+                you_tube_id,
+                origin,
+            }
+        })
+        .collect();
+    dedupe_you_tube_songs(registered)
+}
+
+/// The fallback's rows (D11): plain YouTube's own hits for a query neither the catalogs nor
+/// YouTube Music answered with its own song — mixes and sets the catalogs do not have. Empty
+/// when `matched`, so a source that already answered is never asked to duplicate itself. The
+/// hits sit behind the matched rows (there are none when this runs) and ahead of the
+/// unrelated ones: they are the query's own content, on plain YouTube, behind YouTube Music.
+async fn fallback_rows(query: &str, matched: bool, sources: &YouTubeSources) -> Vec<(YtmRow, RowOrigin)> {
+    if matched {
+        return Vec::new();
+    }
+    sources
+        .resolver
+        .search_many(query, YouTubeResolver::SEARCH_MANY_LIMIT)
+        .await
+        .into_iter()
+        .filter_map(|hit| fallback_row(query, &hit))
+        .map(|row| (row, RowOrigin::YouTube))
+        .collect()
+}
+
+/// Splits the two catalogs' answers into the rows that are the query's own song and the rest
+/// (D2, PoC-1's `interleave_ytm_rows`). Among the query's own rows the videos filter's come
+/// first, the songs catalog's after them: a video and a song of the same recording are two
+/// different rows, and the upload the query means is the answer ahead of the release of it
+/// (W3: `vBvDiLKTDWA` first). The rest keep the index-by-index interleave: songs[i] before
+/// videos[i], row by row.
+fn split_ytm_rows(
+    query: &str,
+    songs: Vec<YtmRow>,
+    videos: Vec<YtmRow>,
+) -> (Vec<(YtmRow, RowOrigin)>, Vec<(YtmRow, RowOrigin)>) {
+    let mut exact_videos = Vec::new();
+    let mut exact_songs = Vec::new();
+    let mut rest = Vec::new();
+    for i in 0..songs.len().max(videos.len()) {
+        for (rows, origin) in [(&songs, RowOrigin::Songs), (&videos, RowOrigin::Videos)] {
+            let Some(row) = rows.get(i) else {
+                continue;
+            };
+            if !row_matches_query(query, row) {
+                rest.push((row.clone(), origin));
+            } else if origin == RowOrigin::Videos {
+                exact_videos.push((row.clone(), origin));
+            } else {
+                exact_songs.push((row.clone(), origin));
+            }
+        }
+    }
+    (exact_videos.into_iter().chain(exact_songs).collect(), rest)
+}
+
+/// Whether a row is the query's own song: the query's key names one of the row's artists and
+/// the row's title (`matches_query` from PoC-1).
+fn row_matches_query(query: &str, row: &YtmRow) -> bool {
+    let query_key = SongIdentity::key(query);
+    let artist_hit = row.artists.iter().any(|artist| {
+        let key = SongIdentity::key(artist);
+        !key.is_empty() && query_key.contains(&key)
+    });
+    artist_hit && query_key.contains(&SongIdentity::key(&row.title))
+}
+
+/// Whether a catalog row is the query's own song, on the same rule as [`row_matches_query`].
+fn pair_matches_query(query: &str, artist: &str, title: &str) -> bool {
+    let query_key = SongIdentity::key(query);
+    let artist_key = SongIdentity::key(artist);
+    !artist_key.is_empty() && query_key.contains(&artist_key) && query_key.contains(&SongIdentity::key(title))
+}
+
+/// A fallback hit as the same row shape YouTube Music's rows have, so registration, the dedup
+/// and the query match are one code path for both sources. The artist is the query's leading
+/// words (the split `search_songs` makes of a free-text query); a hit without a title names
+/// nothing to show and is skipped, as a YouTube Music row without one is.
+fn fallback_row(query: &str, hit: &crate::services::you_tube::YouTubeHit) -> Option<YtmRow> {
+    let title = hit.title.as_deref()?.trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let (artist, _) = parse_query(query);
+    Some(YtmRow {
+        video_id: hit.video_id.clone(),
+        title,
+        artists: vec![artist],
+        album: None,
+        duration_seconds: hit.duration,
+        video_type: None,
+    })
+}
+
+/// How far apart two rows' lengths may be and still be one recording in the songs catalog's
+/// own dedup.
+const SAME_RECORDING_WITHIN_SECONDS: i32 = 8;
+
+impl YouTubeSong {
+    /// Whether this row is the songs catalog's own row of the catalog row `artist - title`:
+    /// a song row covers its catalog twin (the richer duplicate of the same recording — the
+    /// video is pinned and the length is the video's own), while a video row or a plain
+    /// YouTube hit covers nothing: a video and a song never merge, and neither do YouTube
+    /// Music and YouTube, so the catalog row keeps its own place beside them. Versions keep
+    /// their own rows (`match_key` is versioned).
+    fn covers(&self, artist: &str, title: &str) -> bool {
+        self.origin == RowOrigin::Songs
+            && SongIdentity::match_key(&self.song.artist, &self.song.title)
+                .eq_ignore_ascii_case(&SongIdentity::match_key(artist, title))
+    }
+}
+
+/// Whether two YouTube rows are one recording: the very same upload (the same `videoId`),
+/// whatever service each was seen from; or — inside the songs catalog alone — a shared ISRC,
+/// the same MusicBrainz recording, or the same versioned `match_key` with lengths within
+/// [`SAME_RECORDING_WITHIN_SECONDS`] when both are known (Correction B). Everything else
+/// stays apart: a YouTube Music video and a YouTube Music song are two different rows, and so
+/// are YouTube Music and plain YouTube, whatever the same recording's length in each says.
+/// Versions stay apart in every catalog: an Extended Mix, a Live take or a radio edit is its
+/// own row.
+fn same_recording(kept: &YouTubeSong, item: &YouTubeSong) -> bool {
+    // The same upload seen from two services (the videos filter and yt-dlp's fallback, say)
+    // is one row: literally the same video.
+    if let (Some(a), Some(b)) = (kept.you_tube_id.as_deref(), item.you_tube_id.as_deref())
+        && !a.is_empty()
+        && a == b
+    {
+        return true;
+    }
+    // Only the songs catalog folds its own duplicates; every other pair is two rows.
+    if kept.origin != RowOrigin::Songs || item.origin != RowOrigin::Songs {
+        return false;
+    }
+    // A shared ISRC, or the same MusicBrainz recording.
+    if SongIdentity::shares_isrc(kept.song.isrc.as_deref(), item.song.isrc.as_deref()) {
+        return true;
+    }
+    if let (Some(a), Some(b)) = (
+        kept.song.music_brainz_recording_id.as_deref(),
+        item.song.music_brainz_recording_id.as_deref(),
+    ) && !a.is_empty()
+        && a.eq_ignore_ascii_case(b)
+    {
+        return true;
+    }
+    // The same versioned key, with lengths close enough when both are known.
+    let kept_key = SongIdentity::match_key(&kept.song.artist, &kept.song.title);
+    let item_key = SongIdentity::match_key(&item.song.artist, &item.song.title);
+    if !kept_key.eq_ignore_ascii_case(&item_key) {
+        return false;
+    }
+    match (kept.song.duration, item.song.duration) {
+        (Some(a), Some(b)) => (a - b).abs() <= SAME_RECORDING_WITHIN_SECONDS,
+        _ => true,
+    }
+}
+
+/// Folds the duplicate rows (`dedupe_multi_source_songs` from PoC-1): the first of a set of
+/// duplicates wins, keeps its video, its length and its service's label (a video a row was
+/// minted with is never replaced, D13), and takes what it lacks — the ISRC, the MusicBrainz
+/// recording, a blank album — from the rows folded into it.
+fn dedupe_you_tube_songs(rows: Vec<YouTubeSong>) -> Vec<YouTubeSong> {
+    let mut kept: Vec<YouTubeSong> = Vec::new();
+    for row in rows {
+        match kept.iter_mut().find(|existing| same_recording(existing, &row)) {
+            Some(existing) => {
+                if existing.you_tube_id.is_none() {
+                    existing.you_tube_id = row.you_tube_id;
+                }
+                if existing.song.duration.is_none() {
+                    existing.song.duration = row.song.duration;
+                }
+                if existing.song.album.is_empty() {
+                    existing.song.album = row.song.album.clone();
+                }
+                if existing.song.isrc.is_none() {
+                    existing.song.isrc = row.song.isrc.clone();
+                }
+                if existing.song.music_brainz_recording_id.is_none() {
+                    existing.song.music_brainz_recording_id = row.song.music_brainz_recording_id.clone();
+                }
+            }
+            None => kept.push(row),
+        }
+    }
+    kept
 }
 
 /// Who waits for each query's row lookups: album ownership reads its tracklists from the same

@@ -314,8 +314,10 @@ fn parse_int(text: &str) -> Option<i32> {
         .ok()
 }
 
-/// "artist title..." split at the first space; the title is None for a single word.
-fn parse_query(query: &str) -> (String, Option<String>) {
+/// "artist title..." split at the first space; the title is None for a single word. How the
+/// metadata service reads a free-text query ([`IMusicMetadataService::search_songs`]); the
+/// external search's YouTube fallback reads it the same way.
+pub(crate) fn parse_query(query: &str) -> (String, Option<String>) {
     let trimmed = query.trim();
     match trimmed.find(' ') {
         Some(idx) if idx > 0 => (
@@ -406,6 +408,24 @@ impl SoulseekMetadataService {
     }
 }
 
+/// A YouTube Music or YouTube search row as an outside song: registered at once, with the video
+/// and the length it arrived with — the registration pattern of
+/// [`IMusicMetadataService::search_songs_by_artist_title`], but pinned from the start, so the
+/// routing hashes to the id it keeps (seed-stable, D6) and the enrichment pipeline never
+/// overwrites its video or length (D13). A catalog row is the contrast: it mints with no video
+/// and resolves one lazily. The song half of `row` gets its id and provider here.
+pub fn register_you_tube_row(registry: &ExternalIdRegistry, row: (Song, SoulseekRouting)) -> Song {
+    let (mut song, routing) = row;
+    let id = registry.register(routing);
+    // The length the row carried is the video's own, so it is remembered as that: nothing a
+    // catalog lookup finds later may sit above it.
+    registry.remember_length(&id, song.duration, LengthSource::Video);
+    song.id = id.clone();
+    song.external_provider = Some(SoulseekMetadataService::PROVIDER_NAME.to_string());
+    song.external_id = Some(id);
+    song
+}
+
 /// The catalog ids of the clean copies in an album listing: a release that is not marked
 /// explicit beside one of the same artist and title that is. The listing alone does not tell a
 /// clean edit from an album that never had explicit words, but its explicit twin does.
@@ -484,12 +504,22 @@ impl Inner {
         self.id_registry.lookup(id)
     }
 
+    /// Whether the song under `id` was minted with a video (a YouTube Music or YouTube row,
+    /// D13): such a row keeps the video and the length it arrived with, and no catalog answer
+    /// or durations pass replaces them.
+    fn pins_a_video(&self, id: &str) -> bool {
+        self.lookup(id)
+            .is_some_and(|r| r.lock().you_tube_id.as_deref().is_some_and(|y| !y.is_empty()))
+    }
+
     /// Reflect a catalog answer onto the song and its shared routing, so getSong stays
     /// consistent, and remember its length. The catalog's album only fills a blank one: the
     /// track it matched can sit on a compilation, and the album the song already names is the
-    /// one it came from.
+    /// one it came from. A row minted with a video keeps the length it arrived with (D13).
     fn apply_track_meta(&self, song: &mut Song, meta: &TrackMeta) {
-        if let Some(d) = meta.duration.filter(|&d| d > 0) {
+        if !self.pins_a_video(&song.id)
+            && let Some(d) = meta.duration.filter(|&d| d > 0)
+        {
             song.duration = Some(d);
         }
         if dotnet::is_blank(&song.album)
@@ -503,10 +533,14 @@ impl Inner {
     }
 
     fn reflect_on_routing(&self, id: &str, meta: &TrackMeta) {
-        // Reflect onto the shared routing so getSong stays consistent.
+        // Reflect onto the shared routing so getSong stays consistent. A row minted with a
+        // video keeps the length it arrived with (D13); `remember_length` below is safe either
+        // way, as a catalog length never outranks a video's.
         if let Some(routing) = self.lookup(id) {
             let mut r = routing.lock();
-            if let Some(d) = meta.duration.filter(|&d| d > 0) {
+            if !r.you_tube_id.as_deref().is_some_and(|y| !y.is_empty())
+                && let Some(d) = meta.duration.filter(|&d| d > 0)
+            {
                 r.duration = Some(d);
             }
             if r.album.as_deref().is_none_or(dotnet::is_blank)
@@ -1358,6 +1392,9 @@ impl IMusicMetadataService for SoulseekMetadataService {
         let tasks = songs
             .iter_mut()
             .filter(|s| !s.is_local)
+            // A row minted with its video (a YouTube Music or YouTube row, D13) keeps that
+            // video and its length in every pass, foreground or background.
+            .filter(|s| !inner.pins_a_video(&s.id))
             .take(TOP_DURATION_RESOLVE_LIMIT)
             .map(|song| async move {
                 // The background pass runs after the client has the results, so a play may already
@@ -1401,6 +1438,10 @@ impl IMusicMetadataService for SoulseekMetadataService {
             .iter()
             .enumerate()
             .filter(|(_, s)| !s.is_local)
+            // A row minted with its video (D13) is left to both passes: the video it arrived
+            // with is the one it plays, and its length is the video's own — so `keep_video`
+            // never calls `pin_video(.., replace = true)` on it.
+            .filter(|(_, s)| !self.inner.pins_a_video(&s.id))
             .take(TOP_DURATION_RESOLVE_LIMIT)
             .map(|(index, song)| (index, song.clone()))
             .collect();

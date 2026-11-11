@@ -15,6 +15,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use super::*;
 use crate::services::metadata::{DeezerRateLimitHandler, DeezerRateLimiter};
+use crate::services::you_tube::you_tube_music_client::{YtmRow, song_and_routing};
 use octo_core::settings::SettingsStore;
 
 /// Every url the fake catalog was asked for, and its answers by url substring (the first
@@ -2152,4 +2153,137 @@ async fn the_catalog_track_search_answers_its_rows_lookups() {
     h.service.enrich_search_rows(&mut songs).await;
     assert_eq!(songs[0].album, "25");
     assert_eq!(h.calls("/search?"), 1);
+}
+
+// ---- Faza 1: YouTube rows registered with their video, and the pins they hold (D6/D13) -------
+
+/// A YouTube Music row as the search's YouTube half takes it.
+fn you_tube_music_row(id: &str, title: &str, artist: &str, seconds: Option<i32>) -> YtmRow {
+    YtmRow {
+        video_id: id.into(),
+        title: title.into(),
+        artists: vec![artist.into()],
+        album: None,
+        duration_seconds: seconds,
+        video_type: None,
+    }
+}
+
+/// A YouTube Music row registered with its video and its length mints the id its routing
+/// hashes to: replayed field for field, `make_short_id` says the same id (seed-stable, D6),
+/// and the registry hands back the routing the row arrived with (R4-T2).
+#[tokio::test]
+async fn a_you_tube_row_is_registered_with_its_video_and_its_length() {
+    let h = build_service(Vec::new()).await;
+    let (song, routing) = song_and_routing(&you_tube_music_row(
+        "vBvDiLKTDWA",
+        "Lost in Sound",
+        "K3KHA",
+        Some(619),
+    ));
+    let song = register_you_tube_row(&h.registry, (song, routing));
+
+    assert_eq!(song.duration, Some(619));
+    assert_eq!(song.external_provider.as_deref(), Some(PROVIDER));
+    let registered = h.lookup(&song.id);
+    assert_eq!(registered.you_tube_id.as_deref(), Some("vBvDiLKTDWA"));
+    assert_eq!(registered.duration, Some(619));
+    // The id is the seed of the routing the row arrived with, replayed field for field.
+    let replayed = SoulseekRouting {
+        kind: RoutingKind::Song,
+        you_tube_id: Some("vBvDiLKTDWA".into()),
+        artist: Some("K3KHA".into()),
+        title: Some("Lost in Sound".into()),
+        duration: Some(619),
+        ..Default::default()
+    };
+    assert_eq!(ExternalIdRegistry::make_short_id(&replayed), song.id);
+}
+
+/// A row minted with its video keeps that video and its length through the pipeline (D13): the
+/// catalog's answer fills its album but never its duration, and the foreground durations pass
+/// never looks for another video for it — while a catalog row, minted without a video, still
+/// takes the catalog's length and gets its video resolved as before (regression: zero).
+#[tokio::test]
+async fn a_row_minted_with_a_video_keeps_it_through_enrichment_and_the_durations_pass() {
+    let h = build_service(vec![
+        (
+            "search?q=k3kha%20lost%20in%20sound",
+            r#"{"data":[{"title":"Lost in Sound","duration":313,
+                "album":{"id":9,"title":"Singles"},"artist":{"name":"K3KHA"}}]}"#,
+        ),
+        ("search?q=adele%20hello", HELLO_HIT),
+    ])
+    .await;
+    let (pinned, routing) = song_and_routing(&you_tube_music_row(
+        "vBvDiLKTDWA",
+        "Lost in Sound",
+        "K3KHA",
+        Some(619),
+    ));
+    let pinned = register_you_tube_row(&h.registry, (pinned, routing));
+    let mut songs = vec![pinned, hello_row(&h).await];
+
+    h.service.enrich_search_rows(&mut songs).await;
+
+    // The pinned row keeps the video's length and takes only the catalog's album; the catalog
+    // row takes the catalog's length, as it always did.
+    assert_eq!(songs[0].duration, Some(619));
+    assert_eq!(songs[0].album, "Singles");
+    assert_eq!(songs[1].duration, Some(295));
+
+    // The foreground durations pass resolves the catalog row and leaves the pinned row's
+    // video alone: the shim is never asked about the pinned row's song.
+    let still_running = h
+        .service
+        .resolve_top_durations_within(&mut songs, Duration::from_millis(500))
+        .await;
+    if let Some(pass) = still_running {
+        let _ = pass.await;
+    }
+    let routing = h.lookup(&songs[0].id);
+    assert_eq!(routing.you_tube_id.as_deref(), Some("vBvDiLKTDWA"));
+    assert_eq!(routing.duration, Some(619));
+    assert_eq!(h.calls("ytm/search?q=k3kha"), 0);
+}
+
+/// The foreground durations pass never replaces a row's pinned video (D13): a row minted
+/// with its upload keeps it even when the shim WOULD answer with another video of the song
+/// — `keep_video` has no `pin_video(.., replace = true)` to reach for it, and the shim is
+/// not even asked. The asking itself is the bug this pins down: the guard sits before the
+/// pass's targets, so a wrongly targeted pinned row would come back with the other video.
+#[tokio::test]
+async fn the_foreground_durations_pass_never_replaces_a_pinned_video() {
+    // YouTube Music would answer the song's lookup with a different upload, close enough in
+    // length to be the pick the pass wants.
+    let h = build_service(vec![(
+        "ytm/search?q=k3kha%20lost%20in%20sound",
+        r#"{"tracks":[{"videoId":"otherVid9999","title":"Lost in Sound","artists":["K3KHA"],
+            "durationSeconds":620,"videoType":"MUSIC_VIDEO_TYPE_ATV"}]}"#,
+    )])
+    .await;
+    let (pinned, routing) = song_and_routing(&you_tube_music_row(
+        "vBvDiLKTDWA",
+        "Lost in Sound",
+        "K3KHA",
+        Some(619),
+    ));
+    let pinned = register_you_tube_row(&h.registry, (pinned, routing));
+    let mut songs = vec![pinned];
+
+    let still_running = h
+        .service
+        .resolve_top_durations_within(&mut songs, Duration::from_millis(500))
+        .await;
+    if let Some(pass) = still_running {
+        let _ = pass.await;
+    }
+
+    // The pinned video stands, with the length it arrived with, and the shim was never
+    // asked about the row's song.
+    let routing = h.lookup(&songs[0].id);
+    assert_eq!(routing.you_tube_id.as_deref(), Some("vBvDiLKTDWA"));
+    assert_eq!(routing.duration, Some(619));
+    assert_eq!(songs[0].duration, Some(619));
+    assert_eq!(h.calls("ytm/search?q=K3KHA%20Lost"), 0);
 }

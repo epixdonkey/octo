@@ -3,8 +3,9 @@
 use octo_core::common::song_identity::{SongMatchOptions, SongRef};
 use octo_core::common::{SongIdentity, dotnet};
 use octo_core::json::element::{ElementResult, enumerate_array, get_int32, try_get_property};
+use octo_core::models::domain::Song;
 use octo_core::settings::SettingsStore;
-use octo_core::soulseek::SongLength;
+use octo_core::soulseek::{RoutingKind, SongLength, SoulseekRouting};
 use serde_json::Value;
 use tracing::debug;
 
@@ -236,6 +237,37 @@ pub fn rows(root: &Value) -> ElementResult<Vec<YtmRow>> {
         });
     }
     Ok(rows)
+}
+
+/// A `YtmRow` (from either filter, `songs` or `videos`) as the search pipeline takes it: the
+/// song the row becomes, and the routing minted with the row's video and its length from the
+/// start — the video and the length are part of the registry id, so the row is seed-stable and
+/// nothing later replaces them (D6/D13). A catalog row is the contrast: it mints with no video
+/// and resolves one lazily. The song's `id` is empty here; the registry fills it when it
+/// registers the routing. The first artist is the main one and the rest follow it, as
+/// [`pick_song`] reads the row's artists.
+pub fn song_and_routing(row: &YtmRow) -> (Song, SoulseekRouting) {
+    let artist = row.artists.join(", ");
+    let routing = SoulseekRouting {
+        kind: RoutingKind::Song,
+        you_tube_id: Some(row.video_id.clone()),
+        artist: Some(artist.clone()),
+        title: Some(row.title.clone()),
+        album: row.album.clone(),
+        duration: row.duration_seconds,
+        ..Default::default()
+    };
+    (
+        Song {
+            artist,
+            title: row.title.clone(),
+            album: row.album.clone().unwrap_or_default(),
+            duration: row.duration_seconds,
+            is_local: false,
+            ..Default::default()
+        },
+        routing,
+    )
 }
 
 /// `video_type` of a release's own audio track.
