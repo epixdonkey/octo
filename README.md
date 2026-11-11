@@ -16,6 +16,18 @@ Search any song and play it right away. Keep the ones you love as files on your 
 
 ---
 
+> ### This fork
+>
+> A fork of [winters27/octo](https://github.com/winters27/octo) that extends
+> the outside search and playlists: **YouTube Music and YouTube search that
+> works without a Last.fm key** (a video and a song are separate, labeled
+> rows — never merged), **mixed personal playlists** that hold local files and
+> YouTube streams side by side and survive a server restart, and **streaming
+> favorites** for the owner when `DOWNLOAD_ON_STAR=false`. Upstream's features
+> and defaults are untouched. Details: [CHANGELOG.md](CHANGELOG.md).
+
+---
+
 Octo gives a home server what a streaming app has: search that reaches past your own library, songs that play the moment you pick them, and radio that learns what you like. When a song is worth keeping, Octo downloads the best copy it can find, tags it and files it in your library, where it stays with no subscription.
 
 It runs on [Navidrome](https://www.navidrome.org/), the open-source music server. If you already run Navidrome, Octo sits in front of it and your library stays as it is. If you don't, the installer starts one for you.
