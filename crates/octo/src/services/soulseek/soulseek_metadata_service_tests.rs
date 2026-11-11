@@ -105,6 +105,7 @@ async fn build_service_with_delay(routes: Vec<(&str, &str)>, delay: Option<Durat
         deezer_over(&server.uri()),
         Arc::new(CoverArtAggregator::new(Vec::new())),
         None,
+        None,
     );
     Harness {
         registry,
@@ -985,6 +986,7 @@ impl LengthFixture {
             deezer.clone(),
             Arc::new(CoverArtAggregator::new(Vec::new())),
             Some(Arc::new(LastFmTable(tables.clone()))),
+            None,
         );
         LengthFixture {
             tables,

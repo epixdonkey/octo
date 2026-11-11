@@ -945,7 +945,9 @@ impl SubsonicResponseBuilder {
         if let Some(year) = song.year {
             fields.insert("year".into(), year.into());
         }
-        // Which radio source suggested the song; only radio answers carry it (octoRadioSources).
+        // Which source suggested the song: radio answers carry their source (octoRadioSources),
+        // an outside-search row the label of the origin it came by ("YouTube Music (song)",
+        // "YouTube Music (video)", "YouTube").
         if let Some(by) = song.suggested_by.as_deref().filter(|by| !by.is_empty()) {
             fields.insert("octoSuggestedBy".into(), by.into());
         }

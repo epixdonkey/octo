@@ -127,6 +127,36 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
     let ids = sent_ids(&call, "id");
     state.imports.forget_cached_songs(&ids);
     let hearted_ids = ids.clone();
+
+    // A star on a personal playlist is the explicit "download the missing ones" (R-5 op. 4):
+    // only the positions without a library file, straight through the heart's queue. Nothing of
+    // this reaches Navidrome, so the sign-in is checked first; the unstar path never fetches.
+    let (held_playlists, rest): (Vec<String>, Vec<String>) = ids
+        .iter()
+        .cloned()
+        .partition(|id| state.personal_playlists.knows(id));
+    if !held_playlists.is_empty() {
+        if let Some(refused) = refuse_unless_signed_in(&state, &call, &format).await? {
+            return Ok(refused);
+        }
+        let who = signed_in_user(&state, &call).await?;
+        let requested_by = requester_for(&state, Some(&who));
+        for playlist_id in &held_playlists {
+            if let Some(playlist) = state.personal_playlists.find(playlist_id) {
+                info!(
+                    "A star on playlist '{}' starts its {} missing download(s)",
+                    playlist.name,
+                    playlist.missing_tracks_for_explicit_download().len()
+                );
+                super::playlists::queue_missing(&state, &playlist, requested_by.as_deref());
+            }
+        }
+        if rest.is_empty() {
+            return Ok(builder.create_response(&format, "starred").into_response());
+        }
+    }
+    let ids = rest;
+
     let album_ids = sent_ids(&call, "albumId");
     let artist_ids = sent_ids(&call, "artistId");
     // What a heart on an outside song or album does for this person: a download into the

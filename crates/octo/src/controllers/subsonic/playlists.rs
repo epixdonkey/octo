@@ -35,6 +35,7 @@ use super::action_helpers::{
 use super::caller_checks::listener_name_of;
 use crate::app::AppState;
 use crate::middleware::family_gate::{GateReading, Unverified};
+use crate::services::common::AcquisitionTarget;
 use crate::services::family::audio_gate::ExplicitMark;
 use crate::services::family::family_playlists::{
     self, FAMILY_OWNER, NewEntry, PlaylistError, SHARED_SCOPE, Serve, ShownEntry, personal_scope,
@@ -81,6 +82,12 @@ pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Respo
     let notices = notice_titles(&state, &username);
     let mut relay = relay;
     if let Some(body) = mark_notice_rows(&relay.body, &format, &username, &notices) {
+        relay.body = body.into();
+    }
+
+    // The personal playlists' counts are the overlay's (mixed positions), not the local-only
+    // mirror's.
+    if let Some(body) = super::personal_playlists::correct_playlist_rows(&state, &relay.body, &format) {
         relay.body = body.into();
     }
 
@@ -835,6 +842,14 @@ async fn get_playlist_inner(state: &AppState, req: Request, aborted: &RequestAbo
             .into_response();
     }
 
+    // A personal playlist the overlay holds: every position in its stored order, each with the
+    // source it plays by. Not the overlay's: the usual relay below.
+    if state.personal_playlists.knows(&id)
+        && let Some(answer) = super::personal_playlists::rest_get_playlist(state, &call, &id).await
+    {
+        return answer;
+    }
+
     let Some(station) = playlist_stations(state, &username)
         .into_iter()
         .find(|item| item.id == id)
@@ -999,6 +1014,154 @@ async fn family_action_playlist(
     )
 }
 
+/// `updatePlaylist` on the owner's own "Request a copy in FLAC" playlist: each outside song put
+/// on it (or already waiting there) is fetched straight away through the heart's queue (D15 —
+/// NOT a family request, which is the members' branch above); a library song needs nothing, it
+/// is already there. The playlist is then emptied, as the fetch itself is the record. `None`
+/// for any other playlist.
+async fn owner_action_playlist(state: &AppState, call: &SubsonicCall, id: &str) -> Option<Response> {
+    const AUTH_KEYS: [&str; 9] = ["u", "p", "t", "s", "v", "c", "apiKey", "jwt", "f"];
+    if id.trim().is_empty() {
+        return None;
+    }
+    // Only ADDING is the fetch gesture. Taking a position off, or deleting the playlist
+    // outright (deletePlaylist lands here through the same handler), is an ordinary edit
+    // Navidrome can do itself: queueing a download of the very song being taken off would be
+    // the opposite of what was asked. The members' branch above keeps its own bookkeeping — a
+    // member's action playlist IS the record of its requests — so this gate is the owner's
+    // alone.
+    let adds = call.param("songIdToAdd").unwrap_or("");
+    let removes = call
+        .incoming
+        .parameter_values("songIndexToRemove")
+        .iter()
+        .any(|value| !value.trim().is_empty());
+    if adds.trim().is_empty() && (removes || playlist_change(call) == Some(PlaylistChange::Delete)) {
+        return None;
+    }
+    let mut auth: Vec<(String, String)> = call
+        .parameters
+        .iter()
+        .filter(|(key, _)| {
+            AUTH_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key)) && !key.eq_ignore_ascii_case("f")
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    auth.push(("f".into(), "json".into()));
+    let mut ask = auth.clone();
+    ask.push(("id".into(), id.to_string()));
+    let read = call
+        .proxy
+        .relay_safe("rest/getPlaylist", ask.iter().map(|(k, v)| (k, v)))
+        .await?;
+    let body: Value = serde_json::from_slice(&read.body).ok()?;
+    let playlist = body.pointer("/subsonic-response/playlist")?;
+    let name = playlist.get("name").and_then(Value::as_str)?.trim().to_string();
+    if !name.eq_ignore_ascii_case(REQUEST_FLAC_PLAYLIST) {
+        return None;
+    }
+    let username = listener_name_of(state, &call.parameters, &call.proxy, &call.parts.headers).await;
+    // The fetch is a download into the shared library, so the branch is the playlist owner's
+    // alone (O2): the FLAC playlist is provisioned per user and private, and the identity Octo
+    // can name — signed_in_user's own resolution — must be the owner the playlist's row names.
+    // A FLAC-named playlist of someone else's (a public one can be read by any account) or a
+    // caller Octo cannot name is an ordinary edit: the faithful relay, no queue.
+    let row_owner = playlist
+        .get("owner")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if username.trim().is_empty()
+        || row_owner.is_empty()
+        || !dotnet::eq_ignore_case(username.trim(), &row_owner)
+    {
+        return None;
+    }
+    let requested_by = super::caller_checks::requester_for(state, Some(username.as_str()));
+    let carried: Vec<String> = playlist
+        .get("entry")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let added: Vec<String> = call
+        .param("songIdToAdd")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|song| !song.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut fetched = 0;
+    for song in carried.iter().chain(added.iter()) {
+        let (_, provider, external_id) = state.local_library.parse_song_id(song);
+        if let (Some(provider), Some(external_id)) = (provider, external_id) {
+            info!("OWNER {song} put on the '{name}' playlist: fetching it into the library");
+            state.heart_acquisition_coordinator.queue_track_for(
+                &provider,
+                &external_id,
+                requested_by.as_deref(),
+                AcquisitionTarget::Shared,
+            );
+            fetched += 1;
+        }
+    }
+    // The playlist empties, as it does for the members: the fetch is the record.
+    if !carried.is_empty() {
+        let mut empty = auth.clone();
+        empty.push(("playlistId".into(), id.to_string()));
+        empty.extend((0..carried.len()).map(|at| ("songIndexToRemove".to_string(), at.to_string())));
+        if call
+            .proxy
+            .relay_safe("rest/updatePlaylist", empty.iter().map(|(k, v)| (k, v)))
+            .await
+            .is_none()
+        {
+            warn!("Could not empty the '{name}' playlist");
+        }
+    }
+    let _ = fetched;
+    Some(
+        state
+            .subsonic_response_builder
+            .create_response(&call.format, "updatePlaylist")
+            .into_response(),
+    )
+}
+
+/// Queues a held personal playlist's still-outside positions through the heart's coordinator:
+/// the explicit "download the missing ones" of R-5 operation 4, straight to the queue (no
+/// request playlist, no family request). Positions with a library file are left alone. The
+/// queue call lives here rather than in the overlay, so the overlay itself never downloads
+/// anything (the Boundary Rule); `stars.rs`'s star-on-a-playlist and the overlay's `[download]`
+/// tag branch both go through this one door.
+pub(crate) fn queue_missing(
+    state: &AppState,
+    playlist: &crate::services::subsonic::personal_playlist_store::PersonalPlaylist,
+    requested_by: Option<&str>,
+) {
+    for outside_id in playlist.missing_tracks_for_explicit_download() {
+        let (_, provider, external_id) = state.local_library.parse_song_id(&outside_id);
+        let provider = provider.unwrap_or_else(|| "soulseek".to_string());
+        let external_id = external_id.unwrap_or_else(|| outside_id.clone());
+        info!(
+            "Playlist '{}': fetching its missing song {outside_id}",
+            playlist.name
+        );
+        state.heart_acquisition_coordinator.queue_track_for(
+            &provider,
+            &external_id,
+            requested_by,
+            AcquisitionTarget::Shared,
+        );
+    }
+}
+
 /// Refuses Octo's own ids, changes family playlists, and relays everything else as
 /// `rest/<last path segment>` in the client's own spelling.
 async fn mutate(state: AppState, req: Request, id_key: &str, _fallback: &str, failure: &str) -> Response {
@@ -1023,6 +1186,13 @@ async fn mutate(state: AppState, req: Request, id_key: &str, _fallback: &str, fa
     {
         return answer;
     }
+    // The owner's own FLAC action playlist: what is put on it is fetched straight away, through
+    // the heart's queue (D15) — the family's request playlists above are a different thing.
+    if id_key == "playlistId"
+        && let Some(answer) = owner_action_playlist(&state, &call, &id).await
+    {
+        return answer;
+    }
     if is_family_playlist_id(&state, &id)
         && let Some(change) = playlist_change(&call)
     {
@@ -1037,6 +1207,15 @@ async fn mutate(state: AppState, req: Request, id_key: &str, _fallback: &str, fa
     // The endpoint is the path's last segment, without `.view`.
     let path = call.path();
     let endpoint = path.split('/').next_back().unwrap_or("").replace(".view", "");
+    // The personal playlists overlay takes its own create/update/delete; a plain playlist is
+    // none of its business until a client puts an outside id on it.
+    if matches!(
+        endpoint.as_str(),
+        "createPlaylist" | "updatePlaylist" | "deletePlaylist"
+    ) && let Some(answer) = super::personal_playlists::rest_mutate(&state, &call, &endpoint, failure).await
+    {
+        return answer;
+    }
     match call
         .proxy
         .relay_safe(&format!("rest/{endpoint}"), &call.parameters)
@@ -1311,7 +1490,7 @@ async fn library_song_json(call: &SubsonicCall, id: &str) -> Option<Value> {
 }
 
 /// An outside song in the shape every outside song has.
-async fn outside_song_json(state: &AppState, id: &str) -> Option<Value> {
+pub(crate) async fn outside_song_json(state: &AppState, id: &str) -> Option<Value> {
     let (external, provider, external_id) = state.local_library.parse_song_id(id);
     if !external {
         return None;

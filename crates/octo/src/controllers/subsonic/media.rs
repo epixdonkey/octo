@@ -28,8 +28,8 @@ use tracing::{debug, error, info, warn};
 
 use super::action_helpers::MAX_REQUEST_BODY;
 use super::caller_checks::{
-    SubsonicCall, file, is_first_byte_request, is_successful_subsonic_response, refuse_unless_signed_in,
-    requester_for, signed_in_user,
+    SubsonicCall, file, is_first_byte_request, is_successful_subsonic_response, is_true,
+    refuse_unless_signed_in, requester_for, signed_in_user,
 };
 use crate::app::AppState;
 use crate::http::catch_all;
@@ -441,17 +441,34 @@ async fn audio_head(State(state): State<AppState>, req: Request) -> AppResult {
 // ---------------------------------------------------------------------------------------
 
 /// An outside song downloads exactly as it streams: the bytes Octo relays, or the copy it
-/// waits for, are the only file it has. A library song goes to Navidrome's own `download`
-/// through the faithful relay.
+/// waits for, are the only file it has. `save=1` (a parameter no Subsonic client sends; the
+/// surface for Octo's own calls, D15) queues a permanent fetch beside the stream, as the
+/// owner's shared copy. A library song goes to Navidrome's own `download` through the faithful
+/// relay, its `save` ignored as part of the passthrough.
 pub async fn download(State(state): State<AppState>, req: Request) -> AppResult {
     let (parts, body) = req.into_parts();
     let Ok(body) = axum::body::to_bytes(body, MAX_REQUEST_BODY).await else {
         return Ok(StatusCode::PAYLOAD_TOO_LARGE.into_response());
     };
     let call = SubsonicCall::from_parts(&state, &parts, body.clone());
-    let outside = state.local_library.parse_song_id(call.param("id")).0;
+    let (outside, provider, external_id) = state.local_library.parse_song_id(call.param("id"));
     let req = Request::from_parts(parts, Body::from(body));
     if outside {
+        if is_true(call.param("save")) {
+            // The stream's own sign-in refusal answers an unasked-for fetch; a named listener's
+            // fetch is queued before the bytes, so the answer never waits on it.
+            if let Ok(who) = signed_in_user(&state, &call).await {
+                let provider = provider.unwrap_or_default();
+                let external_id = external_id.unwrap_or_default();
+                let requested_by = requester_for(&state, Some(&who));
+                state.heart_acquisition_coordinator.queue_track_for(
+                    &provider,
+                    &external_id,
+                    requested_by.as_deref(),
+                    crate::services::common::AcquisitionTarget::Shared,
+                );
+            }
+        }
         stream(State(state), req).await
     } else {
         Ok(catch_all::catch_all(State(state), req).await)

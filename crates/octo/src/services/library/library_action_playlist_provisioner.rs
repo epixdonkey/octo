@@ -121,10 +121,11 @@ impl LibraryActionPlaylistProvisioner {
         let current = self.settings.current();
         let settings = &current.library_actions;
         let family_titles = self.family_titles(username);
+        let owner_titles = self.owner_titles(username);
         let actions_on = settings.enabled
             && (settings.playlists_enabled || settings.notices_enabled())
             && settings.is_allowed(Some(username));
-        if !actions_on && family_titles.is_empty() {
+        if !actions_on && family_titles.is_empty() && owner_titles.is_empty() {
             return Vec::new();
         }
         if !self.done.lock().insert(dotnet::ordinal_ignore_case_key(username)) {
@@ -153,7 +154,12 @@ impl LibraryActionPlaylistProvisioner {
             Vec::new()
         };
         let mut wanted: Vec<String> = Vec::new();
-        for title in actions.into_iter().chain(notices).chain(family_titles) {
+        for title in actions
+            .into_iter()
+            .chain(notices)
+            .chain(owner_titles)
+            .chain(family_titles)
+        {
             let exists = existing_names
                 .iter()
                 .any(|name| dotnet::eq_ignore_case(name, &title));
@@ -226,6 +232,21 @@ impl LibraryActionPlaylistProvisioner {
     pub fn with_family(mut self, family: Arc<FamilyStore>) -> Self {
         self.family = Some(family);
         self
+    }
+
+    /// The owner's own FLAC action playlist: the explicit-download surface (R-5 operation 3),
+    /// there for anyone who is not a family member — the owner (D15). Creating only; what is put
+    /// on it is `playlists.rs`'s owner branch, the members' requests untouched.
+    fn owner_titles(&self, username: &str) -> Vec<String> {
+        if username.trim().is_empty() {
+            return Vec::new();
+        }
+        if let Some(family) = &self.family
+            && family.member(username).is_some()
+        {
+            return Vec::new();
+        }
+        vec![REQUEST_FLAC_PLAYLIST.to_string()]
     }
 
     /// A family member's own action playlists: "Request a copy" (and "Request a copy in FLAC"
@@ -308,7 +329,11 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
 
-        // Keep comes on with Review; the Review playlist itself exists already.
+        // Keep comes on with Review; the Review playlist itself exists already. The owner's own
+        // FLAC playlist (R-5 operation 3, D15) comes with anyone who is not a family member:
+        // bob's listing claims his own, and Alice's creates hers beside her Keep — each create
+        // with the caller's own sign-in (the `u` the call carried), never an id that would turn
+        // it into an edit.
         provisioner.ensure("bob", &[], &auth).await;
         provisioner
             .ensure("Alice", &["▸ review".to_string()], &auth)
@@ -330,7 +355,14 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(created, [("🛠 Keep".to_string(), "alice".to_string(), false)]);
+        assert_eq!(
+            created,
+            [
+                (REQUEST_FLAC_PLAYLIST.to_string(), "alice".to_string(), false),
+                ("🛠 Keep".to_string(), "alice".to_string(), false),
+                (REQUEST_FLAC_PLAYLIST.to_string(), "alice".to_string(), false),
+            ]
+        );
     }
 
     fn keep_settings(navidrome: &MockServer) -> Arc<SettingsStore> {
@@ -349,10 +381,12 @@ mod tests {
         }))
     }
 
-    fn creates(requests: &[wiremock::Request]) -> usize {
+    /// How many creates carried `title` (the query string, matched exactly).
+    fn creates_of(requests: &[wiremock::Request], title: &str) -> usize {
         requests
             .iter()
             .filter(|r| r.url.path() == "/rest/createPlaylist")
+            .filter(|r| r.url.query_pairs().any(|(k, v)| k == "name" && v == title))
             .count()
     }
 
@@ -388,7 +422,10 @@ mod tests {
         listing("alice").await;
 
         let requests = navidrome.received_requests().await.expect("recorded");
-        assert_eq!(creates(&requests), 1);
+        // Each missing title exactly once: the Keep the listing noticed, and the owner's own
+        // FLAC playlist beside it.
+        assert_eq!(creates_of(&requests, "🛠 Keep"), 1);
+        assert_eq!(creates_of(&requests, REQUEST_FLAC_PLAYLIST), 1);
     }
 
     /// A create Navidrome refused gives the title back, so the next listing tries again.
@@ -423,7 +460,14 @@ mod tests {
         }
 
         let requests = navidrome.received_requests().await.expect("recorded");
-        assert_eq!(creates(&requests), 2, "the refused one, then the one that worked");
+        // The refused Keep is tried again by the next listing and works; the owner's FLAC
+        // playlist needed no second chance.
+        assert_eq!(
+            creates_of(&requests, "🛠 Keep"),
+            2,
+            "the refused one, then the one that worked"
+        );
+        assert_eq!(creates_of(&requests, REQUEST_FLAC_PLAYLIST), 1);
     }
 
     /// Nothing missing means nothing to spawn: the listing path skips the create step.
@@ -440,7 +484,11 @@ mod tests {
         }));
         let provisioner =
             LibraryActionPlaylistProvisioner::new(SubsonicProxyService::new(settings.clone()), settings);
-        let listed = ["▸ Review".to_string(), "🛠 KEEP".to_string()];
+        let listed = [
+            "▸ Review".to_string(),
+            "🛠 KEEP".to_string(),
+            REQUEST_FLAC_PLAYLIST.to_string(),
+        ];
         assert!(provisioner.missing("alice", &listed).is_empty());
     }
 }
@@ -513,7 +561,9 @@ mod family_tests {
         );
         // A member who adds songs at once has nothing to ask for.
         assert_eq!(created_for("alex", true).await, [REMOVE_PLAYLIST]);
-        assert!(created_for("winters", true).await.is_empty());
+        // The owner — anyone who is not a member — gets their own FLAC fetch surface (R-5
+        // operation 3, D15): creating only, the members' request playlists untouched.
+        assert_eq!(created_for("winters", true).await, [REQUEST_FLAC_PLAYLIST]);
         assert!(created_for("sam", false).await.is_empty(), "Family off");
     }
 }

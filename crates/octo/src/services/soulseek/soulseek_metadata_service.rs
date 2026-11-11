@@ -30,6 +30,7 @@ use crate::services::framework::InFlight;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::metadata::DeezerMetadataService;
 use crate::services::metadata::deezer_metadata_service::fold_editions;
+use crate::services::subsonic::personal_playlist_store::PersonalPlaylistStore;
 use crate::services::you_tube::{YouTubeHit, YouTubeResolver};
 
 /// The two members of `LastFmService` the length lookup uses: whether it has an API key, and
@@ -74,6 +75,9 @@ struct Inner {
     deezer: Arc<DeezerMetadataService>,
     cover_art: Arc<CoverArtAggregator>,
     last_fm: Option<Arc<dyn LastFmTrackLengths>>,
+    /// The personal playlists' snapshots, for the overlay `get_song` puts on its thin answer
+    /// once a routing is found (D6). None in the tests that build the service bare.
+    personal_playlists: Option<Arc<PersonalPlaylistStore>>,
 
     /// Ids with a lookup queued or running, so several clients loading one station
     /// at once do not each look its songs up again.
@@ -337,6 +341,7 @@ impl SoulseekMetadataService {
         deezer: Arc<DeezerMetadataService>,
         cover_art: Arc<CoverArtAggregator>,
         last_fm: Option<Arc<dyn LastFmTrackLengths>>,
+        personal_playlists: Option<Arc<PersonalPlaylistStore>>,
     ) -> Self {
         SoulseekMetadataService {
             inner: Arc::new(Inner {
@@ -345,6 +350,7 @@ impl SoulseekMetadataService {
                 deezer,
                 cover_art,
                 last_fm,
+                personal_playlists,
                 length_lookups: Mutex::new(HashSet::new()),
                 last_length_warm: Mutex::new(None),
                 last_rows_finish: Mutex::new(None),
@@ -1809,7 +1815,7 @@ impl IMusicMetadataService for SoulseekMetadataService {
             None => Self::try_decode_external_id(Some(external_id))?,
         };
 
-        Some(Song {
+        let mut song = Song {
             id: external_id.to_string(),
             title: routing.title.clone().unwrap_or_default(),
             artist: routing.artist.clone().unwrap_or_default(),
@@ -1827,7 +1833,34 @@ impl IMusicMetadataService for SoulseekMetadataService {
             external_provider: Some(Self::PROVIDER_NAME.to_string()),
             external_id: Some(external_id.to_string()),
             ..Default::default()
-        })
+        };
+        // The playlist store's overlay: a position on a personal playlist keeps the whole song
+        // as it was found, so after a restart (or an LRU eviction) getSong still answers with
+        // the fields the routing alone never had. Never over the routing's own words: it only
+        // fills what is missing (D6).
+        if let Some(store) = &self.inner.personal_playlists
+            && let Some(snapshot) = store.recover_song(external_id)
+        {
+            if song.music_brainz_recording_id.is_none() {
+                song.music_brainz_recording_id = snapshot.music_brainz_recording_id;
+            }
+            if song.year.is_none() {
+                song.year = snapshot.year;
+            }
+            if song.genre.as_deref().is_none_or(str::is_empty) {
+                song.genre = snapshot.genre;
+            }
+            if song.isrc.as_deref().is_none_or(str::is_empty) {
+                song.isrc = snapshot.isrc;
+            }
+            if song.album.trim().is_empty() {
+                song.album = snapshot.album;
+            }
+            if song.duration.is_none() {
+                song.duration = snapshot.duration;
+            }
+        }
+        Some(song)
     }
 
     async fn get_album(&self, external_provider: &str, external_id: &str) -> Option<Album> {

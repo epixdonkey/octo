@@ -6,6 +6,7 @@ pub mod animated_art;
 pub mod info;
 pub mod internet_radio;
 pub mod native;
+pub mod personal_playlists;
 pub mod ping;
 pub mod places;
 pub mod playlists;

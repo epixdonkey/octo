@@ -155,6 +155,8 @@ use crate::services::soulseek::{
     SoulseekStartupValidator,
 };
 use crate::services::spotiflac::SpotiflacClient;
+use crate::services::subsonic::personal_playlist_reconciler::PersonalPlaylistReconciler;
+use crate::services::subsonic::personal_playlist_store::PersonalPlaylistStore;
 use crate::services::subsonic::{
     CredentialCheck, NavidromeIdentityService, RecentScrobbles, RequestIdentity, SearchSongOrderCache,
     SubsonicDiscoveryService, SubsonicProxyService, SyncCatalogService,
@@ -548,6 +550,9 @@ pub struct AppInner {
     pub family_saved: Arc<SavedStore>,
     /// `family-playlists.json`: playlists every member can add to.
     pub family_playlists: Arc<FamilyPlaylistStore>,
+    /// `personal-playlists.json`: the owner's mixed personal playlists, each position keeping
+    /// both of its sources at once (D5).
+    pub personal_playlists: Arc<PersonalPlaylistStore>,
     /// Where family playlist additions that wait for approval are reported.
     pub family_playlist_requests: crate::services::family::family_playlists::PlaylistAddHook,
     /// `family-pool.json`: the one copy of each member download and who links it.
@@ -1348,6 +1353,7 @@ struct Stores {
     family_requests: Arc<RequestStore>,
     family_saved: Arc<SavedStore>,
     family_playlists: Arc<FamilyPlaylistStore>,
+    personal_playlists: Arc<PersonalPlaylistStore>,
     family_pool: Arc<FamilyPoolStore>,
     listening: Arc<crate::services::listening::ListeningLog>,
 }
@@ -1471,6 +1477,9 @@ impl Stores {
             family_saved: Arc::new(SavedStore::new(Some(config_dir.join("family-saved.json")))),
             family_playlists: Arc::new(FamilyPlaylistStore::new(Some(
                 config_dir.join("family-playlists.json"),
+            ))),
+            personal_playlists: Arc::new(PersonalPlaylistStore::new(Some(
+                config_dir.join("personal-playlists.json"),
             ))),
             family_pool: Arc::new(FamilyPoolStore::new(Some(config_dir.join("family-pool.json")))),
             listening: Arc::new(crate::services::listening::ListeningLog::new(
@@ -1903,10 +1912,12 @@ impl GenreAndCoverJobs {
     }
 }
 
-/// Imports: the import service and the trickle that downloads into the library.
+/// Imports: the import service, the trickle that downloads into the library, and the personal
+/// playlists' reconciler (built on the imports' matcher and Navidrome playlist api).
 struct Imports {
     service: Arc<crate::services::imports::ImportService>,
     trickle: Arc<crate::services::imports::TrickleWorker>,
+    reconciler: Arc<PersonalPlaylistReconciler>,
 }
 
 impl Imports {
@@ -1954,7 +1965,7 @@ impl Imports {
             store: Arc::new(ImportStore::new(file("imports.json"))),
             queue,
             trickle: trickle.clone(),
-            matcher,
+            matcher: matcher.clone(),
             playlists: ImportPlaylists::new(Arc::new(NavidromePlaylists {
                 api: navidrome.navidrome_playlist_api.clone(),
                 identity: navidrome.navidrome_identity.clone(),
@@ -1964,10 +1975,25 @@ impl Imports {
             tracker: Some(acquisition.acquisition_tracker.clone()),
         });
         let weak = Arc::downgrade(&service);
-        stores
-            .external_id_registry
-            .set_recovery(Arc::new(move |id| weak.upgrade()?.preview_routing(id)));
-        Imports { service, trickle }
+        // The recovery chain (D6): the imports' own preview first, then a personal playlist
+        // position's kept seed, verbatim — which is what takes the id back through the registry's
+        // `lookup` guard after a restart or an LRU eviction (W1).
+        let personal_playlists = stores.personal_playlists.clone();
+        stores.external_id_registry.set_recovery(Arc::new(move |id| {
+            weak.upgrade()
+                .and_then(|service| service.preview_routing(id))
+                .or_else(|| personal_playlists.recover_routing(id))
+        }));
+        let reconciler = Arc::new(PersonalPlaylistReconciler::new(
+            stores.personal_playlists.clone(),
+            matcher.clone(),
+            navidrome.navidrome_playlist_api.clone(),
+        ));
+        Imports {
+            service,
+            trickle,
+            reconciler,
+        }
     }
 
     fn register_workers(&self, workers: &WorkerSupervisor) {
@@ -1978,6 +2004,10 @@ impl Imports {
         let service = self.service.clone();
         workers.register("ImportService", move |stopping| {
             service.clone().run_loop(stopping)
+        });
+        let reconciler = self.reconciler.clone();
+        workers.register("PersonalPlaylistReconciler", move |stopping| {
+            reconciler.clone().run(stopping)
         });
     }
 }
@@ -2021,6 +2051,9 @@ impl SoulseekServices {
                 Arc::clone(&clients.deezer_metadata),
                 Arc::clone(&clients.cover_art_aggregator),
                 Some(Arc::clone(last_fm) as Arc<dyn LastFmTrackLengths>),
+                // The store behind the `get_song` overlay (D6): a personal playlist position's
+                // kept snapshot fills what the routing alone never had.
+                Some(Arc::clone(&stores.personal_playlists)),
             )),
             validator: Arc::new(SoulseekStartupValidator::new(settings, client.clone())),
             client,
@@ -3366,6 +3399,7 @@ impl AppState {
             family_requests: stores.family_requests,
             family_saved: stores.family_saved,
             family_playlists: stores.family_playlists,
+            personal_playlists: stores.personal_playlists,
             family_playlist_requests: Default::default(),
             family_pool: stores.family_pool,
             listening: stores.listening,
@@ -3808,6 +3842,7 @@ impl AppState {
             family_requests: stores.family_requests,
             family_saved: stores.family_saved,
             family_playlists: stores.family_playlists,
+            personal_playlists: stores.personal_playlists,
             family_playlist_requests: Default::default(),
             family_pool: stores.family_pool,
             listening: stores.listening,

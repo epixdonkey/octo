@@ -48,6 +48,14 @@ pub async fn answer(state: &AppState, request: &NativeRequest<'_>) -> Result<Opt
         return Ok(Some(radio));
     }
 
+    // The personal playlists overlay: the collection's create (POST /api/playlist), then the
+    // detail, tracks, moves and additions of /api/playlist/{id}... Before the safety net,
+    // because it reads only query parameters — an id in the path or the body never reaches it,
+    // and a DELETE .../tracks?id=<registry id> would be swallowed as an empty ok.
+    if let Some(playlist) = super::personal_playlists::answer_native(state, request).await? {
+        return Ok(Some(playlist));
+    }
+
     // Safety net (client-agnostic): any endpoint we don't explicitly handle,
     // called with one of our external ids, would relay to Navidrome and come
     // back "data not found": Navidrome has no such id. Degrade to a graceful
@@ -207,6 +215,12 @@ async fn try_serve_native_radio(
     if !tail.is_empty() && !reserved {
         return Ok(None);
     }
+    // The collection's create (POST /api/playlist) is the personal playlists overlay's: a mixed
+    // body would be refused whole by Navidrome. The overlay declines a purely local create,
+    // which the catch-all then relays as it came.
+    if tail.is_empty() && !is_get {
+        return Ok(None);
+    }
 
     // A successful upstream list validates the native bearer token before Octo
     // reveals per-user state. The JWT payload only identifies the profile after
@@ -246,6 +260,9 @@ async fn try_serve_native_radio(
         let Ok(Node::Array(mut rows)) = Node::parse(text) else {
             return Ok(Some(unchanged()));
         };
+        // The personal playlists' counts are the overlay's (mixed positions), not the local-only
+        // mirror's — the same correction getPlaylists' rows get on the REST side.
+        super::personal_playlists::correct_native_playlist_rows(state, &mut rows);
         let writable_only = request
             .parameters
             .get("smart")
