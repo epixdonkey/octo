@@ -81,14 +81,16 @@ jobs:
       - name: Compose pulls this version's images
         run: |
           version="$(tr -d ' \r\n' < VERSION)"
-          stale="$(grep -o 'OCTO_IMAGE_TAG:-[^}]*' docker-compose.yml | sed 's/^OCTO_IMAGE_TAG:-//' | grep -Fvx "$version" | paste -sd ' ' || true)"
+          # This fork pulls its images at the dev tag until it cuts a release of its own.
+          default_tag=dev
+          stale="$(grep -o 'OCTO_IMAGE_TAG:-[^}]*' docker-compose.yml | sed 's/^OCTO_IMAGE_TAG:-//' | grep -Fvx "$default_tag" | paste -sd ' ' || true)"
           if [ -n "$stale" ]; then
             echo "::error::docker-compose.yml pulls images tagged $stale, but VERSION says $version. Bump the OCTO_IMAGE_TAG defaults with it."
             exit 1
           fi
           for image in octo octo-yt-dlp-shim octo-sonic; do
-            if ! grep -Fq "image: ghcr.io/winters27/$image:\${OCTO_IMAGE_TAG:-$version}" docker-compose.yml; then
-              echo "::error::docker-compose.yml does not pull ghcr.io/winters27/$image at \${OCTO_IMAGE_TAG:-$version}."
+            if ! grep -Fq "image: ghcr.io/epixdonkey/$image:\${OCTO_IMAGE_TAG:-$default_tag}" docker-compose.yml; then
+              echo "::error::docker-compose.yml does not pull ghcr.io/epixdonkey/$image at \${OCTO_IMAGE_TAG:-$default_tag}."
               exit 1
             fi
           done

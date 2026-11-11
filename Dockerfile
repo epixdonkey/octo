@@ -1,4 +1,4 @@
-# Octo: the Rust server, published as ghcr.io/winters27/octo for amd64 and arm64 (docker.yml),
+# Octo: the Rust server, published as ghcr.io/epixdonkey/octo for amd64 and arm64 (docker.yml),
 # and built from this folder by docker-compose.yml's octo-source. The same contract as the C#
 # image it replaces: port 8080 (ASPNETCORE_URLS), /app/config for settings and state, /music for
 # the library, /app/downloads created, and the app itself as PID 1 so SIGTERM reaches it and it
