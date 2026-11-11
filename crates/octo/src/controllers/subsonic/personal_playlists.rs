@@ -281,13 +281,16 @@ fn zipped<'a>(
 
 /// Fills the snapshots of the local positions the mirror just wrote: the same one bulk read, so
 /// a mutation costs it once however many positions it added — and an adopted position (which
-/// arrives with no snapshot at all) fills in here too. True when anything filled.
+/// arrives with no snapshot at all) fills in here too. The fill itself is the store's one
+/// atomic edit, so a parallel mutation of the same playlist cannot be lost to it (O3). The
+/// playlist as the store now holds it; `None` when there was nothing to fill or the mirror
+/// could not be read.
 async fn backfill_local_snapshots(
     state: &AppState,
     proxy: &crate::services::subsonic::SubsonicProxyService,
     parameters: &Parameters,
-    playlist: &mut PersonalPlaylist,
-) -> bool {
+    playlist: &PersonalPlaylist,
+) -> Option<PersonalPlaylist> {
     // Nothing to fill costs no read at all: a removal, a reorder or a metadata edit does not
     // ask Navidrome again.
     if !playlist
@@ -295,24 +298,24 @@ async fn backfill_local_snapshots(
         .iter()
         .any(|entry| entry.song_snapshot.is_none() && entry.library_id.is_some())
     {
-        return false;
+        return None;
     }
     let auth = auth_of(state, parameters);
-    let Some(rows) = mirror_song_rows(proxy, &auth, &playlist.id).await else {
-        return false;
-    };
-    let mut filled = false;
-    for entry in &mut playlist.entries {
-        if entry.song_snapshot.is_some() {
-            continue;
-        }
-        let Some(row) = entry.library_id.as_deref().and_then(|id| rows.get(id)) else {
-            continue;
-        };
-        entry.song_snapshot = Some(song_from_row(row));
-        filled = true;
-    }
-    filled
+    let rows = mirror_song_rows(proxy, &auth, &playlist.id).await?;
+    state
+        .personal_playlists
+        .edit(&playlist.id, |list| {
+            for entry in &mut list.entries {
+                if entry.song_snapshot.is_some() {
+                    continue;
+                }
+                let Some(row) = entry.library_id.as_deref().and_then(|id| rows.get(id)) else {
+                    continue;
+                };
+                entry.song_snapshot = Some(song_from_row(row));
+            }
+        })
+        .map(|(filled, ())| filled)
 }
 
 /// The empty playlist in Navidrome first (am-yy's move: no song ids on the create), and its
@@ -681,13 +684,15 @@ pub(crate) async fn rest_mutate(
     if !known && !mixed() {
         return None;
     }
-    let mut playlist = if known {
-        state.personal_playlists.find(playlist_id)?
-    } else {
-        adopt(state, playlist_id).await?
-    };
+    if !known {
+        // Two parallel mixed edits can both adopt the playlist; the first adoption stands and
+        // every edit lands on it through the store's own atomic edit (O3).
+        let adopted = adopt(state, playlist_id).await?;
+        state.personal_playlists.insert_if_absent(adopted);
+    }
 
     if endpoint.eq_ignore_ascii_case("deletePlaylist") {
+        let playlist = state.personal_playlists.find(playlist_id)?;
         let mut auth = auth_of(state, &call.parameters);
         auth.push(("id".into(), playlist.id.clone()));
         auth.push(("f".into(), "json".into()));
@@ -708,33 +713,42 @@ pub(crate) async fn rest_mutate(
         return None;
     }
 
-    // updatePlaylist: metadata (with both tags), additions, removals.
+    // updatePlaylist: metadata (with both tags), additions, removals. The additions are
+    // prepared first (they may ask the metadata service), so the change itself is the store's
+    // one atomic read-modify-write and a parallel request's change cannot be lost (O3).
     let name = call.param("name").map(str::to_string);
     let comment = call.param("comment").map(str::to_string);
     let public = call
         .param("public")
         .map(|value| value.trim().eq_ignore_ascii_case("true"));
     let asks_to_download = comment.as_deref().is_some_and(comment_asks_to_download);
-    apply_metadata(&mut playlist, name.as_deref(), comment.as_deref(), public);
-    let removals: Vec<usize> = call
-        .incoming
-        .parameter_values("songIndexToRemove")
-        .iter()
-        .filter_map(|index| index.trim().parse::<usize>().ok())
-        .collect();
-    for index in removals.iter().rev() {
-        if index < &playlist.entries.len() {
-            playlist.entries.remove(*index);
-        }
-    }
-    playlist.entries.extend(entries_for(state, &adding).await);
-    playlist.changed = chrono::Utc::now();
+    let fresh = entries_for(state, &adding).await;
+    let (playlist, ()) = state
+        .personal_playlists
+        .edit(playlist_id, |list| {
+            apply_metadata(list, name.as_deref(), comment.as_deref(), public);
+            let removals: Vec<usize> = call
+                .incoming
+                .parameter_values("songIndexToRemove")
+                .iter()
+                .filter_map(|index| index.trim().parse::<usize>().ok())
+                .collect();
+            for index in removals.iter().rev() {
+                if index < &list.entries.len() {
+                    list.entries.remove(*index);
+                }
+            }
+            list.entries.extend(fresh);
+            list.changed = chrono::Utc::now();
+        })
+        // A playlist the store stopped holding between the gate and here is a plain one again:
+        // the caller's passthrough.
+        ?;
     let owner = playlist.owner.clone();
-    state.personal_playlists.upsert(playlist.clone());
     mirror_local_ids(state, &call.proxy, &call.parameters, &playlist).await;
-    if backfill_local_snapshots(state, &call.proxy, &call.parameters, &mut playlist).await {
-        state.personal_playlists.upsert(playlist.clone());
-    }
+    let playlist = backfill_local_snapshots(state, &call.proxy, &call.parameters, &playlist)
+        .await
+        .unwrap_or(playlist);
     if asks_to_download {
         let requested_by = super::caller_checks::requester_for(state, Some(owner.as_str()));
         super::playlists::queue_missing(state, &playlist, requested_by.as_deref());
@@ -754,7 +768,10 @@ async fn rest_create(
     failure: &str,
 ) -> Option<Response> {
     let mixed = adding.iter().any(|id| state.local_library.parse_song_id(id).0);
-    let mut playlist = if playlist_id.is_empty() {
+    // Prepared before any store write, so the change itself is one atomic read-modify-write
+    // (O3).
+    let fresh = entries_for(state, adding).await;
+    let playlist = if playlist_id.is_empty() {
         if !mixed {
             return None;
         }
@@ -778,34 +795,43 @@ async fn rest_create(
             call.param("public")
                 .map(|value| value.eq_ignore_ascii_case("true")),
         );
+        playlist.entries.extend(fresh);
+        playlist.changed = chrono::Utc::now();
+        // A brand-new id cannot race anyone: a plain whole write.
+        state.personal_playlists.upsert(playlist.clone());
         playlist
     } else {
         let known = state.personal_playlists.knows(playlist_id);
         if !known && !mixed {
             return None;
         }
-        let mut playlist = if known {
-            state.personal_playlists.find(playlist_id)?
-        } else {
-            adopt(state, playlist_id).await?
-        };
-        apply_metadata(
-            &mut playlist,
-            call.param("name"),
-            call.param("comment"),
-            call.param("public")
-                .map(|value| value.eq_ignore_ascii_case("true")),
-        );
-        playlist.entries.clear();
+        if !known {
+            // Insert-if-absent, so a parallel adoption's playlist stands and this replace
+            // lands on it (O3).
+            let adopted = adopt(state, playlist_id).await?;
+            state.personal_playlists.insert_if_absent(adopted);
+        }
+        let (playlist, ()) = state
+            .personal_playlists
+            .edit(playlist_id, |list| {
+                apply_metadata(
+                    list,
+                    call.param("name"),
+                    call.param("comment"),
+                    call.param("public")
+                        .map(|value| value.eq_ignore_ascii_case("true")),
+                );
+                list.entries.clear();
+                list.entries.extend(fresh);
+                list.changed = chrono::Utc::now();
+            })
+            // As above: a playlist the store stopped holding is a plain one again.
+            ?;
         playlist
     };
-    playlist.entries.extend(entries_for(state, adding).await);
-    playlist.changed = chrono::Utc::now();
-    state.personal_playlists.upsert(playlist.clone());
     mirror_local_ids(state, &call.proxy, &call.parameters, &playlist).await;
-    if backfill_local_snapshots(state, &call.proxy, &call.parameters, &mut playlist).await {
-        state.personal_playlists.upsert(playlist.clone());
-    }
+    // The answer carries no rows, so the filled playlist itself is not needed here.
+    let _ = backfill_local_snapshots(state, &call.proxy, &call.parameters, &playlist).await;
     Some(ok_response(state, call, "createPlaylist"))
 }
 
@@ -881,7 +907,7 @@ pub(crate) async fn answer_native(
     if !known && !carries_a_registry_id {
         return Ok(None);
     }
-    let mut playlist = if known {
+    let playlist = if known {
         match state.personal_playlists.find(id) {
             Some(playlist) => playlist,
             // Held a moment ago and gone now: nothing to answer from.
@@ -889,17 +915,23 @@ pub(crate) async fn answer_native(
         }
     } else {
         // The overlay does not hold it, but the mutation is mixed: adopt first, so nothing the
-        // playlist already had is lost.
-        match adopt(state, id).await {
-            Some(adopted) => adopted,
-            None => {
-                return Ok(Some(native_error(
-                    StatusCode::FORBIDDEN,
-                    "Playlist is unavailable",
-                )));
-            }
+        // playlist already had is lost. Insert-if-absent, so a parallel adoption's playlist
+        // stands and every edit below lands on it (O3).
+        let Some(adopted) = adopt(state, id).await else {
+            return Ok(Some(native_error(
+                StatusCode::FORBIDDEN,
+                "Playlist is unavailable",
+            )));
+        };
+        state.personal_playlists.insert_if_absent(adopted);
+        match state.personal_playlists.find(id) {
+            Some(standing) => standing,
+            None => return Ok(Some(native_error(StatusCode::NOT_FOUND, "Playlist not found"))),
         }
     };
+    // Every mutation below changes the playlist through the store's one atomic
+    // read-modify-write, so parallel requests cannot lose each other's change (O3); the
+    // standing copy above serves the reads.
 
     // The tracks: the list, the additions, the removals, the drag-and-drop move.
     if parts.len() >= 2 && parts[1].eq_ignore_ascii_case("tracks") {
@@ -911,13 +943,15 @@ pub(crate) async fn answer_native(
         if request.method == axum::http::Method::POST {
             let fresh = entries_for(state, &ids).await;
             let added = fresh.len();
-            playlist.entries.extend(fresh);
-            playlist.changed = chrono::Utc::now();
-            state.personal_playlists.upsert(playlist.clone());
+            let Some((playlist, ())) = state.personal_playlists.edit(id, |list| {
+                list.entries.extend(fresh);
+                list.changed = chrono::Utc::now();
+            }) else {
+                return Ok(Some(native_error(StatusCode::NOT_FOUND, "Playlist not found")));
+            };
             mirror_local_ids(state, request.proxy, request.parameters, &playlist).await;
-            if backfill_local_snapshots(state, request.proxy, request.parameters, &mut playlist).await {
-                state.personal_playlists.upsert(playlist.clone());
-            }
+            // The answer names no positions, so the filled playlist itself is not needed here.
+            let _ = backfill_local_snapshots(state, request.proxy, request.parameters, &playlist).await;
             return Ok(Some(native_ok(json!({ "id": id, "added": added }))));
         }
         if request.method == axum::http::Method::DELETE {
@@ -929,24 +963,29 @@ pub(crate) async fn answer_native(
             if let Some(position) = parts.get(2).and_then(|pos| pos.parse::<usize>().ok()) {
                 remove = vec![position.to_string()];
             }
-            let mut positions: Vec<usize> = remove
-                .into_iter()
-                .filter_map(|value| value.trim().parse::<usize>().ok())
-                .filter(|at| *at >= 1 && *at <= playlist.entries.len())
-                .map(|at| at - 1)
-                .collect();
-            positions.sort_unstable();
-            positions.dedup();
-            for at in positions.iter().rev() {
-                playlist.entries.remove(*at);
-            }
-            playlist.changed = chrono::Utc::now();
-            state.personal_playlists.upsert(playlist.clone());
+            let Some((playlist, ())) = state.personal_playlists.edit(id, |list| {
+                let mut positions: Vec<usize> = remove
+                    .into_iter()
+                    .filter_map(|value| value.trim().parse::<usize>().ok())
+                    .filter(|at| *at >= 1 && *at <= list.entries.len())
+                    .map(|at| at - 1)
+                    .collect();
+                positions.sort_unstable();
+                positions.dedup();
+                for at in positions.iter().rev() {
+                    list.entries.remove(*at);
+                }
+                list.changed = chrono::Utc::now();
+            }) else {
+                return Ok(Some(native_error(StatusCode::NOT_FOUND, "Playlist not found")));
+            };
             mirror_local_ids(state, request.proxy, request.parameters, &playlist).await;
             return Ok(Some(native_ok(json!({ "id": id }))));
         }
         if request.method == axum::http::Method::PUT && parts.len() >= 3 {
-            // Drag-and-drop: move position `from` before position `insert_before`, both 1-based.
+            // Drag-and-drop: move position `from` before position `insert_before`, both
+            // 1-based. The bounds are checked against the LIVE list inside the edit, so a
+            // parallel change cannot make the move land wrong.
             let Some(from) = parts.get(2).and_then(|pos| pos.parse::<usize>().ok()) else {
                 return Ok(Some(native_error(
                     StatusCode::BAD_REQUEST,
@@ -969,17 +1008,24 @@ pub(crate) async fn answer_native(
                     "Invalid playlist position",
                 )));
             };
-            if from == 0 || from > playlist.entries.len() || to == 0 || to > playlist.entries.len() + 1 {
+            let Some((playlist, moved)) = state.personal_playlists.edit(id, |list| {
+                if from == 0 || from > list.entries.len() || to == 0 || to > list.entries.len() + 1 {
+                    return false;
+                }
+                let moved = list.entries.remove(from - 1);
+                let at = if to > from { to - 2 } else { to - 1 }.min(list.entries.len());
+                list.entries.insert(at, moved);
+                list.changed = chrono::Utc::now();
+                true
+            }) else {
+                return Ok(Some(native_error(StatusCode::NOT_FOUND, "Playlist not found")));
+            };
+            if !moved {
                 return Ok(Some(native_error(
                     StatusCode::BAD_REQUEST,
                     "Invalid playlist position",
                 )));
             }
-            let moved = playlist.entries.remove(from - 1);
-            let at = if to > from { to - 2 } else { to - 1 }.min(playlist.entries.len());
-            playlist.entries.insert(at, moved);
-            playlist.changed = chrono::Utc::now();
-            state.personal_playlists.upsert(playlist.clone());
             mirror_local_ids(state, request.proxy, request.parameters, &playlist).await;
             return Ok(Some(native_ok(json!({ "id": parts[2] }))));
         }
@@ -1021,24 +1067,33 @@ pub(crate) async fn answer_native(
             let asks_to_download = comment.as_deref().is_some_and(comment_asks_to_download);
             // A `tracks` row list is a whole-list replacement — even an empty one clears the
             // playlist — so the key's presence decides the replacement; the adoption gate above
-            // already settled whether the overlay handles this playlist at all.
+            // already settled whether the overlay handles this playlist at all. The new rows
+            // are prepared first, so the replacement is one atomic edit (O3).
             let replaces = body
                 .as_ref()
                 .and_then(|body| body.get("tracks"))
                 .and_then(Value::as_array)
                 .is_some();
-            apply_metadata(&mut playlist, name.as_deref(), comment.as_deref(), public);
-            if replaces {
-                playlist.entries.clear();
-                playlist.entries.extend(entries_for(state, &track_ids).await);
-            }
-            playlist.changed = chrono::Utc::now();
+            let fresh = if replaces {
+                Some(entries_for(state, &track_ids).await)
+            } else {
+                None
+            };
+            let Some((playlist, ())) = state.personal_playlists.edit(id, |list| {
+                apply_metadata(list, name.as_deref(), comment.as_deref(), public);
+                if let Some(fresh) = fresh {
+                    list.entries.clear();
+                    list.entries.extend(fresh);
+                }
+                list.changed = chrono::Utc::now();
+            }) else {
+                return Ok(Some(native_error(StatusCode::NOT_FOUND, "Playlist not found")));
+            };
             let owner = playlist.owner.clone();
-            state.personal_playlists.upsert(playlist.clone());
             mirror_local_ids(state, request.proxy, request.parameters, &playlist).await;
-            if backfill_local_snapshots(state, request.proxy, request.parameters, &mut playlist).await {
-                state.personal_playlists.upsert(playlist.clone());
-            }
+            let playlist = backfill_local_snapshots(state, request.proxy, request.parameters, &playlist)
+                .await
+                .unwrap_or(playlist);
             if asks_to_download {
                 let requested_by = super::caller_checks::requester_for(state, Some(owner.as_str()));
                 super::playlists::queue_missing(state, &playlist, requested_by.as_deref());
@@ -1099,11 +1154,12 @@ async fn native_create(
     apply_metadata(&mut playlist, name.as_deref(), comment.as_deref(), public);
     playlist.entries.extend(entries_for(state, &tracks).await);
     playlist.changed = chrono::Utc::now();
+    // A brand-new id cannot race anyone: a plain whole write.
     state.personal_playlists.upsert(playlist.clone());
     mirror_local_ids(state, request.proxy, request.parameters, &playlist).await;
-    if backfill_local_snapshots(state, request.proxy, request.parameters, &mut playlist).await {
-        state.personal_playlists.upsert(playlist.clone());
-    }
+    let playlist = backfill_local_snapshots(state, request.proxy, request.parameters, &playlist)
+        .await
+        .unwrap_or(playlist);
     Ok(Some(native_detail(&playlist)))
 }
 

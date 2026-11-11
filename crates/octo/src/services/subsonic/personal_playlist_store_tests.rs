@@ -356,3 +356,116 @@ fn binding_the_library_half_keeps_the_outside_half() {
     assert_eq!(released.entries[0].library_id, None);
     assert_eq!(released.entries[0].outside_id.as_deref(), Some("outside-1"));
 }
+
+/// O3: parallel edits of one playlist all land. Every `edit` is ONE read-modify-write under the
+/// store's own lock, so however many mutations run at once on the same playlist, none is lost —
+/// the caller-side `find` → change → `upsert` this replaces could interleave two of them and
+/// drop the loser's change.
+#[test]
+fn parallel_edits_of_one_playlist_all_land() {
+    let store = Arc::new(PersonalPlaylistStore::in_memory());
+    store.upsert(PersonalPlaylist {
+        id: "nd-1".to_string(),
+        owner: "alice".to_string(),
+        name: "Mix".to_string(),
+        entries: Vec::new(),
+        ..Default::default()
+    });
+    const THREADS: usize = 4;
+    const EDITS_PER_THREAD: usize = 250;
+    let mut joins = Vec::new();
+    for thread in 0..THREADS {
+        let store = Arc::clone(&store);
+        joins.push(std::thread::spawn(move || {
+            for edit in 0..EDITS_PER_THREAD {
+                let tag = format!("t{thread}-e{edit}");
+                store
+                    .edit("nd-1", |list| {
+                        list.entries.push(PersonalPlaylistEntry {
+                            occurrence_id: tag,
+                            library_id: Some("nd-song-1".to_string()),
+                            ..Default::default()
+                        });
+                    })
+                    .expect("the playlist is held for every edit");
+            }
+        }));
+    }
+    for join in joins {
+        join.join().expect("no thread panicked");
+    }
+    let held = store.find("nd-1").expect("the playlist is held");
+    assert_eq!(
+        held.entries.len(),
+        THREADS * EDITS_PER_THREAD,
+        "no parallel edit was lost"
+    );
+    let mut occurrence_ids: Vec<&str> = held
+        .entries
+        .iter()
+        .map(|entry| entry.occurrence_id.as_str())
+        .collect();
+    occurrence_ids.sort_unstable();
+    occurrence_ids.dedup();
+    assert_eq!(
+        occurrence_ids.len(),
+        THREADS * EDITS_PER_THREAD,
+        "every edit's own position is there exactly once"
+    );
+}
+
+/// O3: two parallel adoptions of one plain playlist converge on whichever landed first:
+/// `insert_if_absent` keeps the standing playlist, the second adoption does not overwrite it,
+/// and the second caller's own edit lands ON the standing one — so neither side's change is
+/// lost. An id the store does not hold answers `None` without writing anything.
+#[test]
+fn parallel_adoptions_converge_on_the_first_adoption() {
+    let store = PersonalPlaylistStore::in_memory();
+    let first = PersonalPlaylist {
+        id: "nd-1".to_string(),
+        owner: "alice".to_string(),
+        name: "first".to_string(),
+        entries: vec![PersonalPlaylistEntry {
+            occurrence_id: "occ-first".to_string(),
+            library_id: Some("nd-song-1".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut second = first.clone();
+    second.name = "second".to_string();
+    second.entries = vec![PersonalPlaylistEntry {
+        occurrence_id: "occ-second".to_string(),
+        library_id: Some("nd-song-2".to_string()),
+        ..Default::default()
+    }];
+
+    assert!(store.insert_if_absent(first), "the first adoption is taken");
+    assert!(
+        !store.insert_if_absent(second),
+        "the second adoption does not overwrite the standing playlist"
+    );
+    assert!(
+        store.edit("nd-absent", |_| ()).is_none(),
+        "an id the store does not hold edits nothing"
+    );
+
+    let (held, ()) = store
+        .edit("nd-1", |list| {
+            list.entries.push(PersonalPlaylistEntry {
+                occurrence_id: "occ-second-edit".to_string(),
+                library_id: Some("nd-song-2".to_string()),
+                ..Default::default()
+            });
+        })
+        .expect("the standing playlist is held");
+    assert_eq!(held.name, "first", "the first adoption stands");
+    assert_eq!(
+        held.entries
+            .iter()
+            .map(|entry| entry.occurrence_id.as_str())
+            .collect::<Vec<_>>(),
+        ["occ-first", "occ-second-edit"],
+        "the second caller's change landed beside the first adoption's, none lost"
+    );
+}

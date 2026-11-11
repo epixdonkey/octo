@@ -273,6 +273,39 @@ impl PersonalPlaylistStore {
         self.save();
     }
 
+    /// Applies `edit` to the playlist with Navidrome's own `id` as ONE read-modify-write, under
+    /// the store's own lock (O3): a caller-side `find` → change → `upsert` can interleave with a
+    /// parallel request's and lose one of the changes, while this cannot. The edited playlist as
+    /// the store now holds it, with `edit`'s own return value beside it; `None` (and no write)
+    /// when the store does not hold `id`.
+    pub fn edit<R>(
+        &self,
+        id: &str,
+        edit: impl FnOnce(&mut PersonalPlaylist) -> R,
+    ) -> Option<(PersonalPlaylist, R)> {
+        let mut playlists = self.playlists.lock();
+        let list = playlists.iter_mut().find(|list| list.id == id)?;
+        let result = edit(list);
+        let edited = list.clone();
+        drop(playlists);
+        self.save();
+        Some((edited, result))
+    }
+
+    /// Adds `playlist` only while its id is not held yet, so two parallel adoptions of one plain
+    /// playlist converge on whichever landed first instead of overwriting each other (O3). True
+    /// when this call's playlist was taken; false when the id was already held.
+    pub fn insert_if_absent(&self, playlist: PersonalPlaylist) -> bool {
+        let mut playlists = self.playlists.lock();
+        if playlists.iter().any(|list| list.id == playlist.id) {
+            return false;
+        }
+        playlists.push(playlist);
+        drop(playlists);
+        self.save();
+        true
+    }
+
     /// Forgets the overlay of `id` (the playlist in Navidrome is `deletePlaylist`'s to take).
     pub fn remove(&self, id: &str) {
         let mut playlists = self.playlists.lock();
