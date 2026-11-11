@@ -1024,6 +1024,21 @@ async fn owner_action_playlist(state: &AppState, call: &SubsonicCall, id: &str) 
     if id.trim().is_empty() {
         return None;
     }
+    // Only ADDING is the fetch gesture. Taking a position off, or deleting the playlist
+    // outright (deletePlaylist lands here through the same handler), is an ordinary edit
+    // Navidrome can do itself: queueing a download of the very song being taken off would be
+    // the opposite of what was asked. The members' branch above keeps its own bookkeeping — a
+    // member's action playlist IS the record of its requests — so this gate is the owner's
+    // alone.
+    let adds = call.param("songIdToAdd").unwrap_or("");
+    let removes = call
+        .incoming
+        .parameter_values("songIndexToRemove")
+        .iter()
+        .any(|value| !value.trim().is_empty());
+    if adds.trim().is_empty() && (removes || playlist_change(call) == Some(PlaylistChange::Delete)) {
+        return None;
+    }
     let mut auth: Vec<(String, String)> = call
         .parameters
         .iter()

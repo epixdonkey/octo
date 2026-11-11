@@ -950,6 +950,76 @@ async fn what_the_owner_puts_on_their_flac_playlist_is_fetched_straight_away() {
     );
 }
 
+/// Taking a position OFF the FLAC playlist — or deleting the playlist outright — is an
+/// ordinary edit, never a fetch (O1): nothing is queued for a song the person just took off,
+/// the removal is Navidrome's own to do (the client's call relayed as it came), and Octo adds
+/// no emptying sweep of its own. The members' request playlists keep their own semantics.
+#[tokio::test]
+async fn taking_a_position_off_the_flac_playlist_queues_no_fetch() {
+    let t = PersonalApp::new().await;
+    let outside = t.outside_song("Lost in Sound");
+    Mock::given(path("/rest/getPlaylist"))
+        .respond_with(navidrome_json(&format!(
+            r#"{{"subsonic-response":{{"status":"ok","playlist":{{"id":"nd-flac","owner":"alice","name":"Request a copy in FLAC","entry":[{{"id":"{outside}"}},{{"id":"nd-1"}}]}}}}}}"#
+        )))
+        .with_priority(1)
+        .mount(&t.navidrome)
+        .await;
+
+    // A removal-only update: the position comes off, nothing is fetched for it.
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/updatePlaylist.view?{}&f=json&playlistId=nd-flac&songIndexToRemove=0",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    assert!(t.nothing_downloads(), "a removal queues no fetch");
+    let updates = t
+        .navidrome
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path().ends_with("/rest/updatePlaylist"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        updates.len(),
+        1,
+        "exactly the client's own removal is relayed — no Octo-made sweep"
+    );
+    assert!(
+        updates[0]
+            .url
+            .query_pairs()
+            .any(|(key, value)| key == "songIndexToRemove" && value == "0")
+    );
+
+    // Deleting the playlist is the same ordinary edit: relayed, nothing fetched (the
+    // provisioner brings the playlist back on the next listing, as it always does).
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/deletePlaylist.view?{}&f=json&id=nd-flac",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    assert!(t.nothing_downloads(), "a delete queues no fetch");
+    assert!(
+        t.navidrome
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|request| request.url.path().ends_with("/rest/deletePlaylist")),
+        "the delete itself is Navidrome's to do"
+    );
+}
+
 // ---- The reconciler, over the container's own parts (R-4, both ways) ---------------------
 
 /// How many mirror writes (a DELETE or a POST of positions) the playlist's own tracks path has
