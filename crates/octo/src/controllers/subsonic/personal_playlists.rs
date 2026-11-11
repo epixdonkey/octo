@@ -47,7 +47,14 @@ pub(crate) fn comment_asks_to_download(comment: &str) -> bool {
 
 /// The caller's sign-in as the relay carries it, with JSON asked for. A native-mode client signs
 /// in with a header the REST relay does not forward, so a request that named nobody signs in as
-/// Octo's admin (the charts' country walks' stand-in).
+/// Octo's own service account — the scan-auth pair, the charts' country walks' stand-in. That
+/// service signature is the relay's own hand, not the caller's: every Navidrome read or write it
+/// makes here (the mirror, the snapshot backfills, the adoptions) is attributed to the service
+/// account, because the caller's own sign-in never reached the REST relay. The limitation is the
+/// product's single-owner shape — one household, one library, one admin — so the service account
+/// is the owner's own stand-in and a native request that named nobody still acts for the owner;
+/// with several real accounts it would lend the admin's authority to an unnamed caller (O2's
+/// sibling), and widening that is the bridge's call, not this code's guess.
 fn auth_of(state: &AppState, parameters: &Parameters) -> Vec<(String, String)> {
     let own: Vec<(String, String)> = parameters
         .iter()
