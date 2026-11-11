@@ -685,6 +685,89 @@ async fn a_file_that_went_takes_its_position_to_the_stream_at_once() {
     assert_eq!(t.get_song_relays().await, 0, "no per-position song reads");
 }
 
+/// A read heals the snapshots the add could not fill (O5): the answer's own mirror read — paid
+/// for anyway, and this app configures no service account at all, so the caller's own sign-in
+/// did the reading — fills a bare local position's snapshot right there, without a second
+/// relay. And once the snapshot stands in the store, a native row that cannot reach the mirror
+/// keeps its words from it (O6) instead of coming back a bare `id`-only line.
+#[tokio::test]
+async fn a_read_fills_a_bare_local_snapshot_from_the_mirror_it_already_read() {
+    let t = PersonalApp::new().await;
+    let outside = t.outside_song("Lost in Sound");
+    t.create_mixed(&outside).await;
+    // The add could not fill the local half: the base mock's getPlaylist carries no rows.
+    let bare = t.held(NEW_PLAYLIST);
+    let local = bare
+        .entries
+        .iter()
+        .find(|entry| entry.library_id.is_some())
+        .expect("the local position");
+    assert!(local.song_snapshot.is_none(), "the add left the local half bare");
+
+    // The mirror answers nd-2's row: the read itself heals the store, at no extra relay.
+    t.mirror_answers(
+        r#"[{"id":"nd-2","title":"Local FLAC song","artist":"Someone","album":"Somewhere","duration":200}]"#,
+    )
+    .await;
+    let get_playlist_relays_before = t
+        .navidrome
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().ends_with("/rest/getPlaylist"))
+        .count();
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/getPlaylist.view?{}&f=json&id={NEW_PLAYLIST}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    let healed = t.held(NEW_PLAYLIST);
+    let local = healed
+        .entries
+        .iter()
+        .find(|entry| entry.library_id.is_some())
+        .expect("the local position");
+    let snapshot = local
+        .song_snapshot
+        .as_ref()
+        .expect("the read filled the bare snapshot from the mirror it already read");
+    assert_eq!(snapshot.title, "Local FLAC song");
+    assert_eq!(snapshot.artist, "Someone");
+    assert_eq!(snapshot.duration, Some(200));
+    let get_playlist_relays_after = t
+        .navidrome
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.url.path().ends_with("/rest/getPlaylist"))
+        .count();
+    assert_eq!(
+        get_playlist_relays_after,
+        get_playlist_relays_before + 1,
+        "the healing cost no relay of its own — the answer's one read did it"
+    );
+
+    // O6: a native call that names nobody and no service account configured cannot ask the
+    // mirror at all — the row keeps its words from the healed snapshot, not a bare line.
+    let reply = get(&t.app, &format!("/api/playlist/{NEW_PLAYLIST}/tracks")).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let rows = reply.json().as_array().cloned().expect("a tracks array");
+    let local_row = rows
+        .iter()
+        .find(|row| row["mediaFileId"] == "nd-2")
+        .expect("the local position's row");
+    assert_eq!(local_row["title"], "Local FLAC song", "not a bare row");
+    assert_eq!(local_row["artist"], "Someone");
+    assert_eq!(local_row["duration"], 200);
+    assert_eq!(t.get_song_relays().await, 0, "no per-position song reads");
+}
+
 /// A native whole-list replacement on a plain playlist the overlay does not hold, with purely
 /// local rows (`tracks` or an empty `tracks`), is an ordinary edit: the faithful relay takes the
 /// PUT to Navidrome exactly as it came and the store never learns the playlist. The gate is the

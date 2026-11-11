@@ -226,7 +226,10 @@ fn song_from_row(row: &Value) -> octo_core::models::domain::Song {
 /// The positions' playback sources for one answer: the store's one resolution mechanism
 /// (`resolve_playback_sources`, PREFER_LOCAL) over the mirror's fresh availability — one relay
 /// for the whole list, not one per position. When Navidrome cannot be asked, the store's own
-/// bindings stand in, so the answer keeps every position that still has a source.
+/// bindings stand in, so the answer keeps every position that still has a source. A read that
+/// does reach the mirror heals with it: the rows are in hand anyway, so a bare local position's
+/// snapshot fills right here (O5) — no second relay, and signed in as the caller whenever the
+/// caller named anyone, which every REST request does.
 async fn served_sources(
     state: &AppState,
     proxy: &crate::services::subsonic::SubsonicProxyService,
@@ -236,6 +239,9 @@ async fn served_sources(
     let auth = auth_of(state, parameters);
     match mirror_song_rows(proxy, &auth, &playlist.id).await {
         Some(rows) => {
+            if has_bare_local_entries(playlist) {
+                fill_local_snapshots(state, &playlist.id, &rows);
+            }
             let available: HashSet<String> = rows.keys().cloned().collect();
             (playlist.resolve_playback_sources(&available), Some(rows))
         }
@@ -279,12 +285,14 @@ fn zipped<'a>(
         .collect()
 }
 
-/// Fills the snapshots of the local positions the mirror just wrote: the same one bulk read, so
-/// a mutation costs it once however many positions it added — and an adopted position (which
+/// Fills the snapshots of the local positions the mirror just wrote: one bulk read, so a
+/// mutation costs it once however many positions it added — and an adopted position (which
 /// arrives with no snapshot at all) fills in here too. The fill itself is the store's one
-/// atomic edit, so a parallel mutation of the same playlist cannot be lost to it (O3). The
-/// playlist as the store now holds it; `None` when there was nothing to fill or the mirror
-/// could not be read.
+/// atomic edit, so a parallel mutation of the same playlist cannot be lost to it (O3). Reads
+/// heal the same way through `served_sources`, from the mirror rows the answer read anyway
+/// (O5). The playlist as the store now holds it; `None` when there was nothing to fill or the
+/// mirror could not be read — a native caller that named nobody still needs the service
+/// account's sign-in (scan-auth) for any Navidrome read at all, the one dependency left.
 async fn backfill_local_snapshots(
     state: &AppState,
     proxy: &crate::services::subsonic::SubsonicProxyService,
@@ -293,18 +301,34 @@ async fn backfill_local_snapshots(
 ) -> Option<PersonalPlaylist> {
     // Nothing to fill costs no read at all: a removal, a reorder or a metadata edit does not
     // ask Navidrome again.
-    if !playlist
-        .entries
-        .iter()
-        .any(|entry| entry.song_snapshot.is_none() && entry.library_id.is_some())
-    {
+    if !has_bare_local_entries(playlist) {
         return None;
     }
     let auth = auth_of(state, parameters);
     let rows = mirror_song_rows(proxy, &auth, &playlist.id).await?;
+    fill_local_snapshots(state, &playlist.id, &rows)
+}
+
+/// Whether a local position still has no snapshot: the cheap gate that keeps an ordinary
+/// mutation or answer from paying a mirror read or a store write for nothing (O5).
+fn has_bare_local_entries(playlist: &PersonalPlaylist) -> bool {
+    playlist
+        .entries
+        .iter()
+        .any(|entry| entry.song_snapshot.is_none() && entry.library_id.is_some())
+}
+
+/// The one atomic fill itself (O3: under the store's lock, so no parallel edit is lost to it):
+/// every local position the rows name gets its row as the snapshot, whatever else changed in
+/// between. The playlist as the store now holds it; `None` when the store does not hold the id.
+fn fill_local_snapshots(
+    state: &AppState,
+    playlist_id: &str,
+    rows: &HashMap<String, Value>,
+) -> Option<PersonalPlaylist> {
     state
         .personal_playlists
-        .edit(&playlist.id, |list| {
+        .edit(playlist_id, |list| {
             for entry in &mut list.entries {
                 if entry.song_snapshot.is_some() {
                     continue;
