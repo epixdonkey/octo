@@ -1061,6 +1061,23 @@ async fn owner_action_playlist(state: &AppState, call: &SubsonicCall, id: &str) 
         return None;
     }
     let username = listener_name_of(state, &call.parameters, &call.proxy, &call.parts.headers).await;
+    // The fetch is a download into the shared library, so the branch is the playlist owner's
+    // alone (O2): the FLAC playlist is provisioned per user and private, and the identity Octo
+    // can name — signed_in_user's own resolution — must be the owner the playlist's row names.
+    // A FLAC-named playlist of someone else's (a public one can be read by any account) or a
+    // caller Octo cannot name is an ordinary edit: the faithful relay, no queue.
+    let row_owner = playlist
+        .get("owner")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if username.trim().is_empty()
+        || row_owner.is_empty()
+        || !dotnet::eq_ignore_case(username.trim(), &row_owner)
+    {
+        return None;
+    }
     let requested_by = super::caller_checks::requester_for(state, Some(username.as_str()));
     let carried: Vec<String> = playlist
         .get("entry")

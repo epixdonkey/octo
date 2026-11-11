@@ -898,13 +898,14 @@ async fn a_save_one_download_fetches_the_outside_song_and_still_streams_it() {
 /// through the heart's queue (R-5 operation 3, D15 — not a family request): the outside song
 /// waiting on the playlist and nothing else, the library songs untouched, and the playlist
 /// emptied afterwards as the fetch is the record. The playlist never becomes the overlay's own.
+/// The caller is the playlist's owner (O2's gate: the row names them).
 #[tokio::test]
 async fn what_the_owner_puts_on_their_flac_playlist_is_fetched_straight_away() {
     let t = PersonalApp::new().await;
     let outside = t.outside_song("Lost in Sound");
     Mock::given(path("/rest/getPlaylist"))
         .respond_with(navidrome_json(&format!(
-            r#"{{"subsonic-response":{{"status":"ok","playlist":{{"id":"nd-flac","name":"Request a copy in FLAC","entry":[{{"id":"{outside}"}},{{"id":"nd-1"}}]}}}}}}"#
+            r#"{{"subsonic-response":{{"status":"ok","playlist":{{"id":"nd-flac","owner":"alice","name":"Request a copy in FLAC","entry":[{{"id":"{outside}"}},{{"id":"nd-1"}}]}}}}}}"#
         )))
         .with_priority(1)
         .mount(&t.navidrome)
@@ -1018,6 +1019,63 @@ async fn taking_a_position_off_the_flac_playlist_queues_no_fetch() {
             .any(|request| request.url.path().ends_with("/rest/deletePlaylist")),
         "the delete itself is Navidrome's to do"
     );
+}
+
+/// A FLAC-named playlist that is not the caller's own never reaches the fetch queue (O2): the
+/// fetch is a download into the shared library, so the branch is the playlist owner's alone.
+/// Someone else's FLAC-named playlist (public playlists can be read by any account) and a row
+/// that names no owner at all are ordinary edits — relayed to Navidrome as they came, nothing
+/// fetched, nothing emptied.
+#[tokio::test]
+async fn someone_elses_flac_playlist_is_an_ordinary_edit() {
+    let t = PersonalApp::new().await;
+    let outside = t.outside_song("Lost in Sound");
+    for row_owner in ["bob", ""] {
+        let owner_field = match row_owner {
+            "" => String::new(),
+            owner => format!(r#""owner":"{owner}","#),
+        };
+        Mock::given(path("/rest/getPlaylist"))
+            .respond_with(navidrome_json(&format!(
+                r#"{{"subsonic-response":{{"status":"ok","playlist":{{"id":"nd-flac",{owner_field}"name":"Request a copy in FLAC","entry":[{{"id":"{outside}"}}]}}}}}}"#
+            )))
+            .with_priority(1)
+            .mount(&t.navidrome)
+            .await;
+
+        let reply = get(
+            &t.app,
+            &format!(
+                "/rest/updatePlaylist.view?{}&f=json&playlistId=nd-flac&songIdToAdd={outside}",
+                auth("alice", "good", "octo")
+            ),
+        )
+        .await;
+        assert_eq!(
+            reply.envelope()["status"],
+            "ok",
+            "owner '{row_owner}': {}",
+            reply.text()
+        );
+        assert!(
+            t.nothing_downloads(),
+            "owner '{row_owner}': no fetch for a playlist that is not the caller's own"
+        );
+        // The client's own add was relayed for Navidrome to do — the intercepted branch would
+        // have answered without a relay and emptied the playlist instead.
+        assert!(
+            t.navidrome
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|request| {
+                    request.url.path().ends_with("/rest/updatePlaylist")
+                        && request.url.query_pairs().any(|(key, _)| key == "songIdToAdd")
+                }),
+            "owner '{row_owner}': the add is Navidrome's to do"
+        );
+    }
 }
 
 // ---- The reconciler, over the container's own parts (R-4, both ways) ---------------------
