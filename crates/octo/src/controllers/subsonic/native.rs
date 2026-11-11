@@ -74,7 +74,7 @@ pub async fn answer(state: &AppState, request: &NativeRequest<'_>) -> Result<Opt
     // load the now-playing view via GET /api/song/{id}; the id lives in the
     // path, not the query, so the check above (query-only) misses it and a
     // relay would 500. Serve the synthetic native object instead.
-    if let Some(song) = try_serve_native_external_song(state, request.endpoint).await {
+    if let Some(song) = try_serve_native_external_song(state, request).await {
         return Ok(Some(song));
     }
 
@@ -343,10 +343,10 @@ fn native_station(station: &LastFmRadioStation) -> Node {
 /// Native single-song fetch for one of Octo's external ids. Navidrome-mode clients load the
 /// now-playing detail via GET /api/song/{id}; relaying an external id to Navidrome 500s (it has
 /// no such song). Rebuild the song from the id via the same metadata core getSong uses and
-/// return it in native shape. `None` (fall through to relay) for anything but a leaf
-/// external-id fetch.
-async fn try_serve_native_external_song(state: &AppState, endpoint: &str) -> Option<Response> {
-    let id = leaf_id(endpoint, "api/song/")?;
+/// return it in native shape, with `starred`/`starredAt` when the request's user saved it as a
+/// streaming favorite. `None` (fall through to relay) for anything but a leaf external-id fetch.
+async fn try_serve_native_external_song(state: &AppState, request: &NativeRequest<'_>) -> Option<Response> {
+    let id = leaf_id(request.endpoint, "api/song/")?;
     let (is_external, provider, external_id) = state.local_library.parse_song_id(&id);
     if !is_external {
         return None;
@@ -381,7 +381,22 @@ async fn try_serve_native_external_song(state: &AppState, endpoint: &str) -> Opt
         state.metadata_service.complete_song_lengths(&mut one);
     }
 
-    let body = octo_core::json::to_string(&native_song_object(state, &one[0]));
+    let mut object = native_song_object(state, &one[0]);
+    // A caller who saved this song as a streaming favorite reads its star here, in the shape
+    // Navidrome's own song JSON carries it; without a save the fields stay away.
+    let user = native_username(state, request.parameters, request.headers);
+    if let Some(saved) = state
+        .family_saved
+        .list(&user)
+        .into_iter()
+        .find(|saved| saved.id == id)
+    {
+        let starred = saved.saved.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let fields = object.as_object_mut().expect("an object");
+        fields.insert("starred".into(), json!(starred.clone()));
+        fields.insert("starredAt".into(), json!(starred));
+    }
+    let body = octo_core::json::to_string(&object);
     Some(written_json(
         body.into_bytes(),
         HeaderMap::new(),

@@ -11,7 +11,7 @@ use octo_core::common::dotnet::is_blank;
 use octo_core::common::playlist_id_helper;
 use octo_core::last_fm::last_fm_radio_refresh_policy;
 use octo_core::last_fm::last_fm_scrobble_service::LastFmTrack;
-use octo_core::models::domain::Song;
+use octo_core::models::domain::{Album, Song};
 use octo_core::models::radio::LastFmRadioPlay;
 use octo_core::settings::{HeartDownloadStep, LibraryAction, LibraryRatingScope};
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
@@ -108,7 +108,10 @@ fn is_outside_artist(state: &AppState, id: &str) -> bool {
 }
 
 /// Stars (favorites) items. For playlists, triggers download. For external songs and
-/// albums, triggers a download and, outside Octo's own apps, favorites it once it arrives.
+/// albums, triggers a download and, outside Octo's own apps, favorites it once it arrives —
+/// unless every download source for that kind of heart is off and Octo does not manage the
+/// caller: then the song or album is saved as a streaming favorite (`family-saved.json`)
+/// instead, with nothing fetched and no registry id sent to Navidrome.
 ///
 /// Repeated ids and comma lists are taken one by one: outside songs and albums are queued each
 /// on their own, and the library ids go to Navidrome together in one call. An outside artist
@@ -183,6 +186,12 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
     // A saved link needs no download source.
     let saves = matches!(heart, HeartOutcome::Save { .. });
     let song_hearts = saves || sources.iter().any(|step| step.song_enabled == Some(true));
+    let album_hearts = sources.iter().any(|step| step.album_enabled == Some(true));
+    // With the song (or album) heart source off, a caller Octo does not manage saves the
+    // outside item as a streaming favorite instead of sending its registry id to Navidrome:
+    // the owner's heart with DownloadOnStar off is a save, nothing fetched. A member keeps
+    // the gate's outcome whatever the sources say.
+    let managed = caller.as_ref().is_some_and(|caller| caller.managed);
 
     // The REGISTRY decides whether an id is an album, because ParseSongId reports every
     // registry id as a "song" and would otherwise send an entire album down the single-track
@@ -191,21 +200,32 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
     let mut outside_artist = false;
     let mut albums: Vec<String> = Vec::new();
     let mut songs: Vec<String> = Vec::new();
+    let mut saved_songs: Vec<String> = Vec::new();
+    let mut saved_albums: Vec<String> = Vec::new();
     let mut library: Vec<(&str, String)> = Vec::new();
+    let take_album = |id: String, albums: &mut Vec<String>, saved: &mut Vec<String>| {
+        if album_hearts || saves || managed {
+            albums.push(id);
+        } else {
+            saved.push(id);
+        }
+    };
     for id in ids {
         if is_outside_artist(&state, &id) {
             outside_artist = true;
         } else if routing_kind(&state, &id) == Some(RoutingKind::Album) {
-            albums.push(id);
+            take_album(id, &mut albums, &mut saved_albums);
         } else if song_hearts && state.local_library.parse_song_id(&id).0 {
             songs.push(id);
+        } else if !managed && state.local_library.parse_song_id(&id).0 {
+            saved_songs.push(id);
         } else {
             library.push(("id", id));
         }
     }
     for id in album_ids {
         if routing_kind(&state, &id) == Some(RoutingKind::Album) {
-            albums.push(id);
+            take_album(id, &mut albums, &mut saved_albums);
         } else {
             library.push(("albumId", id));
         }
@@ -217,8 +237,9 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
             library.push(("artistId", id));
         }
     }
+    let saved_outside = !saved_songs.is_empty() || !saved_albums.is_empty();
 
-    if outside_artist || !albums.is_empty() || !songs.is_empty() {
+    if outside_artist || !albums.is_empty() || !songs.is_empty() || saved_outside {
         // Navidrome never sees these ids, so nothing else would check who is asking.
         if let Some(refused) = refuse_unless_signed_in(&state, &call, &format).await? {
             return Ok(refused);
@@ -230,7 +251,7 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
             .create_error(&format, 70, ARTIST_NOT_IN_LIBRARY)
             .into_response());
     }
-    let split = !albums.is_empty() || !songs.is_empty();
+    let split = !albums.is_empty() || !songs.is_empty() || saved_outside;
     // Who the outside hearts are for, named once before anything is queued, so a name that
     // cannot be read leaves nothing half queued under the error.
     let who = if split && !saves {
@@ -264,6 +285,8 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
         who: who.as_deref(),
         albums: &albums,
         songs: &songs,
+        saved_albums: &saved_albums,
+        saved_songs: &saved_songs,
     };
     if split && library.is_empty() {
         // Navidrome has never seen these ids, so relaying the star would just error.
@@ -360,13 +383,17 @@ async fn landed_holder(state: &AppState, call: &SubsonicCall) -> Option<String> 
 }
 
 /// The outside songs and albums one star carried, with what a heart does for this person and
-/// who it is for (None only when every heart is a saved link).
+/// who it is for (None only when every heart is a saved link), and the songs and albums saved
+/// as streaming favorites because every download source for them is off and Octo does not
+/// manage the caller.
 struct OutsideHearts<'a> {
     heart: &'a HeartOutcome,
     sources: &'a [HeartDownloadStep],
     who: Option<&'a str>,
     albums: &'a [String],
     songs: &'a [String],
+    saved_albums: &'a [String],
+    saved_songs: &'a [String],
 }
 
 impl OutsideHearts<'_> {
@@ -375,6 +402,24 @@ impl OutsideHearts<'_> {
     /// request hearting several songs of an album walks it once. An album the request hearted
     /// itself is already on its way, so no song brings it again.
     async fn queue(&self, state: &AppState, call: &SubsonicCall) {
+        // The streaming favorites first: a saved link queues nothing and never reaches
+        // Navidrome, so it cannot disturb the chains below.
+        if let Some(who) = self.who {
+            for album in self.saved_albums {
+                save_album(state, who, album).await;
+            }
+            for song in self.saved_songs {
+                let (_, provider, external_id) = state.local_library.parse_song_id(song);
+                save_song(
+                    state,
+                    who,
+                    song,
+                    provider.as_deref().unwrap_or_default(),
+                    external_id.as_deref().unwrap_or_default(),
+                )
+                .await;
+            }
+        }
         for album in self.albums {
             star_outside_album(state, call, self.heart, self.sources, self.who, album).await;
         }
@@ -720,10 +765,11 @@ async fn ask_for_copy(state: &AppState, user: &str, id: &str, kind: RequestKind,
 }
 
 /// `unstar`: repeated ids and comma lists are taken one by one. Outside ids are answered by
-/// Octo: a family member's saved song or album is forgotten, and a heart still waiting for its
-/// download is dropped, so the song leaves the caller's starred lists. Library ids go to
-/// Navidrome together. A request with no outside id, or only outside ids Octo holds nothing
-/// for, goes where it always went.
+/// Octo: a saved song or album is forgotten — a family member's, or a caller Octo does not
+/// manage who saved it as a streaming favorite — and a heart still waiting for its download is
+/// dropped, so the song leaves the caller's starred lists. Library ids go to Navidrome
+/// together. A request with no outside id, or one from a caller Octo does not manage with only
+/// outside ids Octo holds nothing for, goes where it always went.
 pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::response::Response {
     let member = family_caller(req.extensions())
         .filter(|caller| caller.managed)
@@ -735,12 +781,22 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
     let call = SubsonicCall::from_parts(&state, &parts, body.clone());
     let format = call.format();
     state.imports.forget_cached_songs(&sent_ids(&call, "id"));
+    // Who the outside ids are saved for: a member the gate named, or — for a caller Octo does
+    // not manage, whatever Family says — whoever the request signed in as. Their streaming
+    // favorites are theirs to take back here too; the sign-in is checked before one is.
+    let saver = match &member {
+        Some(user) => Some(user.clone()),
+        None => signed_in_user(&state, &call)
+            .await
+            .ok()
+            .filter(|user| !user.is_empty()),
+    };
     let ids: Vec<(&str, String)> = ["id", "albumId", "artistId"]
         .into_iter()
         .flat_map(|key| sent_ids(&call, key).into_iter().map(move |id| (key, id)))
         .collect();
     let is_outside = |id: &str| {
-        member
+        saver
             .as_deref()
             .is_some_and(|user| state.family_saved.is_saved(user, id))
             || state.local_library.parse_song_id(id).0
@@ -780,7 +836,20 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
         .filter(|(provider, external_id)| state.star_on_arrival.holds_song(provider, external_id))
         .collect();
 
-    if !mapped && (outside.is_empty() || (member.is_none() && library.is_empty() && held.is_empty())) {
+    // Whether the caller has one of these ids saved, so an unstar of a streaming favorite is
+    // answered by Octo instead of relaying an id Navidrome has never seen.
+    let saves_held = saver.as_deref().is_some_and(|user| {
+        outside
+            .iter()
+            .any(|(_, id)| state.family_saved.is_saved(user, id))
+    });
+    // A member's outside ids are always answered here — Octo holds a save or a waiting heart for
+    // them or holds nothing at all, and either way Navidrome has never seen the id — so the
+    // pass-through shortcut is a caller Octo does not manage's, taken only when nothing of
+    // theirs stands here: no save to take back, no waiting heart, no library id.
+    if !mapped
+        && (outside.is_empty() || (member.is_none() && !saves_held && library.is_empty() && held.is_empty()))
+    {
         return match member {
             None => {
                 if let Some((holder, ids)) = forget
@@ -818,7 +887,15 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
             }
         }
     }
-    if let Some(user) = &member {
+    if saves_held && member.is_none() {
+        // Nothing here reaches Navidrome, so the sign-in is checked before a save is taken.
+        match refuse_unless_signed_in(&state, &call, &format).await {
+            Ok(None) => {}
+            Ok(Some(refused)) => return refused,
+            Err(error) => return error.into_response(),
+        }
+    }
+    if let Some(user) = &saver {
         for (_, id) in &outside {
             if state.family_saved.remove(user, id) {
                 info!("FAMILY {user} unsaved {id}");
@@ -885,12 +962,18 @@ async fn relay_unstar(
 }
 
 /// `getStarred` and `getStarred2`: Navidrome's answer, with the outside songs the caller hearted
-/// that are still waiting for their download, as outside songs are shaped everywhere else. An
-/// app that reads its favorites from here keeps the heart until the file lands and Navidrome's
-/// own favorite takes over. Only the caller's own waiting hearts are added; with none, the answer
-/// is Navidrome's as it came.
+/// that are still waiting for their download, as outside songs are shaped everywhere else, and —
+/// for a caller Octo does not manage, whatever Family says — the songs and albums they saved as
+/// streaming favorites. An app that reads its favorites from here keeps the heart until the file
+/// lands and Navidrome's own favorite takes over. Only the caller's own waiting hearts and saves
+/// are added; with none, the answer is Navidrome's as it came. A managed member's saves join
+/// through the family rules instead, so they are never added twice.
 pub async fn get_starred(State(state): State<AppState>, req: Request) -> axum::response::Response {
-    if !state.star_on_arrival.holds_any_song() {
+    // The family rules add a member's saves to this same answer, so for a caller they manage
+    // the shortcut past this handler is safe; anyone else's saves are added here, and whether
+    // they have any can only be known once the request names them.
+    let managed = family_caller(req.extensions()).is_some_and(|caller| caller.managed);
+    if !state.star_on_arrival.holds_any_song() && managed {
         return crate::http::catch_all::catch_all(State(state), req).await;
     }
     let (parts, body) = req.into_parts();
@@ -906,14 +989,18 @@ pub async fn get_starred(State(state): State<AppState>, req: Request) -> axum::r
     let answer =
         crate::http::catch_all::catch_all(State(state.clone()), Request::from_parts(parts, Body::from(body)))
             .await;
-    with_waiting_hearts(&state, &call, container, answer).await
+    with_waiting_hearts(&state, &call, container, !managed, answer).await
 }
 
-/// The answer with the caller's waiting hearts added, when it is a plain 200 Navidrome accepted.
+/// The answer with the caller's waiting hearts added, when it is a plain 200 Navidrome accepted,
+/// and with their saved songs and albums when `with_saves` (a caller Octo does not manage).
+/// Every list keeps at most one row per id across everything it joins: a song both saved and
+/// still waiting for its download keeps its saved row, starred when it was saved.
 async fn with_waiting_hearts(
     state: &AppState,
     call: &SubsonicCall,
     container: &str,
+    with_saves: bool,
     answer: axum::response::Response,
 ) -> axum::response::Response {
     if answer.status() != StatusCode::OK || answer.headers().contains_key(header::CONTENT_ENCODING) {
@@ -928,7 +1015,17 @@ async fn with_waiting_hearts(
     let waiting = state
         .star_on_arrival
         .waiting_songs(&StarOnArrival::holder_name(&credential, Some(&who)));
-    if waiting.is_empty() {
+    let saved_songs = if with_saves {
+        state.family_saved.list(&who)
+    } else {
+        Vec::new()
+    };
+    let saved_albums = if with_saves {
+        state.family_saved.albums(&who)
+    } else {
+        Vec::new()
+    };
+    if waiting.is_empty() && saved_songs.is_empty() && saved_albums.is_empty() {
         return answer;
     }
     let (mut parts, body) = answer.into_parts();
@@ -949,21 +1046,47 @@ async fn with_waiting_hearts(
             let Some(holder) = holder.as_object_mut() else {
                 return false;
             };
-            let list = holder.entry("song").or_insert_with(|| Value::Array(Vec::new()));
-            let Some(list) = list.as_array_mut() else {
-                return false;
-            };
-            let known: Vec<String> = list
-                .iter()
-                .filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_string))
-                .collect();
-            for (song, starred) in &songs {
-                if known.contains(&song.id) {
-                    continue;
+            let album_list = holder.entry("album").or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(list) = album_list.as_array_mut() {
+                let known: Vec<String> = list
+                    .iter()
+                    .filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect();
+                for album in &saved_albums {
+                    if known.contains(&album.id) {
+                        continue;
+                    }
+                    let mut fields = builder.convert_album_to_json(&saved_album(album));
+                    fields.insert("starred".into(), starred_time(&album.saved).into());
+                    list.push(Value::Object(fields));
                 }
-                let mut fields = builder.convert_song_to_json(song);
-                fields.insert("starred".into(), starred_time(starred).into());
-                list.push(Value::Object(fields));
+            }
+            let song_list = holder.entry("song").or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(list) = song_list.as_array_mut() {
+                // One row per id across everything this list joins: each appended row counts as
+                // known from here on, so a song both saved and still waiting for its download
+                // keeps a single row — the save's, starred when it was saved.
+                let mut known: Vec<String> = list
+                    .iter()
+                    .filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect();
+                for saved in &saved_songs {
+                    if known.contains(&saved.id) {
+                        continue;
+                    }
+                    let mut fields = builder.convert_song_to_json(&saved_song(saved));
+                    fields.insert("starred".into(), starred_time(&saved.saved).into());
+                    list.push(Value::Object(fields));
+                    known.push(saved.id.clone());
+                }
+                for (song, starred) in &songs {
+                    if known.contains(&song.id) {
+                        continue;
+                    }
+                    let mut fields = builder.convert_song_to_json(song);
+                    fields.insert("starred".into(), starred_time(starred).into());
+                    list.push(Value::Object(fields));
+                }
             }
             true
         },
@@ -978,10 +1101,29 @@ async fn with_waiting_hearts(
             let Some(holder) = root.elements_mut().find(|e| e.name == container) else {
                 return false;
             };
-            let known: Vec<String> = holder
+            // One row per id here too: every appended row counts as known, so a song both
+            // saved and still waiting keeps a single element — the save's.
+            let mut known: Vec<String> = holder
                 .elements()
                 .filter_map(|e| e.attribute("id").map(str::to_string))
                 .collect();
+            for album in &saved_albums {
+                if known.contains(&album.id) {
+                    continue;
+                }
+                let mut element = builder.convert_album_to_xml(&saved_album(album), ns.as_deref());
+                element.set_attr("starred", starred_time(&album.saved));
+                holder.push(element);
+            }
+            for saved in &saved_songs {
+                if known.contains(&saved.id) {
+                    continue;
+                }
+                let mut element = builder.convert_song_to_xml(&saved_song(saved), ns.as_deref());
+                element.set_attr("starred", starred_time(&saved.saved));
+                holder.push(element);
+                known.push(saved.id.clone());
+            }
             for (song, starred) in &songs {
                 if known.contains(&song.id) {
                     continue;
@@ -1052,6 +1194,35 @@ async fn waiting_hearts(state: &AppState, waiting: &[WaitingStar]) -> Vec<(Song,
 
 fn starred_time(at: &DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// A saved outside song as the builder writes songs outside the library: the same shape the
+/// family rules give a member's saves, written here for a caller Octo does not manage (the
+/// rules' own converters stay private to `rules.rs`, which this phase does not touch).
+fn saved_song(saved: &SavedSong) -> Song {
+    Song {
+        id: saved.id.clone(),
+        title: saved.title.clone(),
+        artist: saved.artist.clone(),
+        album: saved.album.clone(),
+        duration: i32::try_from(saved.duration).ok().filter(|d| *d > 0),
+        explicit_content_lyrics: Some(saved.explicit),
+        is_local: false,
+        ..Default::default()
+    }
+}
+
+/// A saved outside album the same way.
+fn saved_album(saved: &SavedAlbum) -> Album {
+    Album {
+        id: saved.id.clone(),
+        title: saved.name.clone(),
+        artist: saved.artist.clone(),
+        year: saved.year,
+        song_count: i32::try_from(saved.song_count).ok(),
+        is_local: false,
+        ..Default::default()
+    }
 }
 
 /// Star ratings.
@@ -1730,6 +1901,10 @@ mod family_tests;
 #[cfg(test)]
 #[path = "stars_hearts_tests.rs"]
 mod hearts_tests;
+
+#[cfg(test)]
+#[path = "stars_saved_owner_tests.rs"]
+mod saved_owner_tests;
 
 #[cfg(test)]
 #[path = "family_library_tests.rs"]

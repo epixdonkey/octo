@@ -2242,6 +2242,7 @@ impl Radio {
                 Some(config_dir.join("generated-playlists.json")),
                 navidrome.subsonic_proxy.clone(),
                 settings.clone(),
+                stores.family_saved.clone(),
             )
             .with_for_you(ForYouServices {
                 builder: new_releases,
