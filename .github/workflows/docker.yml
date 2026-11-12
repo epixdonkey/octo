@@ -441,6 +441,13 @@ jobs:
   # through the overlay). It runs on every push to main and on every dispatch, and it is
   # blocking everywhere (continue-on-error is deliberately false): a red smoke stops the
   # release job below from publishing.
+  # One exception, baked into the script: /stream on a GitHub-hosted runner is always met
+  # with YouTube's bot wall -- datacenter IPs never pass it (build #3, run 43200200981: both
+  # resolve profiles bot-walled while search answered hits), so the script treats that 502 as
+  # chronic, warns and continues; every other stream failure (shim unreachable, wrong shape)
+  # stays a hard red. The stream proof against live YouTube belongs to a self-hosted runner
+  # on a residential IP -- a future addition, not this job. The release job still requires
+  # this one, because the smoke no longer falls over on the bot wall.
   # The images are pulled by the commit tag both merge and retag publish, so the smoke tests
   # exactly the images this run shipped -- and, on a release tag reusing main's build, those
   # same images again before they become a release.
