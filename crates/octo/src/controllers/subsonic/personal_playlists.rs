@@ -18,6 +18,7 @@ use octo_core::json::dom::Node;
 use octo_core::soulseek::SoulseekRouting;
 use octo_subsonic::Parameters;
 use octo_subsonic::SubsonicReply;
+use octo_subsonic::subsonic_response_builder::{genres_with_source, source_genre_for};
 use octo_subsonic::xml::XElement;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -135,6 +136,10 @@ async fn outside_entry_for(state: &AppState, id: &str) -> Option<PersonalPlaylis
     let title = song.as_ref().map(|s| s.title.clone()).unwrap_or_default();
     let duration = song.as_ref().and_then(|s| s.duration);
     let you_tube_id = routing.as_ref().and_then(|r| r.you_tube_id.clone());
+    // The discovery service the row came by, kept on the position because the song's own
+    // `suggested_by` is never stored: it is what the position's rows badge their genre by,
+    // and it survives a registry eviction with the position itself.
+    let source = routing.as_ref().and_then(|r| r.suggested_by.clone());
     let seed = seed_matching(&external_id, you_tube_id.as_deref(), &artist, &title, duration);
     if seed.is_none() {
         warn!(
@@ -147,6 +152,7 @@ async fn outside_entry_for(state: &AppState, id: &str) -> Option<PersonalPlaylis
         library_id: None,
         outside_id: Some(external_id),
         you_tube_id,
+        source,
         song_snapshot: song,
         seed,
     })
@@ -631,7 +637,9 @@ pub(crate) async fn rest_get_playlist(state: &AppState, call: &SubsonicCall, id:
     let (sources, mirror) = served_sources(state, &call.proxy, &call.parameters, &playlist).await;
     let mut entries: Vec<Node> = Vec::new();
     let mut outside_ids: Vec<String> = Vec::new();
-    for source in &sources {
+    // The sources aligned back onto their entries, so each outside row is answered with its own
+    // position's kept source — the label its genre badge reads (option A).
+    for (entry, source) in zipped(&playlist, &sources) {
         match source {
             ServeSource::Library { id, outside } => {
                 if let Some(row) = mirror.as_ref().and_then(|rows| rows.get(id)) {
@@ -641,14 +649,14 @@ pub(crate) async fn rest_get_playlist(state: &AppState, call: &SubsonicCall, id:
                 // Navidrome would not tell (or the row went between the read and here): the
                 // stream takes over what the position kept.
                 if let Some(outside) = outside
-                    && let Some(song) = outside_song_json(state, outside).await
+                    && let Some(song) = outside_song_json(state, outside, entry.source.as_deref()).await
                 {
                     entries.push(Node::from_value(&song));
                     outside_ids.push(outside.clone());
                 }
             }
             ServeSource::Outside { outside_id, .. } => {
-                if let Some(song) = outside_song_json(state, outside_id).await {
+                if let Some(song) = outside_song_json(state, outside_id, entry.source.as_deref()).await {
                     entries.push(Node::from_value(&song));
                     outside_ids.push(outside_id.clone());
                 }
@@ -1254,6 +1262,22 @@ fn native_detail(playlist: &PersonalPlaylist) -> Response {
     }))
 }
 
+/// The discovery label a position's rows badge by: the position's own record first — kept at
+/// add time, because `Song.suggested_by` is never stored and survives an eviction with the
+/// position — else the registry routing's own label, which an older position (added before it
+/// kept one) still badges by while the registry knows the row's origin.
+fn position_source(state: &AppState, entry: &PersonalPlaylistEntry) -> Option<String> {
+    if let Some(source) = entry.source.as_deref().filter(|by| !by.is_empty()) {
+        return Some(source.to_string());
+    }
+    let id = entry.outside_id.as_deref()?;
+    state
+        .external_id_registry
+        .lookup(id)
+        .map(|shared| shared.snapshot())
+        .and_then(|routing| routing.suggested_by)
+}
+
 /// The playlist's native tracks: one row per position, `id` 1..N (what Feishin moves and removes
 /// by), `mediaFileId` the source the position plays by right now — the same one read of the
 /// playlist's mirror and the same store resolution the REST answer goes by, so a file that went
@@ -1299,6 +1323,24 @@ async fn native_tracks(
             },
         };
         let fields = row.as_object_mut().expect("an object");
+        // The source badge (option A), the native rows' own: an outside position's row carries
+        // its source as a genre — the same mapping and the same merge the single-song object
+        // applies (`native_song_object`) and the REST serializer does (`convert_song_fields`),
+        // the snapshot's own genres first and the source appended after them, never twice. A
+        // library position's row keeps the slim shape it always had.
+        if matches!(source, ServeSource::Outside { .. })
+            && let Some(source) = position_source(state, entry)
+                .as_deref()
+                .and_then(source_genre_for)
+        {
+            let own = entry
+                .song_snapshot
+                .as_ref()
+                .and_then(|song| song.genre.as_deref());
+            let (genre, genres) = genres_with_source(own, source);
+            fields.insert("genre".into(), genre.into());
+            fields.insert("genres".into(), Value::Array(genres));
+        }
         fields.insert("id".into(), (at + 1).into());
         fields.insert("mediaFileId".into(), media.into());
         fields.insert("playlistId".into(), playlist.id.clone().into());

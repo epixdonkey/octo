@@ -179,6 +179,19 @@ impl PersonalApp {
         })
     }
 
+    /// One outside song in the registry as a search leaves it, by its short id: registered with
+    /// the discovery service's own label on the routing, the label its rows badge by.
+    fn labeled_outside_song(&self, title: &str, label: &str) -> String {
+        self.state.external_id_registry.register(SoulseekRouting {
+            kind: RoutingKind::Song,
+            artist: Some("K3KHA".into()),
+            title: Some(title.into()),
+            duration: Some(619),
+            suggested_by: Some(label.into()),
+            ..Default::default()
+        })
+    }
+
     /// One `createPlaylist` call, `query` beside the sign-in and the JSON format.
     async fn create(&self, query: &str) -> Reply {
         get(
@@ -1197,6 +1210,7 @@ async fn the_reconciler_binds_a_landed_file_and_releases_a_gone_one() {
             library_id: None,
             outside_id: Some(landed.clone()),
             you_tube_id: Some("video-1".into()),
+            source: None,
             song_snapshot: Some(snapshot_song("K3KHA", "Lost in Sound", 619)),
             seed: None,
         },
@@ -1205,6 +1219,7 @@ async fn the_reconciler_binds_a_landed_file_and_releases_a_gone_one() {
             library_id: Some("nd-gone".into()),
             outside_id: Some(gone.clone()),
             you_tube_id: Some("video-2".into()),
+            source: None,
             song_snapshot: Some(snapshot_song("Gone Artist", "Gone Song", 111)),
             seed: None,
         },
@@ -1623,4 +1638,132 @@ async fn a_purely_local_rest_update_on_a_plain_playlist_stays_navidromes_own() {
     );
     assert!(!t.state.personal_playlists.knows(PLAIN_PLAYLIST));
     assert!(t.nothing_downloads());
+}
+
+// ---- The source badge on playlist rows (SOAK-3b) ---------------------------------------------
+
+/// An outside position carries its discovery source as a genre badge in both protocols, the
+/// same one search rows carry: the position keeps the label at add time (the registry routing
+/// it was minted by), the REST row badges through the serializer's own rule and the native row
+/// through the same mapping and merge — the row's own genre (the snapshot's) first, the source
+/// appended after it. A library position's row keeps exactly what it always was.
+#[tokio::test]
+async fn an_outside_position_carries_its_source_badge_in_both_protocols() {
+    let t = PersonalApp::new().await;
+    let outside = t.labeled_outside_song("Lost in Sound", "YouTube Music (video)");
+    t.create_mixed(&outside).await;
+    // The position kept the label the routing was minted with.
+    let mut held = t.held(NEW_PLAYLIST);
+    assert_eq!(
+        held.entries[1].source.as_deref(),
+        Some("YouTube Music (video)"),
+        "the add kept the discovery label on the position"
+    );
+    // The position's own genre, as an enriched snapshot carries one.
+    held.entries[1]
+        .song_snapshot
+        .as_mut()
+        .expect("the outside snapshot")
+        .genre = Some("Techno".into());
+    t.state.personal_playlists.upsert(held);
+
+    t.mirror_answers(
+        r#"[{"id":"nd-2","title":"Local FLAC song","artist":"Someone","album":"Somewhere","duration":200,"genre":"Techno"}]"#,
+    )
+    .await;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/getPlaylist.view?{}&f=json&id={NEW_PLAYLIST}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    let entries = reply.envelope()["playlist"]["entry"]
+        .as_array()
+        .cloned()
+        .expect("the playlist's entries");
+    // The library row is the mirror's own, untouched: no badge, no label.
+    assert_eq!(entries[0]["id"], "nd-2");
+    assert_eq!(entries[0]["genre"], "Techno");
+    assert!(entries[0].get("octoSuggestedBy").is_none());
+    // The outside row badges its source, its own genre first — the search row's exact shape.
+    assert_eq!(entries[1]["id"], outside.as_str());
+    assert_eq!(entries[1]["genre"], "Techno; YouTube Video");
+    assert_eq!(
+        entries[1]["genres"],
+        json!([{ "name": "Techno" }, { "name": "YouTube Video" }])
+    );
+    assert_eq!(entries[1]["octoSuggestedBy"], "YouTube Music (video)");
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/api/playlist/{NEW_PLAYLIST}/tracks?{}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let rows = reply.json().as_array().cloned().expect("a tracks array");
+    // The library row keeps the slim shape it always had: no genre fields at all.
+    assert_eq!(rows[0]["mediaFileId"], "nd-2");
+    assert!(rows[0].get("genre").is_none(), "no badge on a library row");
+    assert!(rows[0].get("genres").is_none(), "no badge on a library row");
+    // The outside row carries the badge under both fields, the same merge as the REST row.
+    assert_eq!(rows[1]["mediaFileId"], outside.as_str());
+    assert_eq!(rows[1]["genre"], "Techno; YouTube Video");
+    assert_eq!(
+        rows[1]["genres"],
+        json!([{ "name": "Techno" }, { "name": "YouTube Video" }])
+    );
+    // And the whole answer still cost not one per-position song read.
+    assert_eq!(t.get_song_relays().await, 0, "no per-position song reads");
+}
+
+/// An older position, added before positions kept their source, still badges while the
+/// registry knows the row's origin: the routing's own label stands in for the kept one, in
+/// both protocols alike.
+#[tokio::test]
+async fn an_old_position_without_a_kept_source_badges_from_the_registry() {
+    let t = PersonalApp::new().await;
+    let outside = t.labeled_outside_song("Lost in Sound", "YouTube Music (video)");
+    t.create_mixed(&outside).await;
+    // As an old position: no kept source, the registry still labeled.
+    let mut held = t.held(NEW_PLAYLIST);
+    held.entries[1].source = None;
+    t.state.personal_playlists.upsert(held);
+    t.mirror_answers("[]").await;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/getPlaylist.view?{}&f=json&id={NEW_PLAYLIST}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    let entries = reply.envelope()["playlist"]["entry"]
+        .as_array()
+        .cloned()
+        .expect("the playlist's entries");
+    assert_eq!(entries[0]["id"], outside.as_str());
+    assert_eq!(entries[0]["genre"], "YouTube Video");
+    assert_eq!(entries[0]["genres"], json!([{ "name": "YouTube Video" }]));
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/api/playlist/{NEW_PLAYLIST}/tracks?{}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    let rows = reply.json().as_array().cloned().expect("a tracks array");
+    assert_eq!(rows[0]["mediaFileId"], outside.as_str());
+    assert_eq!(rows[0]["genre"], "YouTube Video");
+    assert_eq!(rows[0]["genres"], json!([{ "name": "YouTube Video" }]));
 }

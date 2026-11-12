@@ -56,6 +56,7 @@ fn stored_outside_position(
             library_id: None,
             outside_id: Some(outside_id.to_string()),
             you_tube_id: Some(video.to_string()),
+            source: None,
             song_snapshot: Some(snapshot(artist, title, seconds)),
             seed,
         }],
@@ -83,6 +84,7 @@ fn the_document_round_trips_with_the_folder_on_all_three_carriers() {
             library_id: Some("nd-song-9".to_string()),
             outside_id: None,
             you_tube_id: None,
+            source: None,
             song_snapshot: None,
             seed: None,
         }],
@@ -336,6 +338,7 @@ fn binding_the_library_half_keeps_the_outside_half() {
             library_id: None,
             outside_id: Some("outside-1".to_string()),
             you_tube_id: Some("video-1".to_string()),
+            source: None,
             song_snapshot: Some(snapshot("K3KHA", "Lost in Sound", 619)),
             seed: Some(seed),
         }],
@@ -468,4 +471,38 @@ fn parallel_adoptions_converge_on_the_first_adoption() {
         ["occ-first", "occ-second-edit"],
         "the second caller's change landed beside the first adoption's, none lost"
     );
+}
+
+/// A position's kept source survives the document's round trip: the label is stored beside the
+/// snapshot (`Song.suggested_by` never is), so the badge on a playlist row outlives a restart
+/// or an eviction with the position itself (SOAK-3b).
+#[test]
+fn a_positions_source_survives_the_document_round_trip() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("personal-playlists.json");
+    let store = PersonalPlaylistStore::new(Some(&path));
+    store.upsert(PersonalPlaylist {
+        id: "nd-1".to_string(),
+        entries: vec![PersonalPlaylistEntry {
+            occurrence_id: "occ-1".to_string(),
+            library_id: None,
+            outside_id: Some("outside-1".to_string()),
+            you_tube_id: Some("video-1".to_string()),
+            source: Some("YouTube Music (video)".to_string()),
+            song_snapshot: Some(snapshot("K3KHA", "Lost in Sound", 619)),
+            seed: None,
+        }],
+        ..Default::default()
+    });
+
+    // The store as a restart leaves it: read back from the same file.
+    let read = PersonalPlaylistStore::new(Some(&path));
+    let back = read.find("nd-1").expect("the playlist came back");
+    assert_eq!(
+        back.entries[0].source.as_deref(),
+        Some("YouTube Music (video)"),
+        "the position's source survives the round trip"
+    );
+    assert_eq!(back.entries[0].outside_id.as_deref(), Some("outside-1"));
+    assert!(back.entries[0].song_snapshot.is_some());
 }

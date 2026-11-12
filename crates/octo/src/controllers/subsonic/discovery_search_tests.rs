@@ -128,6 +128,9 @@ async fn a_search3_answer_labels_its_discovery_rows_by_service() {
         .snapshot();
     assert_eq!(routing.you_tube_id.as_deref(), Some("vBvDiLKTDWA"));
     assert_eq!(routing.duration, Some(619));
+    // The origin rides the routing as its own label, so a playlist position added from the row
+    // can keep its source after the answer is gone (the badge's durable bridge).
+    assert_eq!(routing.suggested_by.as_deref(), Some("YouTube Music (video)"));
     assert_eq!(rows[video]["duration"], 619);
     // The song row is its own row beside it, the release's album on it.
     assert_eq!(rows[song]["album"], "Weightless Orbit");
