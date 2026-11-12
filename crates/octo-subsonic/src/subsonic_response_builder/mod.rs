@@ -1171,20 +1171,36 @@ fn known_seconds(duration: Option<i32>) -> i32 {
     duration.unwrap_or(0).max(0)
 }
 
-/// The genre an outside row's `octoSuggestedBy` label doubles as (option A: the source as a
-/// genre badge). A discovery row comes by one of three services — a YouTube Music song, a
-/// YouTube Music video, or plain YouTube — and a badge a client shows without knowing
-/// `octoSuggestedBy` is a genre, the one field every Subsonic client renders (Feishin's Genre
-/// column among them). Only those three labels map; a radio answer's `suggested_by` ("Last.fm",
-/// "YouTube Music" with no paren, "Your library"...) is the radio's own source, not a discovery
-/// origin, and does not become a genre.
+/// A discovery origin's label and the genre it doubles as (option A: the source as a genre
+/// badge), one row per origin. The table is the badge mapping's single source of truth, so the
+/// genre a label carries and the set of labels that carry one cannot drift apart — and the
+/// producer of the labels (octo's `RowOrigin::label()`) binds its own set to
+/// [`source_genre_labels`] by an invariant test, so a renamed label cannot leave this table
+/// behind with every suite green.
+const DISCOVERY_GENRES: [(&str, &str); 3] = [
+    ("YouTube Music (song)", "YouTube Music"),
+    ("YouTube Music (video)", "YouTube Video"),
+    ("YouTube", "YouTube"),
+];
+
+/// The genre an outside row's `octoSuggestedBy` label doubles as. A discovery row comes by one
+/// of three services — a YouTube Music song, a YouTube Music video, or plain YouTube — and a
+/// badge a client shows without knowing `octoSuggestedBy` is a genre, the one field every
+/// Subsonic client renders (Feishin's Genre column among them). Only the labels in
+/// [`DISCOVERY_GENRES`] map; a radio answer's `suggested_by` ("Last.fm", "YouTube Music" with
+/// no paren, "Your library"...) is the radio's own source, not a discovery origin, and does not
+/// become a genre.
 pub fn source_genre_for(suggested_by: &str) -> Option<&'static str> {
-    match suggested_by {
-        "YouTube Music (song)" => Some("YouTube Music"),
-        "YouTube Music (video)" => Some("YouTube Video"),
-        "YouTube" => Some("YouTube"),
-        _ => None,
-    }
+    DISCOVERY_GENRES
+        .iter()
+        .find_map(|(label, genre)| (*label == suggested_by).then_some(*genre))
+}
+
+/// The discovery labels that carry a genre badge, straight from [`source_genre_for`]'s table:
+/// this is the side the label producer's invariant test binds to, so a label the producer no
+/// longer mints — or one it newly does — is a red test, not a silently lost badge.
+pub fn source_genre_labels() -> impl Iterator<Item = &'static str> {
+    DISCOVERY_GENRES.iter().map(|(label, _)| *label)
 }
 
 /// The `genre` string and `genres` list of a row whose source shows as a genre badge: the row's

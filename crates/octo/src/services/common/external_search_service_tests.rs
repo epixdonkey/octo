@@ -7,6 +7,7 @@ use std::time::Duration;
 use futures::FutureExt;
 use octo_core::radio::radio_provider;
 use octo_core::settings::{AppSettings, LastFmSettings, SubsonicSettings};
+use octo_subsonic::subsonic_response_builder::{source_genre_for, source_genre_labels};
 use tokio::sync::watch;
 use wiremock::matchers::{any, path, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -1155,6 +1156,45 @@ fn the_discovery_labels_are_not_radio_provider_names() {
             "'{label}' collides with a radio name"
         );
     }
+}
+
+/// The discovery labels and the genre badges they double as are one vocabulary, bound from both
+/// sides: every label the producer (`RowOrigin::label()`) can mint maps to a badge in the
+/// Subsonic builder, and the builder's table holds no label the producer cannot mint. Without
+/// this bond a renamed label — even with the producer's own literal assertions updated — leaves
+/// that row's badge silently gone and every suite green.
+#[test]
+fn the_discovery_labels_and_the_genre_badges_are_one_vocabulary() {
+    let produced = [
+        RowOrigin::Songs.label(),
+        RowOrigin::Videos.label(),
+        RowOrigin::YouTube.label(),
+    ];
+    // Three services, three distinct labels: a shared one would fold two services into one badge.
+    for (index, label) in produced.iter().enumerate() {
+        assert!(
+            !produced[..index].contains(label),
+            "two discovery origins share the label '{label}'"
+        );
+    }
+    // Every minted label carries a badge: one the mapping does not know loses its badge without
+    // any signal.
+    for label in produced {
+        assert!(
+            source_genre_for(label).is_some(),
+            "the discovery label '{label}' maps to no genre badge"
+        );
+    }
+    // And the mapping knows no label the producer cannot mint, so the two sets are one (the
+    // radio's names are a different vocabulary, deliberately outside both — see the test above).
+    let mut mapped: Vec<&str> = source_genre_labels().collect();
+    let mut minted: Vec<&str> = produced.into();
+    mapped.sort_unstable();
+    minted.sort_unstable();
+    assert_eq!(
+        mapped, minted,
+        "the genre-badge table and the discovery labels are different sets"
+    );
 }
 
 /// A keyed Last.fm answering the production shape of a niche query (SOAK-1a): track.search is
