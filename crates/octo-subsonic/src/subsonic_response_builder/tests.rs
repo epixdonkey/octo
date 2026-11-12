@@ -1729,3 +1729,99 @@ fn station_songs_carry_the_station_and_its_entries_in_both_formats() {
     assert_eq!(entries[0].attribute("id"), Some("local-1"));
     assert_eq!(entries[0].attribute("title"), Some("Title"));
 }
+
+// ---- The source of an outside row as a genre badge (option A) ----------------
+// Feishin's Genre column reads `genres` in both of its modes, and every other client reads
+// the `genre` string, so the badge has to ride both: the row's own genres first, the source
+// appended after them. A library row and a radio row never get one.
+
+/// An outside discovery row's origin label doubles as its genre: a YouTube Music song, a
+/// YouTube Music video, and a plain YouTube fallback each badge as their own genre, in both
+/// genre fields and in the XML attribute.
+#[test]
+fn an_outside_row_carries_its_source_as_a_genre_badge() {
+    for (label, badge) in [
+        ("YouTube Music (song)", "YouTube Music"),
+        ("YouTube Music (video)", "YouTube Video"),
+        ("YouTube", "YouTube"),
+    ] {
+        let song = Song {
+            id: "row-1".into(),
+            title: "Lost in Sound".into(),
+            artist: "K3KHA".into(),
+            duration: Some(619),
+            is_local: false,
+            suggested_by: Some(label.into()),
+            ..Default::default()
+        };
+        let row = builder().convert_song_to_json(&song);
+        assert_eq!(row["genre"], badge, "{label}");
+        assert_eq!(row["genres"], json!([{ "name": badge }]), "{label}");
+        assert_eq!(
+            builder().convert_song_to_xml(&song, NS).attribute("genre"),
+            Some(badge),
+            "{label}"
+        );
+    }
+}
+
+/// A row with a genre of its own (Deezer enrichment, a playlist snapshot) keeps it first and
+/// gets the source appended after it — once, not twice when the row already carries it.
+#[test]
+fn an_outside_rows_own_genres_come_first_with_the_source_appended() {
+    let song = Song {
+        id: "row-1".into(),
+        title: "Lost in Sound".into(),
+        artist: "K3KHA".into(),
+        genre: Some("Techno".into()),
+        is_local: false,
+        suggested_by: Some("YouTube Music (song)".into()),
+        ..Default::default()
+    };
+    let row = builder().convert_song_to_json(&song);
+    assert_eq!(row["genre"], "Techno; YouTube Music");
+    assert_eq!(
+        row["genres"],
+        json!([{ "name": "Techno" }, { "name": "YouTube Music" }])
+    );
+
+    let already_badged = Song {
+        genre: Some("YouTube".into()),
+        suggested_by: Some("YouTube".into()),
+        ..song
+    };
+    let row = builder().convert_song_to_json(&already_badged);
+    assert_eq!(row["genre"], "YouTube");
+    assert_eq!(row["genres"], json!([{ "name": "YouTube" }]));
+}
+
+/// A library row keeps its genres exactly as they were: the badge is a property of an
+/// outside discovery row, and a source label on a library row (or a radio row's source
+/// label, which maps to no badge) changes nothing.
+#[test]
+fn a_library_or_radio_row_never_carries_a_source_badge() {
+    let library = Song {
+        id: "l1".into(),
+        title: "Song".into(),
+        artist: "Artist".into(),
+        genre: Some("Techno".into()),
+        is_local: true,
+        suggested_by: Some("YouTube Music (song)".into()),
+        ..Default::default()
+    };
+    let row = builder().convert_song_to_json(&library);
+    assert_eq!(row["genre"], "Techno");
+    assert_eq!(row["genres"], json!([]));
+
+    let radio = Song {
+        id: "r1".into(),
+        title: "Song".into(),
+        artist: "Artist".into(),
+        is_local: false,
+        suggested_by: Some("Last.fm".into()),
+        ..Default::default()
+    };
+    let row = builder().convert_song_to_json(&radio);
+    assert_eq!(row["genre"], "");
+    assert_eq!(row["genres"], json!([]));
+}
