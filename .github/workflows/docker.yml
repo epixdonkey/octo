@@ -431,12 +431,58 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
         run: docker buildx imagetools inspect "$IMAGE:$VERSION"
 
+  # The live smoke: the built images against the real world, before anything is released.
+  # Every other check in this workflow is hermetic -- the images build, the tests pass, the
+  # tags land -- and hermetic checks cannot see YouTube's anti-bot wall (SOAK-1b shipped a
+  # shim that bot-walled on every resolve because no gate ever talked to YouTube) or a
+  # Subsonic stack answering the wrong shape. So this job runs the built shim against live
+  # YouTube (health, a search that must answer hits, and the first hit's stream handing over
+  # audio bytes) and the built Octo beside a real Navidrome (ping, search3, playlist CRUD
+  # through the overlay). It runs on every push to main and on every dispatch, and it is
+  # blocking everywhere (continue-on-error is deliberately false): a red smoke stops the
+  # release job below from publishing.
+  # The images are pulled by the commit tag both merge and retag publish, so the smoke tests
+  # exactly the images this run shipped -- and, on a release tag reusing main's build, those
+  # same images again before they become a release.
+  live-smoke:
+    needs: [merge, retag]
+    if: always() && (needs.merge.result == 'success' || needs.retag.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # A live gate must be able to fail the release; never soften this per branch.
+    continue-on-error: false
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Live smoke against YouTube and a real Navidrome
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          sha="${GITHUB_SHA::7}"   # the tag merge/retag publish (metadata-action's short sha)
+          export SHIM_IMAGE="$REGISTRY/$IMAGE_NAME-yt-dlp-shim:$sha"
+          export OCTO_IMAGE="$REGISTRY/$IMAGE_NAME:$sha"
+          bash .github/scripts/live-smoke.sh
+
   # Publishes the release's draft once all three images of the tag are on ghcr.io (see the
   # order at the top). Only for dated releases, the ones Octo's update check offers.
   release:
-    needs: [merge, retag]
+    needs: [merge, retag, live-smoke]
     if: >-
       always() && github.ref_type == 'tag' && !startsWith(github.ref_name, 'v')
+      && needs.live-smoke.result == 'success'
       && (needs.merge.result == 'success' || needs.retag.result == 'success')
     runs-on: ubuntu-latest
     permissions:
