@@ -19,7 +19,9 @@ use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::imports::test_support::row;
 use crate::services::soulseek::ExternalIdRegistry;
 use crate::services::subsonic::personal_playlist_reconciler::PersonalPlaylistReconciler;
-use crate::services::subsonic::personal_playlist_store::{PersonalPlaylist, PersonalPlaylistEntry};
+use crate::services::subsonic::personal_playlist_store::{
+    PersonalPlaylist, PersonalPlaylistEntry, seed_matching,
+};
 
 /// The real id Navidrome hands back for an empty create.
 const NEW_PLAYLIST: &str = "nd-mix";
@@ -190,6 +192,48 @@ impl PersonalApp {
             suggested_by: Some(label.into()),
             ..Default::default()
         })
+    }
+
+    /// One outside position as an eviction leaves it (W1's shape, at the controller): the id was
+    /// minted in a registry of its own — never this app's, which starts cold — and the position
+    /// holds the seed that hashed to it, the label the add kept, and a snapshot with a genre of
+    /// its own. The registry's recovery re-registers the seed's words, which never carried the
+    /// label, so the row can badge by the position's record alone.
+    fn holds_a_forgotten_outside_position(&self, title: &str, label: &str) -> String {
+        let mint = ExternalIdRegistry::in_memory();
+        let outside = mint.register(SoulseekRouting {
+            kind: RoutingKind::Song,
+            you_tube_id: Some("vBvDiLKTDWA".into()),
+            artist: Some("K3KHA".into()),
+            title: Some(title.into()),
+            duration: Some(619),
+            ..Default::default()
+        });
+        let seed = seed_matching(&outside, Some("vBvDiLKTDWA"), "K3KHA", title, Some(619))
+            .expect("the minted row's own fields hash to its id");
+        self.state.personal_playlists.upsert(PersonalPlaylist {
+            id: NEW_PLAYLIST.to_string(),
+            owner: "alice".to_string(),
+            name: "Mix".to_string(),
+            entries: vec![PersonalPlaylistEntry {
+                occurrence_id: "occ-forgotten".into(),
+                library_id: None,
+                outside_id: Some(outside.clone()),
+                you_tube_id: Some("vBvDiLKTDWA".into()),
+                source: Some(label.to_string()),
+                song_snapshot: Some(Song {
+                    artist: "K3KHA".into(),
+                    title: title.to_string(),
+                    album: "Somewhere".into(),
+                    genre: Some("Techno".into()),
+                    duration: Some(619),
+                    ..Default::default()
+                }),
+                seed: Some(seed),
+            }],
+            ..Default::default()
+        });
+        outside
     }
 
     /// One `createPlaylist` call, `query` beside the sign-in and the JSON format.
@@ -1766,4 +1810,89 @@ async fn an_old_position_without_a_kept_source_badges_from_the_registry() {
     assert_eq!(rows[0]["mediaFileId"], outside.as_str());
     assert_eq!(rows[0]["genre"], "YouTube Video");
     assert_eq!(rows[0]["genres"], json!([{ "name": "YouTube Video" }]));
+}
+
+/// The eviction the kept source exists for: the registry forgot the position's id (a restart
+/// with the LRU cold, an eviction), and the REST row still badges — from the position's own
+/// record alone, the exact label the add kept. The registry's recovery re-registers the seed's
+/// words, which never carried the label, so no other carrier could have written these words
+/// into the answer (the witness the badge's own tests lacked, Defekt 1).
+#[tokio::test]
+async fn the_rest_row_badges_from_the_kept_source_when_the_registry_forgot_the_id() {
+    let t = PersonalApp::new().await;
+    let outside = t.holds_a_forgotten_outside_position("Lost in Sound", "YouTube Music (video)");
+    assert_eq!(
+        t.state.external_id_registry.count(),
+        0,
+        "the registry starts cold: it does not know the position's id"
+    );
+    t.mirror_answers("[]").await;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/getPlaylist.view?{}&f=json&id={NEW_PLAYLIST}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    let entries = reply.envelope()["playlist"]["entry"]
+        .as_array()
+        .cloned()
+        .expect("the playlist's entries");
+    assert_eq!(entries.len(), 1, "{}", reply.text());
+    // The badge is the position's own label — the value, not just its presence.
+    assert_eq!(entries[0]["id"], outside.as_str());
+    assert_eq!(entries[0]["genre"], "Techno; YouTube Video");
+    assert_eq!(
+        entries[0]["genres"],
+        json!([{ "name": "Techno" }, { "name": "YouTube Video" }])
+    );
+    assert_eq!(entries[0]["octoSuggestedBy"], "YouTube Music (video)");
+    // And the read that answered re-registered the seed's words alone: the label stays on the
+    // position — the registry's own carrier is and remains empty.
+    let recovered = t
+        .state
+        .external_id_registry
+        .lookup(&outside)
+        .expect("the seed re-registered the id")
+        .snapshot();
+    assert_eq!(
+        recovered.suggested_by, None,
+        "the label never comes back with the seed"
+    );
+}
+
+/// The native twin of the same eviction: the row a native tracks answer builds from the
+/// position's snapshot badges from the kept source alone — the same precedence the REST row
+/// badges by, in the protocol that never asks the song service at all.
+#[tokio::test]
+async fn the_native_row_badges_from_the_kept_source_when_the_registry_forgot_the_id() {
+    let t = PersonalApp::new().await;
+    let outside = t.holds_a_forgotten_outside_position("Lost in Sound", "YouTube Music (video)");
+    assert_eq!(
+        t.state.external_id_registry.count(),
+        0,
+        "the registry starts cold: it does not know the position's id"
+    );
+    t.mirror_answers("[]").await;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/api/playlist/{NEW_PLAYLIST}/tracks?{}",
+            auth("alice", "good", "octo")
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let rows = reply.json().as_array().cloned().expect("a tracks array");
+    assert_eq!(rows.len(), 1, "{}", reply.text());
+    assert_eq!(rows[0]["mediaFileId"], outside.as_str());
+    assert_eq!(rows[0]["genre"], "Techno; YouTube Video");
+    assert_eq!(
+        rows[0]["genres"],
+        json!([{ "name": "Techno" }, { "name": "YouTube Video" }])
+    );
 }
