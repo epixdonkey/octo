@@ -663,6 +663,7 @@ fn you_tube_row(
         song,
         you_tube_id: you_tube_id.map(str::to_string),
         origin,
+        matched: false,
     }
 }
 
@@ -1108,6 +1109,7 @@ fn the_dedup_fills_a_blank_album_from_the_row_it_folds() {
         },
         you_tube_id: Some("atvRelVid009".into()),
         origin: RowOrigin::Songs,
+        matched: false,
     };
 
     let deduped = dedupe_you_tube_songs(vec![blank, with_album]);
@@ -1153,6 +1155,151 @@ fn the_discovery_labels_are_not_radio_provider_names() {
             "'{label}' collides with a radio name"
         );
     }
+}
+
+/// A keyed Last.fm answering the production shape of a niche query (SOAK-1a): track.search is
+/// thin, so the artist's top tracks pad the catalog up to BUILD_SIZE pairs.
+async fn padding_last_fm() -> (Arc<LastFmService>, MockServer) {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(move |request: &Request| {
+            let body = if request.url.to_string().contains("method=track.search") {
+                let tracks: Vec<String> = (1..=5)
+                    .map(|i| format!(r#"{{"name":"Track {i}","artist":"Artist"}}"#))
+                    .collect();
+                format!(
+                    r#"{{"results":{{"trackmatches":{{"track":[{}]}}}}}}"#,
+                    tracks.join(",")
+                )
+            } else {
+                let fillers: Vec<String> = (1..=80)
+                    .map(|i| format!(r#"{{"name":"Filler {i}","artist":"Artist"}}"#))
+                    .collect();
+                format!(r#"{{"toptracks":{{"track":[{}]}}}}"#, fillers.join(","))
+            };
+            ResponseTemplate::new(200).set_body_string(body)
+        })
+        .mount(&server)
+        .await;
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+        last_fm: LastFmSettings {
+            api_key: "key".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    (
+        Arc::new(LastFmService::with_base_url(
+            settings,
+            &format!("{}/", server.uri()),
+        )),
+        server,
+    )
+}
+
+/// A keyed install's catalog fills the build on its own (SOAK-1a's production shape: "60
+/// placeholder songs ... from Last.fm"): a thin track.search padded with the artist's top
+/// tracks is BUILD_SIZE pairs, and every one of them mints. The YouTube half used to be
+/// appended BEHIND that catalog, and the BUILD_SIZE cut, taken after the append, dropped every
+/// YouTube row of it — both shim sources live, zero YouTube rows in the answer, key present
+/// (D4 broken on a keyed install). The query's own YouTube rows lead the answer now, so no
+/// catalog bulk can push them past the cut, and the catalog's placeholders fill the rest of
+/// the build behind them.
+#[tokio::test]
+async fn a_keyed_catalog_that_fills_the_build_alone_still_answers_the_you_tube_half() {
+    let (last_fm, _server) = padding_last_fm().await;
+    let shim = MockServer::start().await;
+    Mock::given(path("/ytm/search"))
+        .and(query_param("filter", "songs"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"tracks":[
+                {"videoId":"rwqD5PrajEA","title":"Lost in Sound","artists":["K3KHA"],"durationSeconds":619,"album":"Weightless Orbit"}
+            ]}"#,
+        ))
+        .mount(&shim)
+        .await;
+    Mock::given(path("/ytm/search"))
+        .and(query_param("filter", "videos"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(K3KHA_VIDEOS))
+        .mount(&shim)
+        .await;
+    let metadata = Arc::new(FakeMetadata::default());
+    {
+        let mut hits = metadata.hits.lock();
+        for i in 1..=5 {
+            hits.insert(
+                ("Artist".into(), format!("Track {i}")),
+                Song {
+                    artist: "Artist".into(),
+                    title: format!("Track {i}"),
+                    ..Default::default()
+                },
+            );
+        }
+        for i in 1..=80 {
+            hits.insert(
+                ("Artist".into(), format!("Filler {i}")),
+                Song {
+                    artist: "Artist".into(),
+                    title: format!("Filler {i}"),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    let search = ExternalSearchService::new(
+        metadata,
+        Some(last_fm),
+        waiting(false),
+        Arc::new(YouTubeMusicClient::with_shim_url(Some(&shim.uri()))),
+        Arc::new(YouTubeResolver::with_base_url(Some(&shim.uri()))),
+        Arc::new(ExternalIdRegistry::in_memory()),
+    );
+
+    let songs = search.get("K3KHA - Lost in Sound").await;
+
+    let labels = || {
+        songs
+            .iter()
+            .map(|s| s.suggested_by.clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+    // The build stays capped at BUILD_SIZE.
+    assert_eq!(songs.len(), BUILD_SIZE as usize, "{} labeled rows", songs.len());
+    // The query's own recording answers first, both of its rows (the Admiral's order: the
+    // upload the query means ahead of the release of the same recording), each with its
+    // service's label and its own length — placeholders pushed neither out nor ahead.
+    assert_eq!(
+        songs[0].suggested_by.as_deref(),
+        Some("YouTube Music (video)"),
+        "{}",
+        songs[0].title
+    );
+    assert_eq!(songs[0].duration, Some(619));
+    assert_eq!(
+        songs[1].suggested_by.as_deref(),
+        Some("YouTube Music (song)"),
+        "{}",
+        songs[1].title
+    );
+    assert_eq!(songs[1].album, "Weightless Orbit");
+    assert_eq!(songs[1].duration, Some(619));
+    // Both rows are registered with their own video, seed-stable (D6/D13).
+    for (row, video) in [&songs[0], &songs[1]].iter().zip(["vBvDiLKTDWA", "rwqD5PrajEA"]) {
+        let routing = search.id_registry.lookup(&row.id).expect("registered").snapshot();
+        assert_eq!(routing.you_tube_id.as_deref(), Some(video));
+        assert_eq!(ExternalIdRegistry::make_short_id(&routing), row.id);
+    }
+    // The catalog's placeholders fill the rest of the build behind the query's own rows.
+    assert!(
+        songs[2..].iter().all(|s| s.suggested_by.is_none()),
+        "the rows behind the query's own are the catalog's: {:?}",
+        labels()
+    );
+    assert_eq!(
+        songs.iter().filter(|s| s.suggested_by.is_none()).count(),
+        BUILD_SIZE as usize - 2
+    );
 }
 
 /// A query neither the catalogs nor YouTube Music answers with its own row falls back to

@@ -415,18 +415,35 @@ async fn build(
     let searched = started.elapsed();
 
     // The YouTube half (D2/D11/D3): rows registered with their video and its length at once,
-    // deduped version-aware. A catalog row the SONGS catalog's row covers is left out rather
-    // than minted: that row is the richer duplicate of the same recording (the video is pinned
-    // and the length is the video's own) and the songs catalog folds its own duplicates
-    // (Correction B). A video row or a YouTube hit covers nothing: a video and a song are two
-    // different rows that never merge, and so are YouTube Music and YouTube — the catalog row
-    // keeps its own place beside them.
-    let you_tube_songs = you_tube_songs(&query, &collected, &you_tube).await;
-    if !you_tube_songs.is_empty() {
-        collected.retain(|(artist, title)| you_tube_songs.iter().all(|row| !row.covers(artist, title)));
+    // deduped version-aware, in two blocks — the query's own rows and the rest. A catalog row
+    // the SONGS catalog's row covers is left out rather than minted: that row is the richer
+    // duplicate of the same recording (the video is pinned and the length is the video's
+    // own) and the songs catalog folds its own duplicates (Correction B). A video row or a
+    // YouTube hit covers nothing: a video and a song are two different rows that never merge,
+    // and so are YouTube Music and YouTube — the catalog row keeps its own place beside them.
+    let (querys_own_rows, rest_rows) = you_tube_songs(&query, &collected, &you_tube).await;
+    if !(querys_own_rows.is_empty() && rest_rows.is_empty()) {
+        collected.retain(|(artist, title)| {
+            querys_own_rows
+                .iter()
+                .chain(rest_rows.iter())
+                .all(|row| !row.covers(artist, title))
+        });
     }
 
-    let mut songs = Vec::with_capacity(collected.len() + you_tube_songs.len());
+    // The query's own YouTube rows LEAD the answer, the catalog's rows follow, and the
+    // unrelated YouTube rows close. The order is the fix for SOAK-1a: with a Last.fm key the
+    // catalog half fills BUILD_SIZE pairs on its own (a thin track.search padded with the
+    // artist's top tracks), and rows appended BEHIND the catalog were what the BUILD_SIZE cut
+    // dropped — a keyed production answered 60 catalog placeholders and no YouTube row at all,
+    // both shim sources live. Leading, the query's own rows (the answer the query is asking
+    // for, the upload first and the release beside it, W3) cannot be pushed past the cut by
+    // any catalog bulk; without a key the catalog half is empty and the order is the one it
+    // always was (D4).
+    let mut songs = Vec::with_capacity(querys_own_rows.len() + collected.len() + rest_rows.len());
+    for row in querys_own_rows {
+        songs.push(row.song);
+    }
     for (artist, title) in &collected {
         if let Some(hit) = metadata
             .search_songs_by_artist_title(artist, title, 1, None)
@@ -437,7 +454,9 @@ async fn build(
             songs.push(hit);
         }
     }
-    songs.extend(you_tube_songs.into_iter().map(|row| row.song));
+    for row in rest_rows {
+        songs.push(row.song);
+    }
     songs.truncate(BUILD_SIZE as usize);
     let placed = started.elapsed();
     info!("External search '{query}' -> {} placeholder songs", songs.len());
@@ -666,13 +685,20 @@ impl RowOrigin {
     }
 }
 
-/// A YouTube-origin row: the registered song, the video it was minted with, and the service
-/// it came from. The dedup's stages read the video and the origin; the song itself has no
-/// field for either (the source label rides `suggested_by`, which nothing stores).
+/// A YouTube-origin row: the registered song, the video it was minted with, the service
+/// it came from, and whether it is the query's own row (a row the query's words name, or
+/// the fallback's hit for a query nothing else answered — see [`you_tube_songs`]). The song
+/// itself has no field for any of that (the source label rides `suggested_by`, which nothing
+/// stores).
 struct YouTubeSong {
     song: Song,
     you_tube_id: Option<String>,
     origin: RowOrigin,
+    /// Whether the row is the query's own: such rows lead the answer, ahead of the catalogs'
+    /// rows, so the BUILD_SIZE cut — which the catalog half alone can fill on a keyed install
+    /// — cannot drop them (SOAK-1a). The dedup keeps the winner's flag: rows arrive with the
+    /// query's own first, so a fold always merges a later row into an earlier one.
+    matched: bool,
 }
 
 /// The YouTube half of a search: YouTube Music's `songs` and `videos` filters asked at once,
@@ -685,11 +711,16 @@ struct YouTubeSong {
 /// version-aware dedup folds only what it may: the same upload, and the songs catalog's own
 /// duplicates. A shim that cannot answer — 502 `ytm_failed`, 503 busy, unreachable — leaves no
 /// rows: the search still answers from its other sources (degradation, not panic).
+///
+/// The rows come back as the query's own and the rest: the query's own lead the answer, ahead
+/// of the catalogs' rows, so no catalog bulk can push them past the BUILD_SIZE cut (SOAK-1a:
+/// a keyed install's catalog fills the cut on its own, and rows appended behind it answered
+/// nothing).
 async fn you_tube_songs(
     query: &str,
     catalog: &[(String, String)],
     sources: &YouTubeSources,
-) -> Vec<YouTubeSong> {
+) -> (Vec<YouTubeSong>, Vec<YouTubeSong>) {
     // Both filters at once (D2): the songs catalog answers releases, the videos one uploads,
     // and the song asked for can sit in either (measured: K3KHA - Lost in Sound is only in
     // videos). A filter the shim could not answer is no rows from it, never a failure.
@@ -709,9 +740,13 @@ async fn you_tube_songs(
             .iter()
             .any(|(artist, title)| pair_matches_query(query, artist, title));
     let fallback = fallback_rows(query, matched, sources).await;
+    // The query's own rows are the exact rows and, when they ran, the fallback's: the rows
+    // before `rest` begins.
+    let querys_own = exact.len() + fallback.len();
     let rows = exact.into_iter().chain(fallback).chain(rest);
     let registered = rows
-        .map(|(row, origin)| {
+        .enumerate()
+        .map(|(index, (row, origin))| {
             let (song, routing) = song_and_routing(&row);
             let you_tube_id = routing.you_tube_id.clone();
             let mut song = register_you_tube_row(&sources.registry, (song, routing));
@@ -720,10 +755,13 @@ async fn you_tube_songs(
                 song,
                 you_tube_id,
                 origin,
+                matched: index < querys_own,
             }
         })
         .collect();
     dedupe_you_tube_songs(registered)
+        .into_iter()
+        .partition(|row| row.matched)
 }
 
 /// The fallback's rows (D11): plain YouTube's own hits for a query neither the catalogs nor
