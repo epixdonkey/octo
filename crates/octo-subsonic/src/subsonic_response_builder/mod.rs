@@ -894,6 +894,23 @@ impl SubsonicResponseBuilder {
         let track = song.track.unwrap_or(1);
         let bit_depth = 16;
 
+        // The row's origin as a genre badge: only an outside row a discovery service suggested
+        // gets one, and both genre fields carry it — `genre` for the string-reading clients,
+        // `genres` for the OpenSubsonic ones (Feishin's Genre column) that read badges from the
+        // list. A library row, a radio row, and an unlabeled outside row keep what they had.
+        let source_genre = if song.is_local {
+            None
+        } else {
+            song.suggested_by
+                .as_deref()
+                .filter(|by| !by.is_empty())
+                .and_then(source_genre_for)
+        };
+        let (genre, genres) = match source_genre {
+            Some(source) => genres_with_source(song.genre.as_deref(), source),
+            None => (song.genre.clone().unwrap_or_default(), Vec::new()),
+        };
+
         let mut fields = Fields::new();
         fields.insert("id".into(), song.id.clone().into());
         fields.insert("parent".into(), album_id.clone().into());
@@ -902,7 +919,7 @@ impl SubsonicResponseBuilder {
         fields.insert("album".into(), album_name.into());
         fields.insert("artist".into(), song.artist.clone().into());
         fields.insert("track".into(), track.into());
-        fields.insert("genre".into(), song.genre.clone().unwrap_or_default().into());
+        fields.insert("genre".into(), genre.into());
         fields.insert("coverArt".into(), song.id.clone().into());
         fields.insert("size".into(), est_size.into());
         fields.insert("contentType".into(), content_type.into());
@@ -936,7 +953,9 @@ impl SubsonicResponseBuilder {
         // OpenSubsonic's isrc is a list. An album track Deezer described carries its code,
         // and a library song keeps the ones Navidrome gave it.
         fields.insert("isrc".into(), song.isrcs_for_clients().into());
-        fields.insert("genres".into(), Value::Array(Vec::new()));
+        // The row's own genres plus its source badge (option A), or the empty list OpenSubsonic
+        // asks for when there is nothing to show.
+        fields.insert("genres".into(), Value::Array(genres));
         fields.insert("moods".into(), Value::Array(Vec::new()));
         fields.insert("replayGain".into(), Value::Object(Fields::new()));
         fields.insert("sortName".into(), to_lower_invariant(&song.title).into());
@@ -1150,6 +1169,38 @@ fn build_artist_fields(artist: &Artist) -> Fields {
 /// A song's length for a list's total: an unknown length counts as nothing.
 fn known_seconds(duration: Option<i32>) -> i32 {
     duration.unwrap_or(0).max(0)
+}
+
+/// The genre an outside row's `octoSuggestedBy` label doubles as (option A: the source as a
+/// genre badge). A discovery row comes by one of three services — a YouTube Music song, a
+/// YouTube Music video, or plain YouTube — and a badge a client shows without knowing
+/// `octoSuggestedBy` is a genre, the one field every Subsonic client renders (Feishin's Genre
+/// column among them). Only those three labels map; a radio answer's `suggested_by` ("Last.fm",
+/// "YouTube Music" with no paren, "Your library"...) is the radio's own source, not a discovery
+/// origin, and does not become a genre.
+pub fn source_genre_for(suggested_by: &str) -> Option<&'static str> {
+    match suggested_by {
+        "YouTube Music (song)" => Some("YouTube Music"),
+        "YouTube Music (video)" => Some("YouTube Video"),
+        "YouTube" => Some("YouTube"),
+        _ => None,
+    }
+}
+
+/// The `genre` string and `genres` list of a row whose source shows as a genre badge: the row's
+/// own genres (from enrichment or a playlist snapshot) keep their place and order, and the
+/// source is appended after them — left out when the row already carries it, so the badge is
+/// never there twice. `existing` is the row's own genre as stored (blank = none).
+pub fn genres_with_source(existing: Option<&str>, source: &str) -> (String, Vec<Value>) {
+    let owned = existing.map(str::trim).unwrap_or_default();
+    if owned.is_empty() {
+        return (source.to_string(), vec![json!({ "name": source })]);
+    }
+    if owned == source {
+        return (owned.to_string(), vec![json!({ "name": owned })]);
+    }
+    let genres = vec![json!({ "name": owned }), json!({ "name": source })];
+    (format!("{owned}; {source}"), genres)
 }
 
 /// The `subsonic-response` root in the Subsonic namespace, with its status and version.
