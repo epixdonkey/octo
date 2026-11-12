@@ -747,8 +747,12 @@ async fn you_tube_songs(
     let registered = rows
         .enumerate()
         .map(|(index, (row, origin))| {
-            let (song, routing) = song_and_routing(&row);
+            let (song, mut routing) = song_and_routing(&row);
             let you_tube_id = routing.you_tube_id.clone();
+            // The origin rides the routing as its own label, so it outlives the answer: a
+            // playlist position added from the row keeps its source from here (the song's
+            // `suggested_by` is never stored).
+            routing.suggested_by = Some(origin.label().to_string());
             let mut song = register_you_tube_row(&sources.registry, (song, routing));
             song.suggested_by = Some(origin.label().to_string());
             YouTubeSong {

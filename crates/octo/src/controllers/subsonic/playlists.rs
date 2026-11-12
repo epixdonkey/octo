@@ -1362,12 +1362,12 @@ async fn served_entries(
                             return Err(());
                         }
                         match outside {
-                            Some(outside) => outside_song_json(state, &outside).await,
+                            Some(outside) => outside_song_json(state, &outside, None).await,
                             None => None,
                         }
                     }
                 },
-                Serve::Outside(outside) => outside_song_json(state, &outside).await,
+                Serve::Outside(outside) => outside_song_json(state, &outside, None).await,
             };
             Ok(song.map(|song| (stored, song)))
         })
@@ -1489,19 +1489,37 @@ async fn library_song_json(call: &SubsonicCall, id: &str) -> Option<Value> {
     }
 }
 
-/// An outside song in the shape every outside song has.
-pub(crate) async fn outside_song_json(state: &AppState, id: &str) -> Option<Value> {
+/// An outside song in the shape every outside song has. `source` is the discovery label the
+/// row badges its genre by when the song itself carries none: the position's own kept label
+/// first (a playlist position's durable record — `Song.suggested_by` is never stored), else
+/// the registry routing's, which badges an outside row the registry still knows the origin of
+/// (a family playlist's row, a position added before it kept one). The badge itself is the
+/// serializer's one rule (`convert_song_fields`), applied exactly as a search answer applies
+/// it.
+pub(crate) async fn outside_song_json(state: &AppState, id: &str, source: Option<&str>) -> Option<Value> {
     let (external, provider, external_id) = state.local_library.parse_song_id(id);
     if !external {
         return None;
     }
-    let song = state
+    let mut song = state
         .metadata_service
         .get_song(
             provider.as_deref().unwrap_or_default(),
             external_id.as_deref().unwrap_or_default(),
         )
         .await?;
+    if song.suggested_by.is_none() {
+        song.suggested_by = source
+            .filter(|by| !by.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                state
+                    .external_id_registry
+                    .lookup(external_id.as_deref().unwrap_or_default())
+                    .map(|shared| shared.snapshot())
+                    .and_then(|routing| routing.suggested_by)
+            });
+    }
     Some(Value::Object(
         state.subsonic_response_builder.convert_song_to_json(&song),
     ))

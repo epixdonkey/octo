@@ -38,6 +38,11 @@ pub struct PersonalPlaylistEntry {
     pub outside_id: Option<String>,
     /// The pinned video, kept beside the snapshot because `Song` has no field of its own.
     pub you_tube_id: Option<String>,
+    /// The discovery service the position came by, as its own label ("YouTube Music (video)") —
+    /// kept at add time, because `Song.suggested_by` is never stored and the registry's routing
+    /// can be evicted. What the position's rows badge their genre by (option A).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// The whole song as it was found: artist, title, album, duration, ISRC, MusicBrainz id.
     pub song_snapshot: Option<Song>,
     /// The routing that minted `outside_id`, byte-for-byte, so the registry's `lookup` guard

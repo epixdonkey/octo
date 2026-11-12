@@ -79,6 +79,14 @@ pub struct SoulseekRouting {
     /// existed (stars, playlists, pins) stays the same.
     pub version: Option<String>,
 
+    /// Which discovery service suggested the row this routing names, as its own label
+    /// ("YouTube Music (song)", "YouTube Music (video)", "YouTube") — the label the row's
+    /// `octoSuggestedBy` and its genre badge read. Written when a YouTube-origin row is
+    /// registered, so a playlist position added from the row can keep its source; display
+    /// only, not part of the id (like [`SoulseekRouting::explicit_content`]), so ids minted
+    /// before it existed keep their shape.
+    pub suggested_by: Option<String>,
+
     /// The exact byte count of the pinned video's audio stream, once an answer named it. It
     /// belongs to [`SoulseekRouting::you_tube_id`]: pinning another video clears it. Not part of
     /// the id.
@@ -298,8 +306,10 @@ impl Serialize for SoulseekRouting {
         .filter(|known| *known)
         .count();
         let from_file = self.shown_duration_source == LengthSource::File;
-        let mut s =
-            serializer.serialize_struct("SoulseekRouting", 18 + stream_fields + usize::from(from_file))?;
+        let mut s = serializer.serialize_struct(
+            "SoulseekRouting",
+            18 + stream_fields + usize::from(from_file) + usize::from(self.suggested_by.is_some()),
+        )?;
         s.serialize_field("Kind", &self.kind)?;
         s.serialize_field("YouTubeId", &self.you_tube_id)?;
         s.serialize_field("Artist", &self.artist)?;
@@ -320,6 +330,9 @@ impl Serialize for SoulseekRouting {
         }
         s.serialize_field("ExplicitContent", &self.explicit_content)?;
         s.serialize_field("Version", &self.version)?;
+        if let Some(by) = &self.suggested_by {
+            s.serialize_field("SuggestedBy", by)?;
+        }
         if let Some(size) = &self.stream_size {
             s.serialize_field("StreamSize", size)?;
         }
