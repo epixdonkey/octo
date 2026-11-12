@@ -28,8 +28,10 @@ key returns the official video (`vBvDiLKTDWA`, 619 s) first, the song release
 as a separate row.
 
 The stream resolver also got a fast extraction profile (one combined
-`--extractor-args`, skipping the webpage and configs it does not need), applied
-only when resolving a stream URL — searches are untouched.
+`--extractor-args`, skipping the configs, initial data and subtitles it does not
+need), applied only when resolving a stream URL — searches are untouched. The
+video page itself is always fetched: YouTube's bot check lives there, and
+skipping it gets the resolve rejected.
 
 ### 2. Mixed personal playlists, REST and native (`feat(playlists)`)
 
