@@ -249,11 +249,14 @@ def _run_with_client(args: list[str], label: str, bg: bool, timeout: int = 15) -
     return fallback or out
 
 
-# The fast profile's skip segments, for stream resolves only (D7): the webpage, its configs and
+# The fast profile's skip segments, for stream resolves only (D7): the watch page's configs and
 # initial data, translated subtitles and DASH formats are nothing a resolve needs, and skipping
-# them cuts the time to the URL. Kept in ONE --extractor-args together with the player client,
-# because a second --extractor-args on the command line would overwrite the client choice.
-_FAST_SKIP_ARGS = "player_skip=webpage,configs,initial_data;skip=translated_subs,dash"
+# them cuts the time to the URL. The watch page itself is deliberately NOT skipped: YouTube
+# requires it for the challenge/consent context, and player_skip=webpage made every resolve
+# hit the "confirm you're not a bot" wall (SOAK-1b) -- on datacenter and home IPs alike.
+# Kept in ONE --extractor-args together with the player client, because a second
+# --extractor-args on the command line would overwrite the client choice.
+_FAST_SKIP_ARGS = "player_skip=configs,initial_data;skip=translated_subs,dash"
 
 
 def _fast_args() -> list[str]:
@@ -919,8 +922,9 @@ def _resolve_url(video_id: str, bg: bool = False) -> Optional[str]:
         if cached:
             return cached
         # The same URL `-g` printed, plus the picked format's facts from the same run. On the
-        # fast profile (D7): the resolve needs neither the webpage nor translated subtitles, and
-        # its skips cut the time to the URL.
+        # fast profile (D7): the resolve needs neither the page's configs nor translated
+        # subtitles, and the skips cut the time to the URL. The watch page itself is still
+        # fetched -- YouTube demands it before handing out formats (SOAK-1b).
         out = _run_fast(
             [
                 "-f", _AUDIO_FORMAT,
