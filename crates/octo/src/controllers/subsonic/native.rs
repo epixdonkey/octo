@@ -415,34 +415,8 @@ async fn native_family_create(
         .into_iter()
         .chain(super::personal_playlists::native_track_ids(&body))
         .collect();
-    // Not caught: a relay failure is the global handler's. The probe is a GET of the
-    // collection's first page, asked for as the request's own bearer says it (a relay of the
-    // create itself would carry the POST, and POST this endpoint IS the create).
-    let mut probe_headers = HeaderMap::new();
-    for name in ["x-nd-authorization", "authorization"] {
-        if let (Ok(name), Some(value)) = (HeaderName::from_bytes(name.as_bytes()), request.headers.get(name))
-        {
-            probe_headers.insert(name, value.clone());
-        }
-    }
-    let mut probe_parameters = Parameters::new();
-    probe_parameters.insert("_start".into(), "0".into());
-    probe_parameters.insert("_end".into(), "1".into());
-    let probe = state.subsonic_proxy.with_request(Arc::new(IncomingRequest::new(
-        Method::GET,
-        probe_headers,
-        None,
-        Bytes::new(),
-    )));
-    let raw = probe.relay_raw("api/playlist", &probe_parameters).await?;
-    if !(200..300).contains(&raw.status) {
-        let mut response = file_reply(
-            &raw.body,
-            Some(raw.content_type.as_deref().unwrap_or("application/json")),
-            "json",
-        );
-        *response.status_mut() = StatusCode::from_u16(raw.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        return Ok(Some(response));
+    if let Some(refusal) = native_bearer_refusal(state, request).await? {
+        return Ok(Some(refusal));
     }
     let username = native_username(state, request.parameters, request.headers);
     let caller = native_family_caller(state, &username);
@@ -459,6 +433,46 @@ async fn native_family_create(
             Err(refused) => error_object(status_of_refusal(refused.code), &refused.message),
         },
     ))
+}
+
+/// Navidrome's refusal of a native create's bearer, when it has one: a one-playlist page
+/// asked for by a GET of the proxy's own making (a relay of the create itself would carry
+/// the POST, and POST this endpoint IS the create), passed through exactly as it came, so
+/// no word of the family rides on a sign-in that was not taken. `None` when Navidrome
+/// answered the page 2xx — the list branch's own rule, that a successful upstream read
+/// validates the token before Octo reveals per-user state. Not caught: a relay failure is
+/// the global handler's.
+async fn native_bearer_refusal(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+) -> Result<Option<Response>, AppError> {
+    let mut headers = HeaderMap::new();
+    for name in ["x-nd-authorization", "authorization"] {
+        if let (Ok(name), Some(value)) = (HeaderName::from_bytes(name.as_bytes()), request.headers.get(name))
+        {
+            headers.insert(name, value.clone());
+        }
+    }
+    let mut parameters = Parameters::new();
+    parameters.insert("_start".into(), "0".into());
+    parameters.insert("_end".into(), "1".into());
+    let probe = state.subsonic_proxy.with_request(Arc::new(IncomingRequest::new(
+        Method::GET,
+        headers,
+        None,
+        Bytes::new(),
+    )));
+    let raw = probe.relay_raw("api/playlist", &parameters).await?;
+    if (200..300).contains(&raw.status) {
+        return Ok(None);
+    }
+    let mut response = file_reply(
+        &raw.body,
+        Some(raw.content_type.as_deref().unwrap_or("application/json")),
+        "json",
+    );
+    *response.status_mut() = StatusCode::from_u16(raw.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    Ok(Some(response))
 }
 
 /// A refused create's native HTTP kin of its Subsonic code: 10 a name to type, 50 a caller
