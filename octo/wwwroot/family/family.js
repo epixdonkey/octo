@@ -1681,11 +1681,30 @@
       F.toast('Made ' + r.data.name);
       viewPlaylists(main);
     } }, name, el('button', { class: 'btn btn-primary', type: 'submit' }, F.icon('plus'), 'Make a playlist')) : null;
+    // The prefix that founds a family playlist from any app: managers save it, everyone
+    // reads it (the session carries it), so the field shows what the server holds.
+    var prefix = el('input', {
+      class: 'set-input', value: session.playlistPrefix || '', placeholder: '#family',
+      'aria-label': 'Playlist prefix', maxlength: '40', disabled: session.manager ? null : 'disabled'
+    });
+    var prefixForm = session.manager ? el('form', { class: 'set-inline fam-create', onsubmit: async function (e) {
+      e.preventDefault();
+      var r = await api('POST', '/playlist-prefix', { prefix: prefix.value });
+      if (!r.ok) return F.toast(F.errorOf(r), true);
+      session.playlistPrefix = r.data.playlistPrefix;
+      prefix.value = r.data.playlistPrefix;
+      F.toast(r.data.playlistPrefix
+        ? 'App playlists named ' + r.data.playlistPrefix + '… become family playlists'
+        : 'App playlists stay their own');
+    } }, prefix, el('button', { class: 'btn btn-primary', type: 'submit' }, F.icon('check'), 'Save')) : prefix;
     F.clear(main);
     F.append(main, [
       pageHeader('playlist', 'Family playlists', 'Playlists everyone in the family sees and can add to from any app.'),
       card(null, null, null, create,
-        reply.data.length ? list : empty('playlist', canEdit ? 'No family playlists yet. Name one above, then add songs to it from any app.' : 'No family playlists yet.'))
+        reply.data.length ? list : empty('playlist', canEdit ? 'No family playlists yet. Name one above, then add songs to it from any app.' : 'No family playlists yet.')),
+      card('Making one from an app',
+        'A playlist created in an app whose name starts with this prefix becomes a family playlist; e.g. #family Road trip \u2192 the family sees Road trip. Leave empty to turn off.',
+        null, prefixForm)
     ]);
   }
 

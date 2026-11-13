@@ -1,6 +1,7 @@
 //! What managers do on the Family page: members (add, change, pause, remove, new sign-in link,
 //! repair), the requests inbox, everyone's devices, family playlists, the load panel, the
-//! libraries members can see, the explicit marks card, and turning Family on.
+//! libraries members can see, the explicit marks card, the playlist prefix that turns an app's
+//! playlist into a family one, and turning Family on.
 
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
@@ -523,6 +524,81 @@ pub async fn enable(State(state): State<AppState>, web: Web, body: Bytes) -> Res
         Ok(report) => ok(&json!(report)),
         Err(e) => family_error(&e),
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PlaylistPrefixBody {
+    /// The prefix a playlist's name starts with; blank turns the capture off.
+    pub prefix: Option<String>,
+}
+
+/// `POST /api/family/playlist-prefix`: managers set the prefix that turns a playlist made in
+/// any Subsonic app into a family playlist. The prefix is kept exactly as written (a
+/// trailing space is a way to keep `#familyRoad` from matching `#family`); blank, or spaces
+/// only, turns the capture off.
+pub async fn set_playlist_prefix(State(state): State<AppState>, web: Web, body: Bytes) -> Response {
+    if let Err(res) = web.manager(&state).await {
+        return res;
+    }
+    let request: PlaylistPrefixBody = match body_as(&body) {
+        Ok(request) => request,
+        Err(res) => return res,
+    };
+    let Some(prefix) = request.prefix else {
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "Say the prefix, or empty to turn it off.",
+        );
+    };
+    match save_playlist_prefix(&state, &prefix) {
+        Ok(saved) => ok(&json!({ "playlistPrefix": saved })),
+        Err(res) => res,
+    }
+}
+
+/// Saves the playlist prefix as `Family:PlaylistPrefix` and answers the value Octo now holds.
+/// The setting outlives a restart, as `Family:Enabled` does; an environment value the file
+/// cannot override says so instead of pretending the page's choice stuck.
+fn save_playlist_prefix(state: &AppState, prefix: &str) -> Result<String, Response> {
+    let mut section = indexmap::IndexMap::new();
+    section.insert(
+        "PlaylistPrefix".to_string(),
+        octo_core::json::dom::Node::String(prefix.to_string()),
+    );
+    let mut patch = indexmap::IndexMap::new();
+    patch.insert("Family".to_string(), octo_core::json::dom::Node::Object(section));
+    if let Err(e) = state.settings_writer.merge(&patch, &[]) {
+        return Err(refusal(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Octo could not save the setting: {e}"),
+        ));
+    }
+    // A test store's snapshot is only what `set` gave it, so reloading it does nothing there.
+    if let Err(e) = state.settings.reload_now() {
+        tracing::warn!("FAMILY settings could not be read again: {e}");
+    }
+    let mut settings = (*state.settings.current()).clone();
+    if settings.family.playlist_prefix != prefix {
+        if let Some(held) = state
+            .settings
+            .raw("Family:PlaylistPrefix")
+            .filter(|held| !held.trim().is_empty() && held != prefix)
+        {
+            return Err(refusal(
+                StatusCode::CONFLICT,
+                &format!(
+                    "Family:PlaylistPrefix is set to \"{held}\" in Octo's environment \
+                     (PLAYLIST_PREFIX), which wins over the Family page. Change it there."
+                ),
+            ));
+        }
+        // A test store, or a value the file could not take back: hold the choice in memory so
+        // the page shows what it saved.
+        settings.family.playlist_prefix = prefix.to_string();
+        state.settings.set(settings);
+    }
+    Ok(prefix.to_string())
 }
 
 /// `GET /api/family/libraries`.

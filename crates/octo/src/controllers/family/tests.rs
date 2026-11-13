@@ -1944,6 +1944,58 @@ async fn playlists_are_listed_made_changed_and_deleted() {
 }
 
 #[tokio::test]
+async fn the_playlist_prefix_is_saved_by_managers_and_read_by_everyone() {
+    let f = fam().await;
+    // Off until a prefix is set: the session every member reads says blank.
+    let before = f.get("/api/family/session", Some(&f.alex())).await;
+    assert_eq!(before.json()["playlistPrefix"], "");
+    // A listener cannot set it.
+    let refused = f
+        .post(
+            "/api/family/playlist-prefix",
+            Some(&f.alex()),
+            json!({ "prefix": "#family" }),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert!(f.state.settings.current().family.playlist_prefix.is_empty());
+    // A manager saves it: the answer, the setting Octo holds, and the settings file (which it
+    // outlives a restart by) all carry it.
+    let saved = f
+        .post(
+            "/api/family/playlist-prefix",
+            Some(&f.sam()),
+            json!({ "prefix": "#family" }),
+        )
+        .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+    assert_eq!(saved.json(), json!({ "playlistPrefix": "#family" }));
+    assert_eq!(f.state.settings.current().family.playlist_prefix, "#family");
+    let file = serde_json::from_str::<Value>(
+        &std::fs::read_to_string(f._dir.path().join("settings.json")).expect("saved"),
+    )
+    .expect("JSON");
+    assert_eq!(file["Family"]["PlaylistPrefix"], "#family");
+    // Everyone reads it back through the session.
+    let session = f.get("/api/family/session", Some(&f.alex())).await;
+    assert_eq!(session.json()["playlistPrefix"], "#family");
+    // A blank prefix turns the capture off again, and the body must say the prefix.
+    let off = f
+        .post(
+            "/api/family/playlist-prefix",
+            Some(&f.sam()),
+            json!({ "prefix": "" }),
+        )
+        .await;
+    assert_eq!(off.json(), json!({ "playlistPrefix": "" }));
+    assert!(f.state.settings.current().family.playlist_prefix.is_empty());
+    let unsaid = f
+        .post("/api/family/playlist-prefix", Some(&f.sam()), json!({}))
+        .await;
+    assert_eq!(unsaid.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn load_is_for_managers() {
     let f = fam().await;
     let r = f.get("/api/family/load", Some(&f.owner_cookie())).await;
