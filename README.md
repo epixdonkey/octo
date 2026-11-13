@@ -25,7 +25,9 @@ Search any song and play it right away. Keep the ones you love as files on your 
 > YouTube streams side by side and survive a server restart, **streaming
 > favorites** for the owner when `DOWNLOAD_ON_STAR=false`, and **family
 > playlists you can found from any app** by naming a playlist with a
-> configurable prefix. Upstream's features and defaults are untouched.
+> configurable prefix — in Subsonic mode and in Navidrome's own mode alike,
+> though players are best connected as Subsonic. Upstream's features and
+> defaults are untouched.
 > Details: [CHANGELOG.md](CHANGELOG.md).
 
 ---
