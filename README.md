@@ -22,9 +22,11 @@ Search any song and play it right away. Keep the ones you love as files on your 
 > the outside search and playlists: **YouTube Music and YouTube search that
 > works without a Last.fm key** (a video and a song are separate, labeled
 > rows — never merged), **mixed personal playlists** that hold local files and
-> YouTube streams side by side and survive a server restart, and **streaming
-> favorites** for the owner when `DOWNLOAD_ON_STAR=false`. Upstream's features
-> and defaults are untouched. Details: [CHANGELOG.md](CHANGELOG.md).
+> YouTube streams side by side and survive a server restart, **streaming
+> favorites** for the owner when `DOWNLOAD_ON_STAR=false`, and **family
+> playlists you can found from any app** by naming a playlist with a
+> configurable prefix. Upstream's features and defaults are untouched.
+> Details: [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

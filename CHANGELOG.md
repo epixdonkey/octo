@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026.11.13 — Family playlists from any app
+
+### 4. A playlist named with a prefix becomes a family playlist (`feat(family)`)
+
+Any Subsonic app — Feishin, Symfonium, octo-player, whatever the family uses —
+can now found a family playlist: name it with the server's configured prefix
+(`#family Road trip`) and it becomes a family playlist everyone in the family
+sees (`Road trip`), the songs asked for at the making going in with their
+maker. The answer carries the playlist's `of…` id and owner "Family", so the
+app shows it among the family's at once and can keep changing it (renames and
+deletions already worked from apps).
+
+The prefix is a setting, not a hardcode: the Family page's playlists tab saves
+it (managers write, everyone reads) and it survives a restart, or
+docker-compose sets `PLAYLIST_PREFIX`. Blank — the default — leaves
+`createPlaylist` exactly as it was. Only a founding create is captured:
+renaming a plain playlist to the prefix never converts anything, and an
+account outside the family (or without playlist-editing rights) gets a clear
+error instead of a silently renamed playlist.
+
 ## 2026.11.11 — YouTube search, mixed personal playlists, streaming favorites
 
 This fork's first delivery, in three independent parts. Upstream:
