@@ -140,6 +140,7 @@ pub fn routes() -> RouteSet {
             "/api/family/playlists/{id}",
             put(change_playlist).delete(delete_playlist),
         )
+        .route("/api/family/playlist-prefix", post(set_playlist_prefix))
         .route("/api/family/load", get(load))
         .route("/api/family/enable", post(enable))
         .route("/api/family/libraries", get(libraries))
