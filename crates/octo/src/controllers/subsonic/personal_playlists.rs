@@ -1203,7 +1203,7 @@ async fn native_create(
 }
 
 /// The request's JSON body, when it carries one (POST/PUT/PATCH, `IncomingRequest::raw_body`).
-fn native_body(request: &NativeRequest<'_>) -> Option<Value> {
+pub(crate) fn native_body(request: &NativeRequest<'_>) -> Option<Value> {
     request
         .proxy
         .incoming()
@@ -1212,7 +1212,7 @@ fn native_body(request: &NativeRequest<'_>) -> Option<Value> {
 }
 
 /// The song ids a native body carried (`ids`).
-fn native_ids(body: &Option<Value>) -> Vec<String> {
+pub(crate) fn native_ids(body: &Option<Value>) -> Vec<String> {
     body.as_ref()
         .and_then(|body| body.get("ids"))
         .and_then(Value::as_array)
@@ -1226,7 +1226,7 @@ fn native_ids(body: &Option<Value>) -> Vec<String> {
 
 /// The song ids a native body's `tracks` rows carried — `mediaFileId` (what a native client
 /// sends on a create or a list replacement) or `id` — blanks left out.
-fn native_track_ids(body: &Option<Value>) -> Vec<String> {
+pub(crate) fn native_track_ids(body: &Option<Value>) -> Vec<String> {
     body.as_ref()
         .and_then(|body| body.get("tracks"))
         .and_then(Value::as_array)
