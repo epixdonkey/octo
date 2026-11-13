@@ -659,6 +659,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
                 ("FastPullFactor", n_num(family.fast_pull_factor)),
                 ("RadioStreamsPerPerson", n_num(family.radio_streams_per_person)),
                 ("ManageFromAway", Node::Bool(family.manage_from_away)),
+                ("PlaylistPrefix", n_str(&family.playlist_prefix)),
             ]),
         );
         // The family notices are listed with the Family section, for the same reason.
