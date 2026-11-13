@@ -2,6 +2,24 @@
 
 ## 2026.11.13 — Family playlists from any app
 
+### 5. The native (Navidrome) API carries the family playlists too (`feat(subsonic)`)
+
+Apps that connect in Navidrome's own mode (Feishin's "Navidrome" connection
+type) used to miss the family entirely: the playlist list showed no family
+rows, a `#family` create silently became a plain playlist, and opening a
+family playlist's `of…` id answered a radio-shaped 404. The two modes are now
+peers: the native list carries the family's playlists beside the caller's own
+(owner "Family", for the owner and members alone), a detail and a tracks read
+of an `of…` id answer in native shape with paging, and a create whose name
+starts with the prefix founds a family playlist through the same core the
+Subsonic `createPlaylist` does — songs carried in `ids` or `tracks` going in
+with their maker, and the same refusals (a name that is nothing but the
+prefix, an account outside the family) in native form. Changing a family
+playlist from the native API stays out on purpose; the answer now says where
+changes go (the panel, or a Subsonic-mode connection) instead of calling it a
+read-only station. Both modes work — but connect players as Subsonic when you
+can: it is the mode every feature of this fork reaches first.
+
 ### 4. A playlist named with a prefix becomes a family playlist (`feat(family)`)
 
 Any Subsonic app — Feishin, Symfonium, octo-player, whatever the family uses —
