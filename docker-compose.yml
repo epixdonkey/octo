@@ -381,6 +381,11 @@ services:
       # folder, so it needs no volume of its own and stays out of your library. Off until
       # you turn it on here or on the dashboard.
       Family__Enabled: ${FAMILY_ENABLED:-false}
+      # A playlist made in any Subsonic app whose name starts with this prefix becomes a
+      # family playlist the whole family sees (its name is the rest after the prefix; e.g.
+      # "#family Road trip" makes "Road trip"). Blank, the default, leaves createPlaylist
+      # alone; the Family page's playlists tab sets the same setting without a restart.
+      Family__PlaylistPrefix: ${PLAYLIST_PREFIX:-}
       # ----- Logging -----
       # The two lines for every request and those for every call Octo makes to another
       # service are left out (Warning), so the log holds Octo's own lines and costs less
