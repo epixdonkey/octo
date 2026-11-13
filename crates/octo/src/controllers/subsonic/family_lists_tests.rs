@@ -18,7 +18,7 @@ use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 use super::route_tests::{TestMetadata, query_value};
-use super::test_app::{Reply, send};
+use super::test_app::{Reply, received_paths, send};
 use crate::app::{AppState, TestServices};
 use crate::http::pipeline::{App, build_with};
 use crate::services::family::family_playlists::{
@@ -871,6 +871,141 @@ async fn kid_cannot_edit() {
     assert!(f.state.family_playlists.get(&id).is_none());
     let gone = f.json("alex", &format!("getPlaylist?id={id}")).await;
     assert_eq!(gone["error"]["code"], 70, "{gone}");
+}
+
+// ---- family playlists founded from an app (the playlist prefix) ----
+
+/// The fixture with the playlist prefix set: a create whose name starts with it becomes a
+/// family playlist.
+async fn prefixed(prefix: &str) -> Fixture {
+    fixture_with(true, |family| family.playlist_prefix = prefix.into()).await
+}
+
+#[tokio::test]
+async fn a_prefixed_create_makes_a_family_playlist_the_family_sees() {
+    let f = prefixed("#family").await;
+    let made = f
+        .json("alex", "createPlaylist?name=%23family%20Road%20trip")
+        .await;
+    assert_eq!(made["status"], "ok", "{made}");
+    let playlist = &made["playlist"];
+    let id = playlist["id"].as_str().expect("an id").to_string();
+    assert!(id.starts_with("of"), "{made}");
+    assert_eq!(playlist["name"], "Road trip", "{made}");
+    assert_eq!(playlist["owner"], "Family", "{made}");
+    assert_eq!(playlist["octoFamily"], true, "{made}");
+    assert_eq!(playlist["octoFamilyCreatedBy"], "alex", "{made}");
+    assert_eq!(playlist["songCount"], 0, "{made}");
+    // The maker is the caller, the store holds it, and nothing reached Navidrome.
+    let stored = f.state.family_playlists.get(&id).expect("there");
+    assert_eq!(stored.name, "Road trip");
+    assert_eq!(stored.created_by, "alex");
+    assert!(
+        !received_paths(&f._server)
+            .await
+            .iter()
+            .any(|p| p.contains("createPlaylist")),
+        "Navidrome never saw the create"
+    );
+    // Another member's playlist list carries it at once.
+    let sam = f.json("sam", "getPlaylists").await;
+    let listed = row(&sam, &id).unwrap_or_else(|| panic!("sam sees it: {sam}"));
+    assert_eq!(listed["owner"], "Family");
+}
+
+#[tokio::test]
+async fn a_prefixed_create_takes_the_songs_asked_for_at_the_making() {
+    let f = prefixed("#family").await;
+    let made = f
+        .json(
+            "alex",
+            &format!("createPlaylist?name=%23family%20Road%20trip&songId=s-clean&songId={OUTSIDE}"),
+        )
+        .await;
+    assert_eq!(made["status"], "ok", "{made}");
+    // The call's order is the playlist's order: the library song and the outside song alike.
+    assert_eq!(ids(&made["playlist"]["entry"]), ["s-clean", OUTSIDE], "{made}");
+    assert_eq!(made["playlist"]["songCount"], 2, "{made}");
+    let id = made["playlist"]["id"].as_str().expect("an id");
+    let served = f.json("sam", &format!("getPlaylist?id={id}")).await;
+    assert_eq!(
+        ids(&served["playlist"]["entry"]),
+        ["s-clean", OUTSIDE],
+        "{served}"
+    );
+}
+
+#[tokio::test]
+async fn a_prefixed_create_without_a_name_after_the_prefix_is_refused() {
+    let f = prefixed("#family").await;
+    for name in ["%23family", "%23family%20%20"] {
+        let answer = f.json("alex", &format!("createPlaylist?name={name}")).await;
+        assert_eq!(answer["status"], "failed", "{answer}");
+        assert_eq!(answer["error"]["code"], 10, "{answer}");
+        assert!(
+            answer["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("#family")),
+            "{answer}"
+        );
+    }
+    assert!(f.state.family_playlists.list().is_empty(), "nothing was made");
+}
+
+#[tokio::test]
+async fn a_prefixed_create_is_refused_outside_the_family_and_without_edit_rights() {
+    let f = prefixed("#family").await;
+    for user in ["guest", "kid"] {
+        let answer = f.json(user, "createPlaylist?name=%23family%20Mine").await;
+        assert_eq!(answer["status"], "failed", "{user}: {answer}");
+        assert_eq!(answer["error"]["code"], 50, "{user}: {answer}");
+    }
+    assert!(f.state.family_playlists.list().is_empty(), "nothing was made");
+}
+
+#[tokio::test]
+async fn a_create_without_the_prefix_or_with_the_prefix_unset_is_navidromes_own() {
+    // The prefix unset: nothing intercepts, whatever the name.
+    let f = fixture(true).await;
+    let answer = f
+        .json("alex", "createPlaylist?name=%23family%20Road%20trip")
+        .await;
+    assert_eq!(answer["status"], "ok", "{answer}");
+    assert!(
+        received_paths(&f._server)
+            .await
+            .iter()
+            .any(|p| p.contains("createPlaylist")),
+        "the create was relayed"
+    );
+    assert!(f.state.family_playlists.list().is_empty());
+    // The prefix set, but the name does not start with it.
+    let f = prefixed("#family").await;
+    let answer = f.json("alex", "createPlaylist?name=Road%20trip").await;
+    assert_eq!(answer["status"], "ok", "{answer}");
+    assert!(f.state.family_playlists.list().is_empty());
+}
+
+#[tokio::test]
+async fn only_a_founding_create_is_captured_never_an_edit() {
+    let f = prefixed("#family").await;
+    // A rename of a plain playlist to the prefixed name: Navidrome's own answer (error 70
+    // here), and no family playlist appears.
+    let renamed = f
+        .json("alex", "updatePlaylist?playlistId=p-own&name=%23family%20Renamed")
+        .await;
+    assert_eq!(renamed["error"]["code"], 70, "{renamed}");
+    assert!(f.state.family_playlists.list().is_empty());
+    // createPlaylist WITH a playlistId replaces an existing playlist's songs — an edit, not a
+    // birth — so it is relayed too.
+    let replaced = f
+        .json(
+            "alex",
+            "createPlaylist?playlistId=p-own&name=%23family%20Again&songId=s-clean",
+        )
+        .await;
+    assert_eq!(replaced["status"], "ok", "{replaced}");
+    assert!(f.state.family_playlists.list().is_empty());
 }
 
 #[tokio::test]
