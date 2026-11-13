@@ -1720,8 +1720,10 @@ async fn new_entry(state: &AppState, id: &str) -> Option<NewEntry> {
 /// with their maker, so any Subsonic app can found a shared playlist and no panel is needed.
 /// Only a founding create is captured — `createPlaylist` with a `playlistId` replaces an
 /// existing playlist's songs (an edit, not a birth) and `updatePlaylist` never founds one —
-/// and the caller must be family with playlists-editing rights, as any family change asks.
-/// `None` when the call is none of this: the caller's own create, untouched.
+/// and the caller is checked before any answer of Octo's own is made (the blank-name answer
+/// names the prefix, a server setting), then must be family with playlists-editing rights,
+/// as any family change asks. `None` when the call is none of this: the caller's own create,
+/// untouched.
 async fn prefixed_family_create(state: &AppState, call: &SubsonicCall) -> Option<Response> {
     let family = &state.settings.current().family;
     if !family.enabled {
@@ -1739,6 +1741,14 @@ async fn prefixed_family_create(state: &AppState, call: &SubsonicCall) -> Option
         .and_then(|name| name.strip_prefix(prefix))?
         .trim()
         .to_string();
+    // Who is asking, before anything is answered with Octo's own words: the same checked
+    // sign-in every family playlist change goes through. The blank-name answer below names
+    // the prefix, a server setting, so it is said to a checked caller alone (as family_mutate
+    // checks first: nothing is said in anyone's name until then).
+    let caller = match checked_caller(state, call).await {
+        Ok(caller) => caller,
+        Err(answer) => return Some(answer),
+    };
     if rest.is_empty() {
         return Some(family_error(
             state,
@@ -1747,11 +1757,6 @@ async fn prefixed_family_create(state: &AppState, call: &SubsonicCall) -> Option
             &format!("Type a name after {prefix} to make a family playlist."),
         ));
     }
-    // Who is asking: the same checked sign-in every family playlist change goes through.
-    let caller = match checked_caller(state, call).await {
-        Ok(caller) => caller,
-        Err(answer) => return Some(answer),
-    };
     let made = match family_playlists::create(&state.family_playlists, &caller, &rest, false, Utc::now()) {
         Ok(playlist) => playlist,
         Err(error) => return Some(playlist_error(state, call, error)),
