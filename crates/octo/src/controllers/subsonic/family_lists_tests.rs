@@ -952,6 +952,31 @@ async fn a_prefixed_create_without_a_name_after_the_prefix_is_refused() {
     assert!(f.state.family_playlists.list().is_empty(), "nothing was made");
 }
 
+/// The blank-name answer names the prefix, a server setting, so it is said to a checked
+/// caller alone: a create that names nobody is answered with the sign-in's own refusal, and
+/// the body never carries the prefix. A guess at the prefix confirms nothing.
+#[tokio::test]
+async fn a_prefixed_create_without_a_sign_in_never_names_the_prefix() {
+    let f = prefixed("#family").await;
+    let asked = send(
+        &f.app,
+        Method::GET,
+        "/rest/createPlaylist?name=%23family&f=json",
+        &[],
+        "",
+    )
+    .await;
+    let answer = asked.envelope();
+    assert_eq!(answer["status"], "failed", "{answer}");
+    assert_eq!(answer["error"]["code"], 70, "{answer}");
+    assert!(
+        !asked.text().contains("#family"),
+        "no word of the prefix before the sign-in is checked: {}",
+        asked.text()
+    );
+    assert!(f.state.family_playlists.list().is_empty(), "nothing was made");
+}
+
 #[tokio::test]
 async fn a_prefixed_create_is_refused_outside_the_family_and_without_edit_rights() {
     let f = prefixed("#family").await;
