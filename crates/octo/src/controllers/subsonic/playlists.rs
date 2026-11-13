@@ -1207,6 +1207,12 @@ async fn mutate(state: AppState, req: Request, id_key: &str, _fallback: &str, fa
     // The endpoint is the path's last segment, without `.view`.
     let path = call.path();
     let endpoint = path.split('/').next_back().unwrap_or("").replace(".view", "");
+    // A playlist named with the Family page's prefix, made in any Subsonic app: it becomes a
+    // family playlist here, before the personal playlists overlay or Navidrome could take
+    // the create.
+    if let Some(answer) = prefixed_family_create(&state, &call).await {
+        return answer;
+    }
     // The personal playlists overlay takes its own create/update/delete; a plain playlist is
     // none of its business until a client puts an outside id on it.
     if matches!(
@@ -1319,8 +1325,20 @@ async fn family_playlist(state: &AppState, call: &SubsonicCall, id: &str) -> Res
     let Some(playlist) = family_playlists::find(&state.family_playlists, caller, id) else {
         return playlist_error(state, call, PlaylistError::NotFound);
     };
+    family_playlist_answer(state, call, &playlist, caller).await
+}
 
-    let shown = family_playlists::shown_entries(&playlist, caller);
+/// One family playlist as `caller`'s answer: its row fields plus the songs the caller is
+/// served (see [`served_entries`]), counted and timed as `getPlaylist` does. Both the
+/// `getPlaylist` answer and a prefixed `createPlaylist`'s answer are this shape, so an app
+/// that just made a family playlist shows it at once, among the family's.
+async fn family_playlist_answer(
+    state: &AppState,
+    call: &SubsonicCall,
+    playlist: &FamilyPlaylist,
+    caller: &FamilyCaller,
+) -> Response {
+    let shown = family_playlists::shown_entries(playlist, caller);
     let entries: Vec<Value> = served_entries(state, call, shown, false)
         .await
         .unwrap_or_default()
@@ -1333,7 +1351,7 @@ async fn family_playlist(state: &AppState, call: &SubsonicCall, id: &str) -> Res
         .iter()
         .map(|song| song.get("duration").and_then(Value::as_i64).unwrap_or(0))
         .sum();
-    let fields = family_playlist_fields(&playlist, caller, entries.len(), seconds);
+    let fields = family_playlist_fields(playlist, caller, entries.len(), seconds);
     state
         .subsonic_response_builder
         .create_chart_playlist_response(&call.format, fields, &entries)
@@ -1695,6 +1713,83 @@ async fn new_entry(state: &AppState, id: &str) -> Option<NewEntry> {
         duration,
         explicit_status,
     })
+}
+
+/// `createPlaylist` whose playlist `name` starts with the Family page's playlist prefix: the
+/// playlist becomes a family playlist named the rest after the prefix, its `songId`s going in
+/// with their maker, so any Subsonic app can found a shared playlist and no panel is needed.
+/// Only a founding create is captured — `createPlaylist` with a `playlistId` replaces an
+/// existing playlist's songs (an edit, not a birth) and `updatePlaylist` never founds one —
+/// and the caller must be family with playlists-editing rights, as any family change asks.
+/// `None` when the call is none of this: the caller's own create, untouched.
+async fn prefixed_family_create(state: &AppState, call: &SubsonicCall) -> Option<Response> {
+    let family = &state.settings.current().family;
+    if !family.enabled {
+        return None;
+    }
+    let prefix = family.playlist_prefix_as_set()?;
+    let founding = playlist_change(call) == Some(PlaylistChange::Create)
+        && call.param("playlistId").is_none()
+        && call.param("id").is_none();
+    if !founding {
+        return None;
+    }
+    let rest = call
+        .param("name")
+        .and_then(|name| name.strip_prefix(prefix))?
+        .trim()
+        .to_string();
+    if rest.is_empty() {
+        return Some(family_error(
+            state,
+            call,
+            10,
+            &format!("Type a name after {prefix} to make a family playlist."),
+        ));
+    }
+    // Who is asking: the same checked sign-in every family playlist change goes through.
+    let caller = match checked_caller(state, call).await {
+        Ok(caller) => caller,
+        Err(answer) => return Some(answer),
+    };
+    let made = match family_playlists::create(&state.family_playlists, &caller, &rest, false, Utc::now()) {
+        Ok(playlist) => playlist,
+        Err(error) => return Some(playlist_error(state, call, error)),
+    };
+    // The songs asked for at the founding, in the order the call named them: a library song
+    // or an outside id alike, as any addition to a family playlist takes them.
+    let mut songs = Vec::new();
+    for song in call
+        .incoming
+        .parameter_values("songId")
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if let Some(entry) = new_entry(state, song).await {
+            songs.push(entry);
+        }
+    }
+    if !songs.is_empty() {
+        let requests = state.family_playlist_requests.get();
+        if let Err(error) = family_playlists::add(
+            &state.family_playlists,
+            requests.as_ref(),
+            &caller,
+            &made.id,
+            songs,
+            Utc::now(),
+        ) {
+            return Some(playlist_error(state, call, error));
+        }
+    }
+    info!(
+        "FAMILY {} made '{rest}' from a playlist named with {prefix}",
+        caller.user
+    );
+    let playlist = family_playlists::find(&state.family_playlists, &caller, &made.id).unwrap_or(made);
+    Some(family_playlist_answer(state, call, &playlist, &caller).await)
 }
 
 /// The outside id a library song was downloaded from: from Octo's record of downloaded songs,
