@@ -28,8 +28,11 @@ use super::action_helpers::{
 use super::playlists::to_node;
 use crate::app::AppState;
 use crate::http::error::AppError;
+use crate::services::family::FamilyCaller;
+use crate::services::family::FamilyPlaylist;
+use crate::services::family::family_playlists::{self, Serve};
 use crate::services::soulseek::SoulseekMetadataService;
-use crate::services::subsonic::{RawRelayResult, SubsonicProxyService};
+use crate::services::subsonic::{IncomingRequest, RawRelayResult, SubsonicProxyService};
 
 /// The request as the catch-all read it.
 pub struct NativeRequest<'a> {
@@ -205,11 +208,19 @@ async fn try_serve_native_radio(
         .unwrap_or("")
         .to_string();
     let reserved = is_octo_playlist_id(&id, state.settings.current().family.enabled);
+    let family_playlist = super::playlists::is_family_playlist_id(state, &id);
     let is_get = request.method == Method::GET;
     if reserved && !is_get {
+        // An existing family playlist is the family's shared list: its songs change from the
+        // panel or a Subsonic-mode connection, never here. Octo's generated playlists stay
+        // read-only stations, each with its own word.
         return Ok(Some(error_object(
             StatusCode::METHOD_NOT_ALLOWED,
-            "Octo's generated playlists are read-only",
+            if family_playlist {
+                "Family playlists are changed from the panel or a Subsonic-mode connection"
+            } else {
+                "Octo's generated playlists are read-only"
+            },
         )));
     }
     if !tail.is_empty() && !reserved {
@@ -217,8 +228,13 @@ async fn try_serve_native_radio(
     }
     // The collection's create (POST /api/playlist) is the personal playlists overlay's: a mixed
     // body would be refused whole by Navidrome. The overlay declines a purely local create,
-    // which the catch-all then relays as it came.
+    // which the catch-all then relays as it came. A name with the Family page's prefix founds
+    // a family playlist instead — taken here, before the overlay or the relay could make the
+    // create anyone else's.
     if tail.is_empty() && !is_get {
+        if let Some(answer) = native_family_create(state, request).await? {
+            return Ok(Some(answer));
+        }
         return Ok(None);
     }
 
@@ -246,6 +262,7 @@ async fn try_serve_native_radio(
     }
     let username = native_username(state, request.parameters, request.headers);
     let stations = playlist_stations(state, &username);
+    let family_caller = native_family_caller(state, &username);
     let unchanged = || {
         file_reply(
             &raw.body,
@@ -270,6 +287,16 @@ async fn try_serve_native_radio(
         if !writable_only {
             rows.extend(stations.iter().map(native_station));
         }
+        // The family playlists beside the stations, for the caller's family alone — the same
+        // visibility the REST getPlaylists answer serves (the owner and members; an account
+        // outside the family, or Family off, sees none). A family playlist is not a smart one,
+        // so the smart=false filter keeps it.
+        rows.extend(
+            super::playlists::native_family_rows(state, &family_caller)
+                .await
+                .iter()
+                .map(to_node),
+        );
         let total = rows.len();
         let start = page_number(request.parameters, "_start").unwrap_or(0).max(0);
         let end = page_number(request.parameters, "_end").unwrap_or(total as i32);
@@ -279,6 +306,22 @@ async fn try_serve_native_radio(
             page.to_json_string(false).into_bytes(),
             total,
         )));
+    }
+
+    // A family playlist's detail and tracks, decided before the station lookup: an `of` id is
+    // the family's own, not a radio station, and the lookup below would answer a radio-shaped
+    // 404 for it. The relayed page above already took the bearer, and the caller is the family
+    // member (or owner) the request named; anyone else is answered a plain not-found.
+    if family_playlist {
+        return Ok(Some(
+            match family_playlists::find(&state.family_playlists, &family_caller, &id) {
+                Some(playlist) if dotnet::to_lower_invariant(&tail).ends_with("/tracks") => {
+                    native_family_tracks(state, request, &playlist, &family_caller).await
+                }
+                Some(playlist) => native_family_detail(state, &playlist, &family_caller).await,
+                None => error_object(StatusCode::NOT_FOUND, "Playlist not found"),
+            },
+        ));
     }
 
     let Some(station) = stations.into_iter().find(|station| station.id == id) else {
@@ -315,6 +358,208 @@ async fn try_serve_native_radio(
         Some("application/json"),
         "json",
     )))
+}
+
+/// The family caller of a native request whose bearer Navidrome has taken (the relayed page
+/// above already checked it): the user the request named — a member with their abilities,
+/// anyone else as the owner or an account outside the family — or, when nobody was named,
+/// the owner. That last stand-in is the single-owner shape the personal playlists overlay
+/// already documents for native requests that name no one (its service account acts for the
+/// owner); the family keeps the same rule, so a native create that named nobody founds in
+/// the owner's name. An account outside the family sees no family playlists (`may_view` is
+/// false for it).
+fn native_family_caller(state: &AppState, username: &str) -> FamilyCaller {
+    if let Some(member) = state.family_store.member(username) {
+        return FamilyCaller::member(&member.username, member.preset, member.abilities());
+    }
+    let named = username.trim();
+    if named.is_empty() {
+        return FamilyCaller::unmanaged(&state.family_store.owner(), true);
+    }
+    FamilyCaller::unmanaged(named, state.family_store.is_owner(named))
+}
+
+/// `POST /api/playlist` whose body's `name` starts with the Family page's playlist prefix:
+/// the native twin of REST's prefixed create, through the very same core
+/// ([`super::playlists::found_family_playlist`]), so an app in Navidrome mode founds a family
+/// playlist exactly like a Subsonic one. The prefix match alone decides the routing (a name
+/// without it relays on, confirming nothing); who is asking is settled next, before any word
+/// of Octo's own: a one-playlist page relayed to Navidrome takes the bearer — the list
+/// branch's own rule, that a successful upstream read validates the token before Octo
+/// reveals per-user state — and a refusal Navidrome answered goes out exactly as it came, so
+/// no word of the family (least of all the prefix) rides on a sign-in that was not taken.
+/// `None` when the create is not the family's: the overlay or the faithful relay takes it,
+/// as today.
+async fn native_family_create(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+) -> Result<Option<Response>, AppError> {
+    let family = &state.settings.current().family;
+    if !family.enabled {
+        return Ok(None);
+    }
+    let Some(prefix) = family.playlist_prefix_as_set() else {
+        return Ok(None);
+    };
+    let body = super::personal_playlists::native_body(request);
+    let rest = body
+        .as_ref()
+        .and_then(|body| body.get("name"))
+        .and_then(Value::as_str)
+        .and_then(|name| name.strip_prefix(prefix))
+        .map(|rest| rest.trim().to_string());
+    let Some(rest) = rest else {
+        return Ok(None);
+    };
+    let songs: Vec<String> = super::personal_playlists::native_ids(&body)
+        .into_iter()
+        .chain(super::personal_playlists::native_track_ids(&body))
+        .collect();
+    // Not caught: a relay failure is the global handler's. The probe is a GET of the
+    // collection's first page, asked for as the request's own bearer says it (a relay of the
+    // create itself would carry the POST, and POST this endpoint IS the create).
+    let mut probe_headers = HeaderMap::new();
+    for name in ["x-nd-authorization", "authorization"] {
+        if let (Ok(name), Some(value)) = (HeaderName::from_bytes(name.as_bytes()), request.headers.get(name))
+        {
+            probe_headers.insert(name, value.clone());
+        }
+    }
+    let mut probe_parameters = Parameters::new();
+    probe_parameters.insert("_start".into(), "0".into());
+    probe_parameters.insert("_end".into(), "1".into());
+    let probe = state.subsonic_proxy.with_request(Arc::new(IncomingRequest::new(
+        Method::GET,
+        probe_headers,
+        None,
+        Bytes::new(),
+    )));
+    let raw = probe.relay_raw("api/playlist", &probe_parameters).await?;
+    if !(200..300).contains(&raw.status) {
+        let mut response = file_reply(
+            &raw.body,
+            Some(raw.content_type.as_deref().unwrap_or("application/json")),
+            "json",
+        );
+        *response.status_mut() = StatusCode::from_u16(raw.status).unwrap_or(StatusCode::BAD_GATEWAY);
+        return Ok(Some(response));
+    }
+    let username = native_username(state, request.parameters, request.headers);
+    let caller = native_family_caller(state, &username);
+    Ok(Some(
+        match super::playlists::found_family_playlist(state, &caller, &rest, &songs).await {
+            Ok(playlist) => {
+                let row = super::playlists::native_family_row_for(state, &playlist, &caller).await;
+                written_json(
+                    octo_core::json::to_string(&row).into_bytes(),
+                    HeaderMap::new(),
+                    "application/json",
+                )
+            }
+            Err(refused) => error_object(status_of_refusal(refused.code), &refused.message),
+        },
+    ))
+}
+
+/// A refused create's native HTTP kin of its Subsonic code: 10 a name to type, 50 a caller
+/// who may not, 70 a playlist that is not there.
+fn status_of_refusal(code: i32) -> StatusCode {
+    match code {
+        10 => StatusCode::BAD_REQUEST,
+        50 => StatusCode::FORBIDDEN,
+        70 => StatusCode::NOT_FOUND,
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// One family playlist's native detail: its native row, counted as this viewer is shown.
+async fn native_family_detail(
+    state: &AppState,
+    playlist: &FamilyPlaylist,
+    viewer: &FamilyCaller,
+) -> Response {
+    let row = super::playlists::native_family_row_for(state, playlist, viewer).await;
+    written_json(
+        octo_core::json::to_string(&row).into_bytes(),
+        HeaderMap::new(),
+        "application/json",
+    )
+}
+
+/// One family playlist's tracks in the native shape, paginated as the station tracks are:
+/// each entry what the REST answer serves this viewer (the `served_entries` recipe — the
+/// library song read as the caller over the request's own bearer, falling back to its
+/// outside version when Navidrome does not serve it, an outside id through the metadata
+/// core), the row in `native_song_object`'s shape. An entry neither read could serve is left
+/// out, as the REST answer leaves it.
+async fn native_family_tracks(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    playlist: &FamilyPlaylist,
+    viewer: &FamilyCaller,
+) -> Response {
+    let shown = super::playlists::native_family_songs(state, playlist, viewer).await;
+    let mut rows: Vec<Node> = Vec::new();
+    for entry in &shown {
+        let row = match &entry.serve {
+            Serve::Library { id, outside } => match native_library_song(request, id).await {
+                Some(row) => Some(row),
+                None => match outside {
+                    Some(outside) => outside_song_native(state, outside).await,
+                    None => None,
+                },
+            },
+            Serve::Outside(outside) => outside_song_native(state, outside).await,
+        };
+        if let Some(row) = row {
+            rows.push(to_node(&row));
+        }
+    }
+    let total = rows.len();
+    let start = page_number(request.parameters, "_start").unwrap_or(0).max(0);
+    let end = page_number(request.parameters, "_end").unwrap_or(total as i32);
+    let page = Node::Array(page(&rows, start, end));
+    file_with_total(page.to_json_string(false).into_bytes(), total)
+}
+
+/// A library song read as the caller, in Navidrome's own native shape: the request's bearer
+/// relayed to the song's own detail. `None` when Navidrome did not answer it for this caller,
+/// so the entry falls back to its outside version as the REST answer does.
+async fn native_library_song(request: &NativeRequest<'_>, id: &str) -> Option<Value> {
+    let raw = request
+        .proxy
+        .relay_raw(&format!("api/song/{id}"), &Parameters::new())
+        .await
+        .ok()?;
+    if !(200..300).contains(&raw.status) {
+        return None;
+    }
+    serde_json::from_slice(&raw.body).ok()
+}
+
+/// An outside song in the native row shape: the same read the REST answer's
+/// `outside_song_json` makes (the catalog's song, the origin label the registry kept when
+/// the song itself carries none), serialized by the native object builder instead.
+async fn outside_song_native(state: &AppState, id: &str) -> Option<Value> {
+    let (external, provider, external_id) = state.local_library.parse_song_id(id);
+    if !external {
+        return None;
+    }
+    let mut song = state
+        .metadata_service
+        .get_song(
+            provider.as_deref().unwrap_or_default(),
+            external_id.as_deref().unwrap_or_default(),
+        )
+        .await?;
+    if song.suggested_by.is_none() {
+        song.suggested_by = state
+            .external_id_registry
+            .lookup(external_id.as_deref().unwrap_or_default())
+            .map(|shared| shared.snapshot())
+            .and_then(|routing| routing.suggested_by);
+    }
+    Some(native_song_object(state, &song))
 }
 
 fn native_station(station: &LastFmRadioStation) -> Node {
@@ -986,3 +1231,7 @@ fn sanitize(text: &str) -> String {
 #[cfg(test)]
 #[path = "native_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "family_native_tests.rs"]
+mod family_native_tests;
