@@ -2,8 +2,8 @@
 //! `octo_core::fingerprint::verification`.
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,7 +11,9 @@ use octo_core::common::SongIdentity;
 use octo_core::common::dotnet;
 use octo_core::common::song_versions::strip_versions;
 use octo_core::common::version_gap::{self, Against};
+use octo_core::fingerprint::heart_gate::{GateVerdict, HeardSource, HeartGate, WaitingFor};
 use octo_core::fingerprint::recording_identity::{self, RecordingFacts, RecordingKind, Takes};
+use octo_core::fingerprint::verification::{AnswerReading, MIN_SOURCES_TO_CONFIRM};
 use octo_core::fingerprint::{
     AcoustIdLookup, AcoustIdRecording, AcoustIdResult, InconclusiveReason, TrackMatchComparer,
     VerificationResult, VerificationVerdict,
@@ -23,15 +25,90 @@ use octo_media::tags::{TagFile, tag_writer_extras};
 use tracing::{debug, info, warn};
 
 use super::acoust_id_client::AcoustIdClient;
-use super::acoust_id_rate_limiter::AcoustIdRateLimiter;
-use super::music_brainz_client::{MusicBrainzClient, MusicBrainzError};
+use super::acoust_id_rate_limiter::{AcoustIdRateLimiter, LookupClass};
+use super::catalog_clip::{CatalogClip, ClipPrints};
+use super::heard_master_check::HeardMasterCheck;
+use super::music_brainz_client::{CatalogQuestions, MusicBrainzClient, MusicBrainzError};
 use super::preview_check::{self, PreviewOutcome, PreviewRequest, PreviewSource};
+use crate::services::common::SoulseekHoldStore;
+use crate::services::prefetch::HeardSamples;
+use crate::services::prefetch::heard_samples::ResumeHold;
+use crate::services::soulseek::ExternalIdRegistry;
+use crate::services::soulseek::rejected_peer_registry::RejectedPeerRegistry;
 
 /// The ISRCs MusicBrainz listed per recording id, with ids compared ignoring case.
 pub type RecordingIsrcs = HashMap<String, Vec<String>>;
 
 /// What MusicBrainz says each recording is, by lowercased recording id.
 pub type FactsById = HashMap<String, RecordingFacts>;
+
+/// Where a candidate file's own labels are read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelSource {
+    /// The file itself, as its source delivered it.
+    TheFile,
+    /// Another file that holds the download as delivered (a Lidarr download at its dropped path).
+    Delivered(PathBuf),
+    /// The file has no usable labels (a Lidarr import with Write Metadata on).
+    None,
+}
+
+/// What a verify step knows of one candidate beyond its path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartCandidate {
+    pub labels: LabelSource,
+    /// The file's own identity when it is a copy of the kind heard audio is (a prefetch copy, a
+    /// whole copy of a video's stream).
+    pub identity: Option<HeardSource>,
+    /// The acquisition's key, which finds the open heard-master round.
+    pub acquisition_key: String,
+}
+
+/// One file judged for one gate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeartCheck {
+    pub verdict: GateVerdict,
+    /// The file's own reading against the gate's R, when AcoustID answered.
+    pub reading: Option<AnswerReading>,
+    /// The shipped reading of the same answer: the log's line, and what
+    /// `names_another_recording` reads for the YouTube loop.
+    pub verification: VerificationResult,
+}
+
+/// What building one heart's or play's gate came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateBuild {
+    /// Judge every file with this gate.
+    Ready(HeartGate),
+    /// The heart holds before any source runs (a busy answer, AcoustID off and the clip check
+    /// unsettled, a believed different song with nothing to try), with its downloads line.
+    /// `question` is the MusicBrainz question that did not answer, when that is what it waits for.
+    Hold {
+        gate: HeartGate,
+        waiting_for: WaitingFor,
+        line: String,
+        question: Option<String>,
+    },
+    /// The heart ends before any source runs, with its downloads line: it was never played, no
+    /// video can stand in for it, and the catalog names no recording, so nothing could ever prove
+    /// a copy.
+    End { gate: HeartGate, line: String },
+}
+
+/// What the heart gate reads besides AcoustID: the songs and what each person heard, the heard
+/// prints and the `fpcalc` queue, the heard-master runner, the catalog's clip, Deezer's side of
+/// a heart's questions, the holds (the prints a held heart keeps) and the refusals only hearts
+/// read.
+#[derive(Clone)]
+pub struct HeartParts {
+    pub registry: Arc<ExternalIdRegistry>,
+    pub samples: Arc<HeardSamples>,
+    pub master: Arc<HeardMasterCheck>,
+    pub clip: Arc<CatalogClip>,
+    pub catalog: Arc<dyn CatalogQuestions>,
+    pub holds: Arc<SoulseekHoldStore>,
+    pub rejected: Arc<RejectedPeerRegistry>,
+}
 
 /// Asks what a finished download actually contains, rather than what its name and advertised
 /// length claim.
@@ -46,6 +123,15 @@ pub struct DownloadVerificationService {
     settings: Arc<SettingsStore>,
     music_brainz: Option<Arc<MusicBrainzClient>>,
     spectrum: Option<Arc<SpectrumAnalyzer>>,
+    /// What the heart gate reads, once the app has built it.
+    heart: OnceLock<HeartParts>,
+    /// Resumes a hold by its key when what it waited for answers.
+    resume: parking_lot::Mutex<Option<ResumeHold>>,
+    /// Clip prints a gate took for a person, by song and person, until their hold keeps them.
+    clip_prints: parking_lot::Mutex<HashMap<(String, String), ClipPrints>>,
+    /// The MusicBrainz question a file's label check met busy, by song and person, until the hold
+    /// it left is filed and asks it again.
+    file_questions: parking_lot::Mutex<HashMap<(String, String), String>>,
 }
 
 impl DownloadVerificationService {
@@ -71,6 +157,10 @@ impl DownloadVerificationService {
             settings,
             music_brainz,
             spectrum,
+            heart: OnceLock::new(),
+            resume: parking_lot::Mutex::new(None),
+            clip_prints: parking_lot::Mutex::new(HashMap::new()),
+            file_questions: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -157,9 +247,9 @@ impl DownloadVerificationService {
         preview_check::check(source, &self.fingerprinter, Path::new(path), request, timeout).await
     }
 
-    /// AcoustID can answer at all.
+    /// AcoustID can answer at all: it is not `off`, and the user's key or Octo's own is usable.
     pub fn has_api_key(&self) -> bool {
-        !dotnet::is_blank(&self.settings.current().soulseek.acoust_id_api_key)
+        self.client.is_on()
     }
 
     /// The user asked Octo to police what peers deliver. Governs the deny-list on its own,
@@ -190,8 +280,31 @@ impl DownloadVerificationService {
         requested_isrc: Option<&str>,
         takes: &Takes,
     ) -> VerificationResult {
+        self.verify_labeled(
+            path,
+            &LabelSource::TheFile,
+            requested_artist,
+            requested_title,
+            requested_isrc,
+            takes,
+        )
+        .await
+    }
+
+    /// [`Self::verify`] for a file whose own labels are read from `labels`: a Lidarr file's tags
+    /// that Lidarr wrote from its own matching never confirm or refuse it.
+    pub async fn verify_labeled(
+        &self,
+        path: &str,
+        labels: &LabelSource,
+        requested_artist: Option<&str>,
+        requested_title: Option<&str>,
+        requested_isrc: Option<&str>,
+        takes: &Takes,
+    ) -> VerificationResult {
         self.verify_on(
             path,
+            labels,
             requested_artist,
             requested_title,
             requested_isrc,
@@ -210,13 +323,23 @@ impl DownloadVerificationService {
         requested_artist: Option<&str>,
         requested_title: Option<&str>,
     ) -> VerificationResult {
-        self.verify_on(path, requested_artist, requested_title, None, &Takes::Any, true)
-            .await
+        self.verify_on(
+            path,
+            &LabelSource::TheFile,
+            requested_artist,
+            requested_title,
+            None,
+            &Takes::Any,
+            true,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)] // verify's inputs, where the labels are, and the lane
     async fn verify_on(
         &self,
         path: &str,
+        labels: &LabelSource,
         requested_artist: Option<&str>,
         requested_title: Option<&str>,
         requested_isrc: Option<&str>,
@@ -227,13 +350,18 @@ impl DownloadVerificationService {
             return VerificationResult::inconclusive();
         }
 
+        // The file whose tags are the file's own labels, when it has any.
+        let tags = match labels {
+            LabelSource::TheFile => Some(path.to_string()),
+            LabelSource::Delivered(delivered) => Some(delivered.to_string_lossy().into_owned()),
+            LabelSource::None => None,
+        };
         // What the file's own tags say it is, when the request named an ISRC to hold them to.
         // A header read, and it needs no API key: with no key it is the only question asked.
         let isrc = requested_isrc.and_then(SongIdentity::normalize_isrc);
-        let tagged = if isrc.is_none() {
-            Vec::new()
-        } else {
-            Self::read_isrcs(path)
+        let tagged = match (&isrc, tags.as_deref()) {
+            (Some(_), Some(tags)) => Self::read_isrcs(tags),
+            _ => Vec::new(),
         };
         let tagged_match = isrc.as_ref().is_some_and(|isrc| tagged.contains(isrc));
 
@@ -253,13 +381,16 @@ impl DownloadVerificationService {
         };
 
         let verdict = Self::with_tagged_isrc(verdict, isrc.as_deref(), tagged_match);
-        let verdict =
-            if verdict.verdict == VerificationVerdict::Inconclusive && matches!(takes, Takes::Only(_)) {
-                self.with_tagged_recording(verdict, path, requested_title, background)
+        let verdict = match tags.as_deref() {
+            Some(tags)
+                if verdict.verdict == VerificationVerdict::Inconclusive
+                    && matches!(takes, Takes::Only(_)) =>
+            {
+                self.with_tagged_recording(verdict, tags, requested_title, background)
                     .await
-            } else {
-                verdict
-            };
+            }
+            _ => verdict,
+        };
         let (artist, title) = (requested_artist.unwrap_or(""), requested_title.unwrap_or(""));
         let isrc_text = isrc.as_deref().unwrap_or("");
         match (&verdict.verdict, &verdict.evidence) {
@@ -475,7 +606,7 @@ impl DownloadVerificationService {
     ) -> VerificationResult {
         let settings = self.settings.current().soulseek.clone();
         let fingerprint = self
-            .fingerprinter
+            .file_printer()
             .fingerprint(
                 Path::new(path),
                 settings.effective_fingerprint_seconds(),
@@ -510,10 +641,15 @@ impl DownloadVerificationService {
             return reason(InconclusiveReason::NotFingerprinted);
         }
 
+        // The key and the lane follow the class of the work that asked (bulk unless it says
+        // otherwise), so a shared key never lets an import ahead of a heart.
+        let Some(key) = self.client.key_for(AcoustIdRateLimiter::class_now()) else {
+            return reason(InconclusiveReason::LookupFailed);
+        };
         let Some(lookup) = self
             .client
             .lookup(
-                &settings.acoust_id_api_key,
+                &key,
                 &print,
                 seconds,
                 settings.effective_acoust_id_timeout_seconds(),
@@ -999,12 +1135,14 @@ impl DownloadVerificationService {
         VerificationResult {
             verdict: VerificationVerdict::Confirmed,
             reason: InconclusiveReason::None,
-            evidence: Some("the song's YouTube preview agrees".into()),
+            evidence: Some("the song's YouTube stream agrees".into()),
             ..verdict
         }
     }
 }
 
+/// The check a person starts with one click (the library editor's, the tag preview's): its lookup
+/// goes after hearts and plays, before family requests and bulk work.
 #[async_trait]
 impl FingerprintVerifier for DownloadVerificationService {
     fn is_fingerprinting_enabled(&self) -> bool {
@@ -1012,7 +1150,11 @@ impl FingerprintVerifier for DownloadVerificationService {
     }
 
     async fn verify(&self, path: &str, artist: &str, title: &str) -> VerificationResult {
-        DownloadVerificationService::verify(self, path, Some(artist), Some(title), None, &Takes::Any).await
+        AcoustIdRateLimiter::with_class(
+            LookupClass::Person,
+            DownloadVerificationService::verify(self, path, Some(artist), Some(title), None, &Takes::Any),
+        )
+        .await
     }
 }
 
@@ -1383,10 +1525,6 @@ fn confirm(
     }
 }
 
-/// A link that this many submissions or more stand behind confirms a file on its own; fewer is one
-/// person's word, which the song's YouTube preview has to back.
-const MIN_SOURCES_TO_CONFIRM: i32 = 2;
-
 /// How many submissions tie the fingerprint to these recordings, together.
 fn submissions<'a>(recordings: impl IntoIterator<Item = &'a AcoustIdRecording>) -> i32 {
     recordings
@@ -1495,6 +1633,15 @@ fn get_extension(path: &str) -> &str {
         _ => "",
     }
 }
+
+#[path = "download_verification_heart.rs"]
+mod heart;
+
+pub use heart::{
+    ANOTHER_SONG_OR_TAKE, ANOTHER_SONG_PLAYED, HEARD_LOOKUP_BUSY, NEVER_PLAYED, SOUND_NOT_READ, YOUTUBE_PEER,
+    became_with_duplicates,
+};
+pub(crate) use heart::{pick_contexts, song_in};
 
 #[cfg(test)]
 #[path = "download_verification_service_tests.rs"]

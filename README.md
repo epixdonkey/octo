@@ -44,7 +44,7 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 
 ## What you get
 
-- **Search everything.** Your own music comes first, then the songs and albums you don't have yet. Any of it plays straight away, previewed from YouTube.
+- **Search everything.** Your own music comes first, then the songs and albums you don't have yet. Any of it plays straight away, streamed from YouTube.
 - **Radio that learns.** Your Radio, discovery, artist and genre stations grow from what you play, plus optional genre and decade mixes from your own library.
 - **Keep what you love.** Press **+** or heart a song and Octo downloads the best copy it can find from Soulseek or your own Lidarr, FLAC first, catches a "lossless" file that was made from an MP3, tags it, adds the cover and lyrics, and files it in your library. Whole albums work too.
 - **Bring your music.** Import your liked songs and playlists from Spotify or any other service, see what you already have, and let Octo fetch the rest a few songs an hour. See [Importing your music](#importing-your-music).
@@ -82,12 +82,12 @@ When it finishes:
 ```text
    Music apps             Octo                Navidrome
  (Octo, Feishin, ...) ─▶  :5274  ───────────▶  your library
-                            ├─▶ yt-dlp shim    instant previews
+                            ├─▶ yt-dlp shim    instant streams
                             ├─▶ slskd          downloads
                             └─▶ your Lidarr    optional download source
 ```
 
-Your apps talk to Octo. Octo adds search, radio and previews, and passes everything else to Navidrome, so any Subsonic app works unchanged. Downloads land in the music folder Navidrome reads, and Octo asks it to rescan.
+Your apps talk to Octo. Octo adds search, radio and the songs you don't have, streamed from YouTube, and passes everything else to Navidrome, so any Subsonic app works unchanged. Downloads land in the music folder Navidrome reads, and Octo asks it to rescan.
 
 On the starter stack Navidrome runs from the same `docker-compose.yml`, turned on by `COMPOSE_PROFILES=navidrome` in `.env`. To set it up by hand instead of with the installer, copy `.env.example` to `.env`, fill in its starter stack section, and run `docker compose up -d`.
 
@@ -145,7 +145,7 @@ The desktop app runs on Windows and Linux, and the Android app on Android 10 and
 never reaches Octo. What does reach Octo is the copy itself: Symfonium pages through the whole
 library with an empty `search3` query. Octo continues that walk past your last song with
 your radio stations' tracks that you don't own yet, so they land on the phone as ordinary
-songs. There they search, browse and play as previews like anything else, the station
+songs. There they search, browse and play straight from YouTube like anything else, the station
 playlists find their tracks, and hearting one downloads it exactly as it does from any
 other app. What you can't do is search for any song at all: search on the phone only finds
 what the stations have suggested.
@@ -153,8 +153,9 @@ what the stations have suggested.
 - Run a full sync in Symfonium to pick up new suggestions. Stations are drawn again every
   `LASTFM_REFRESH_INTERVAL_HOURS` (12 by default), and Octo rebuilds the list when they change,
   or an hour after its last build.
-- A song you heart shows up twice for a while: the preview, and the downloaded copy once
-  Navidrome has scanned it. The next sync after the list is rebuilt drops the preview.
+- A song you heart shows up twice for a while: the song as it streams from YouTube, and the
+  downloaded copy once Navidrome has scanned it. The next sync after the list is rebuilt drops
+  the streamed one.
 - Controlled under **Behavior → Discovery for offline-search apps** in the admin dashboard
   (`ENABLE_SYNC_CATALOG`, `SYNC_CATALOG_CLIENTS`, `SYNC_CATALOG_MAX_SONGS`). Only apps listed
   there get the extra tracks, so apps that search the server keep a clean library view.
@@ -205,7 +206,7 @@ scripts/updater/install-updater.sh --remove
 Without the helper, **About** shows the command for the new release. From the Octo folder:
 
 ```bash
-git fetch --tags && git checkout --detach 2026.10.28
+git fetch --tags && git checkout --detach 2026.11.13
 docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source
 docker compose up -d
 ```
@@ -322,10 +323,10 @@ tell you a starred track landed, or quietly settled for a lossy copy.
 - **Two transports, either works alone**: [ntfy](https://ntfy.sh/) (paste a topic URL,
   subscribe to the same topic in the ntfy app) and Discord webhooks (rich embed with
   album art). A transport is on when its URL is set.
-- **Five events, each with its own toggle** in the dashboard's Notifications tab:
+- **Six events, each with its own toggle** in the dashboard's Notifications tab:
   download started (did it find lossless, or is it settling?), download completed,
-  lossless fallback, download failed, and one summary per album instead of a ping per
-  track.
+  lossless fallback, download failed, one summary per album instead of a ping per
+  track, and Mornye could not pass its check (with a link to pass it on the dashboard).
 - A **Send test** button verifies your URLs and tokens without waiting for a real
   download, and reports each transport's outcome separately.
 
@@ -343,15 +344,15 @@ No. Octo speaks the Subsonic API, not the Plex API. If you're a Plex user lookin
 
 ### How is this different from Navidrome's built-in radio?
 
-Navidrome's radio plays songs from your existing library. Octo's radio reaches *outside* your library: Last.fm finds similar tracks, YouTube provides the preview, and Soulseek provides the keep-it-forever path. Navidrome alone gives you a great library player; Octo turns that library into a launchpad for discovery.
+Navidrome's radio plays songs from your existing library. Octo's radio reaches *outside* your library: Last.fm finds similar tracks, YouTube streams them, and Soulseek provides the keep-it-forever path. Navidrome alone gives you a great library player; Octo turns that library into a launchpad for discovery.
 
 ### Is my data going anywhere?
 
-Octo's per-user play ledger and station snapshots stay in `/app/config/lastfm-radio-state.json`. It sends Last.fm only the artist, title, and tag lookups needed to build recommendations; it does not send the ledger, Navidrome credentials, usernames, or stream URLs. Continuous Radio URLs contain opaque, expiring in-memory session tokens rather than Navidrome credentials. Every 6 hours Octo asks GitHub for its own release list, sending nothing but its version in the request's user agent; `UPDATES_CHECK=false` stops it. YouTube and Soulseek receive the ordinary outbound lookups needed for preview/acquisition. Once a listener connects Last.fm on the dashboard, Octo also sends that listener's plays (outside songs, and library songs unless left to Navidrome; artist, title, album and time) to their own Last.fm account, and with a ListenBrainz token set it sends the same plays to ListenBrainz.
+Octo's per-user play ledger and station snapshots stay in `/app/config/lastfm-radio-state.json`. It sends Last.fm only the artist, title, and tag lookups needed to build recommendations; it does not send the ledger, Navidrome credentials, usernames, or stream URLs. Continuous Radio URLs contain opaque, expiring in-memory session tokens rather than Navidrome credentials. Every 6 hours Octo asks GitHub for its own release list, sending nothing but its version in the request's user agent; `UPDATES_CHECK=false` stops it. YouTube and Soulseek receive the ordinary outbound lookups needed for streaming and downloads. Once a listener connects Last.fm on the dashboard, Octo also sends that listener's plays (outside songs, and library songs unless left to Navidrome; artist, title, album and time) to their own Last.fm account, and with a ListenBrainz token set it sends the same plays to ListenBrainz.
 
 ### Do downloaded songs get tagged correctly?
 
-Yes. Every download is identified before it is filed: the fingerprint service's answer, the music database and Deezer each offer the releases the song could be from, and every one is weighed against what was asked for and what the file is. A sure match tags the file with the full release set (album, original date, label, catalogue number, barcode, release type and status, the recording and release ids), measures its loudness for ReplayGain, and gives it the largest cover the cover chain can find. A doubtful match keeps the name that was asked for, fills only what is missing, and goes to the Review playlist as before. The Fetched songs page shows, under each row, which release won, by how much, and where each field came from. Octo then organizes the file per your `FolderStructure` setting (`Flat`, `ByArtist` or `Organized`) and triggers a Navidrome rescan, so it appears in your library exactly like everything else you own. The details are under [Tags, covers and lyrics](#tags-covers-and-lyrics).
+Yes. Every download is identified before it is filed: the fingerprint service's answer, the music database and Deezer each offer the releases the song could be from, and every one is weighed against what was asked for and what the file is. A sure match tags the file with the full release set (album, original date, label, catalogue number, barcode, release type and status, the recording and release ids), measures its loudness for ReplayGain, and gives it the largest cover the cover chain can find. A doubtful match keeps the name that was asked for, fills only what is missing, and goes to the Review playlist as before. The Fetched songs page shows, under each row, which release won, by how much, and where each field came from. Octo then organizes the file per your `FolderStructure` setting (`Flat`, `ByArtist`, `Organized` or a `Custom` layout of your own) and triggers a Navidrome rescan, so it appears in your library exactly like everything else you own. The details are under [Tags, covers and lyrics](#tags-covers-and-lyrics).
 
 ### Can it run on a Raspberry Pi?
 
@@ -411,7 +412,7 @@ The earlier project leaned on SquidWTF (a public TIDAL proxy) for streaming. In 
 Octo's earliest commits descended from [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta) (via [bransoned/octo-fiestarr](https://github.com/bransoned/octo-fiestarr)), so the *concept* is the same: a Subsonic proxy that fills in songs you don't own. The implementation has diverged completely:
 
 - **Octo-fiesta's model:** when you play an unowned song, it hits the Qobuz / Deezer / Yandex API with your paid streaming credentials, decrypts the audio, and writes the FLAC to disk permanently. Every play = a downloaded file. Excellent if you have a paid streaming sub and want a unified Subsonic UX over your subscription catalog.
-- **Octo's model:** when you play an unowned song, you get a *YouTube preview* with zero disk impact. If you decide you want to keep it, you star it and Octo grabs the FLAC from Soulseek peers. Preview is free, ownership is opt-in.
+- **Octo's model:** when you play an unowned song, it *streams from YouTube* with zero disk impact. If you decide you want to keep it, you star it and Octo grabs the FLAC from Soulseek peers. Streaming is free, ownership is opt-in.
 
 Different audience. If you pay for streaming and want every play to enrich your library, octo-fiesta is the right tool. If you don't pay for streaming and want discovery + selective FLAC ownership, Octo is the right tool.
 
@@ -420,7 +421,7 @@ Other practical differences in Octo: a real admin UI, multi-peer Soulseek retry,
 
 ### Background
 
-Octo is a full refactor of [octo-radiostarr](https://github.com/winters27/octo-radiostarr). That earlier project ran on SquidWTF + Tidal and broke when Tidal hardened their API in April 2026. Octo pivots to **YouTube via yt-dlp** for previews and **Soulseek via slskd** for downloads, neither of which depends on a single fragile public API.
+Octo is a full refactor of [octo-radiostarr](https://github.com/winters27/octo-radiostarr). That earlier project ran on SquidWTF + Tidal and broke when Tidal hardened their API in April 2026. Octo pivots to **YouTube via yt-dlp** for streaming and **Soulseek via slskd** for downloads, neither of which depends on a single fragile public API.
 
 ### Architecture
 
@@ -503,7 +504,10 @@ transition profile, which the Octo apps use to blend one song into the next, so 
 whether or not Sounds alike is on. It reads each song once, one at a time
 with `RADIO_SONIC_PAUSE_SECONDS` between, only while nothing downloads, then keeps up with new
 and changed songs; a damaged file costs only that file. On a network mount the first pass takes
-a while, and the dashboard shows how far it is, with Pause and Start over. `SONIC_CPUS` (default
+a while, and the dashboard shows how far it is, with Pause and Start over. When an update changes
+how transition profiles are measured, it reads each song once more, in the same way; the apps
+keep the song's older profile until then, and the dashboard shows "Updating song profiles" with
+how many are done. `SONIC_CPUS` (default
 1) caps the CPUs it may use; never set it above the machine's count, or Docker will not start it.
 It starts with the rest of the stack, so an update brings it without any change to `.env`. It is
 pulled already built, like the yt-dlp shim; only without access to `ghcr.io` is it compiled
@@ -636,32 +640,32 @@ arrived if verification was on at the time; `LIBRARY_ACTIONS_REVIEW_SWEEP_OCTO_D
 them too.
 
 A sound AcoustID has never heard, or one only one person ever linked to the song in AcoustID, is
-not left to you while its song's YouTube preview can say, the same question a new download is
-asked. If the file sounds like a YouTube Music row with the song's title, artist and length from
-the file's own album, it is counted as fine and nothing is asked. If it sounds nothing like such a
-preview, Review gets a question that says so ("it sounds nothing like its YouTube preview, 47% of
-its bits differ"). Anything the preview cannot settle (another version, a preview that may not be
-the song, no preview) stays the question it was, so Review still decides those. When the YouTube
-shim does not answer, or is busy with plays, the song waits instead of becoming a question. When
-it finds the video but does not send it, the song is tried three times in all, then it becomes
-the question it was. By default nothing is replaced because of the preview, not even with the
-sweep's replacing on.
+not left to you while the song as it streams from YouTube can say, the same question a new
+download is asked. If the file sounds like a YouTube Music row with the song's title, artist and
+length from the file's own album, it is counted as fine and nothing is asked. If it sounds nothing
+like such a stream, Review gets a question that says so ("it sounds nothing like its YouTube
+stream (47% of its bits differ)"). Anything the YouTube stream cannot settle (another version, a
+video that may not be the song, no video) stays the question it was, so Review still decides
+those. When the YouTube shim does not answer, or is busy with plays, the song waits instead of
+becoming a question. When it finds the video but does not send it, the song is tried three times in
+all, then it becomes the question it was. By default nothing is replaced because of the YouTube
+stream, not even with the sweep's replacing on.
 
 `LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PREVIEW` (off by default) lets the sweep replace such a
 song through Wrong song instead of asking, for when there are too many questions to go through by
-hand. It acts only on the clearest case: the preview is a YouTube Music row with the song's title,
+hand. It acts only on the clearest case: the video is a YouTube Music row with the song's title,
 artist and length, from the same album as the file's album tag and not a live album, and at least
 42% of the file's bits differ from it (from 38% to 42% it is still asked about). It never acts on a
-song with no tags, an ISRC tag, a star or a rating, on anything the preview cannot settle, or on the
+song with no tags, an ISRC tag, a star or a rating, on anything the YouTube stream cannot settle, or on the
 re-check of Octo's own downloads; those stay questions. It needs what the replacing below needs
 (Wrong song on, dry run off, the keeper on the allowlist), a download source other than YouTube
 alone (`DOWNLOAD_SOURCE` Soulseek, Lidarr, or SoulseekThenYouTube, whose replacement then comes
 from Soulseek only, never the YouTube fallback), so the replacement is held to the song's YouTube
-preview like any download, and `LIBRARY_ACTIONS_KEEP_REPLACED` on, so the old file can be put back from
+stream like any download, and `LIBRARY_ACTIONS_KEEP_REPLACED` on, so the old file can be put back from
 Recently removed for `LIBRARY_ACTIONS_TRASH_DAYS` days. It counts toward the same
 `LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PER_DAY` and the same stop after three failures as the
 replacing below. Review keeps a note of each replacement ("Octo replaced this: it
-sounded nothing like its YouTube preview, 47% of its bits differ").
+sounded nothing like its YouTube stream (47% of its bits differ)").
 
 `LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE` (off by default) lets the check replace a song that
 clearly is another one instead of asking: AcoustID names a different song, by another title, at
@@ -691,13 +695,13 @@ the check itself when library actions may change files. Needs the AcoustID key; 
 in `identity-sweep.json` beside the settings, so a restart carries on where it was.
 
 "Check every song against YouTube" (Library actions, Review) compares each song already in the
-library with its YouTube preview, once, the way a new download is compared when AcoustID cannot
+library with its YouTube stream, once, the way a new download is compared when AcoustID cannot
 place it. Songs downloaded before that check, or kept from before Octo, never had it. A song
 AcoustID vouches for (by the tag check's last answer, or a lookup of its own) is passed over
-quickly. A song that sounds nothing like a preview whose title, artist and length are the song's
-becomes a Review question, or is added to an open question AcoustID could not settle, whose
-fingerprint is then never sent to AcoustID; one that may be another version, or has no preview, is
-left alone. Nothing is changed or removed. It compares `LIBRARY_ACTIONS_YOUTUBE_CHECK_PER_HOUR`
+quickly. A song that sounds nothing like a YouTube video whose title, artist and length are the
+song's becomes a Review question, or is added to an open question AcoustID could not settle, whose
+fingerprint is then never sent to AcoustID; one that may be another version, or has no YouTube
+video, is left alone. Nothing is changed or removed. It compares `LIBRARY_ACTIONS_YOUTUBE_CHECK_PER_HOUR`
 (default 30, 0 is off) songs an hour, one at a time and only while nothing is downloading, pauses while 50 library questions wait in Review,
 and rests an hour when the shim stops answering. It needs library actions and Review on and
 someone on the allowed list to ask. Where it is is kept in `youtube-check.json` beside the
@@ -714,30 +718,49 @@ the copies are on purpose and stops Octo asking about them. The library is walke
 `LIBRARY_ACTIONS_DUPLICATES_SCAN_HOURS` (default 24) with Octo's Navidrome admin credential,
 and the dashboard can start a walk at once.
 
-`SLSKD_VERIFY_DOWNLOADS` fingerprints each finished Soulseek download with Chromaprint and
-identifies it through AcoustID before it joins the library, using the free key in
-`ACOUSTID_API_KEY`. A file identified as a different recording is deleted and its peer and
-filename are remembered in `/app/config/rejected-peers.json`, so that exact file is never
-downloaded again; entries lapse after 30 days and the Soulseek admin page can forget them all
-at once. `SLSKD_MIN_MATCH_SCORE` (50-99, default 85) is how sure AcoustID must be before its
-answer may reject anything, so raising it makes Octo *more* permissive, because weaker matches
-are ignored rather than acted on. A track with no AcoustID entry at all is always accepted.
+`SLSKD_VERIFY_DOWNLOADS` (on by default) fingerprints each finished download with Chromaprint
+and identifies it through AcoustID before it joins the library. Octo's published images bring
+Octo's own AcoustID key, which a blank `ACOUSTID_API_KEY` uses; a server built from source
+without one has AcoustID off until you add a key (the dashboard's AcoustID key setting says
+which yours is). Your own free key in `ACOUSTID_API_KEY` (or Settings) takes its place, and
+`ACOUSTID_API_KEY=off` turns AcoustID off. A file identified as a different recording is
+deleted and its peer and filename are remembered in `/app/config/rejected-peers.json`, so that
+exact file is never downloaded again; entries lapse after 30 days and the Soulseek admin page
+can forget them all at once. `SLSKD_MIN_MATCH_SCORE` (50-99, default 85) is how sure AcoustID
+must be before its answer may reject anything, so raising it makes Octo *more* permissive,
+because weaker matches are ignored rather than acted on. For hearts and plays, a file is kept
+only when its sound proves it is the recording you heard; otherwise Octo keeps the version you
+heard. For other downloads, a track AcoustID has never heard of is kept and marked not proven.
 `SLSKD_TAG_FROM_MUSICBRAINZ` writes the matched recording's MusicBrainz title, artist, album
 and year over the peer's own tags. `NAME_FROM_MATCH` goes one step further and names the file
 from the match as well (artist folder, title, album and track number), so the path and the
 tags come from one decision; it is off by default because a canonical name is not always the
-one you file under, and it only ever names files Octo downloads and confirms. YouTube
-downloads are identified too, but never rejected: YouTube has no second candidate, so a
-disagreement is kept and, with the Review playlist on, asked about. Verification needs
-`fpcalc` in the runtime image (`libchromaprint-tools`); without it the feature logs once and
-accepts everything. A song asked for with an ISRC (an album track Deezer listed) is also held
-to that code: a file whose own tags carry it is confirmed even with no AcoustID key or entry,
-and a fingerprint that names a recording spelled differently (a title in its own script, or
-translated) is confirmed when MusicBrainz lists the ISRC on it. A different ISRC never rejects
-a file, since re-releases are often given new codes. A recording only one person ever linked to
-the sound is not proof on its own: it is confirmed when the song's YouTube preview sounds like
-the file, refused when a preview that can be believed sounds nothing like it, and asked about
-otherwise.
+one you file under, and it only ever names files Octo downloads and confirms. A YouTube
+download that AcoustID names as another recording is thrown away, that video is never used for
+the song again, and the next video is tried. Verification needs `fpcalc` in the runtime image
+(`libchromaprint-tools`); without it the feature logs once and accepts everything. For hearts
+and plays none of this decides: a heart's file is kept only when AcoustID is certain it is the
+recording you heard, or when it is the very master you played, moment by moment; a file's own
+tags can only rule it out. A song asked for with an ISRC (an album track Deezer listed) is also
+held to that code: a file whose own tags carry it is confirmed even with no AcoustID key or
+entry, and a fingerprint that names a recording spelled differently (a title in its own script,
+or translated) is confirmed when MusicBrainz lists the ISRC on it. A different ISRC never
+rejects a file, since re-releases are often given new codes. A recording only one person ever
+linked to the sound is not proof on its own: it is confirmed when the song's own YouTube stream
+sounds like the file, refused when a stream that can be believed sounds nothing like it, and
+asked about otherwise.
+
+The dashboard's Status page says when a check cannot run, in its Downloads card: "Octo is not
+checking imported downloads by their sound. Turn it on" while verification is off, with a
+switch that turns it on (an install whose `.env` was written from an older example may still
+say `SLSKD_VERIFY_DOWNLOADS=false`); "AcoustID is off: Octo checks what played against the
+catalog's own clip of each song, and keeps a copy only when it is the very master you played";
+"AcoustID is not answering; hearts wait for it" while a heart holds for it; and "AcoustID
+refused your submission key" once `ACOUSTID_USER_KEY` is refused, until the settings change. The
+yt-dlp shim's card says "Update the yt-dlp shim so Octo can check YouTube" for a shim too old to
+answer the fresh lookups hearts check what played with, and Lidarr's card says "Waiting for
+Lidarr's indexers" while hearts hold for them, and "Lidarr has no indexer that can search" when
+none has automatic search on.
 
 "Catch fake lossless files" on the Soulseek admin page (on by default) checks every download
 that claims to be lossless for a lossy file converted to it. Octo decodes a few seconds from
@@ -780,7 +803,11 @@ last good version. Stations are drawn again every `LASTFM_REFRESH_INTERVAL_HOURS
 default), whether or not anyone is listening; plays never draw a station again early, so an app
 that holds a station as a playlist keeps the same songs between refreshes. A listener's first
 stations, and Your Radio once `LASTFM_MINIMUM_PLAYS` plays have taught it, come as soon as
-there is something to build them from. State is bounded and versioned in
+there is something to build them from. When Last.fm gives no answer for one of a listener's
+stations during a refresh (no connection, a rate limit, its time running out), that station keeps
+its songs instead of dropping off the list, and Octo tries it again every 15 minutes until it can
+be made or is no longer wanted; the dashboard's Radio page says when stations were kept this way. A
+station Last.fm answered with too few songs goes as before. State is bounded and versioned in
 `/app/config/lastfm-radio-state.json`; do not share that file across Octo instances
 because cross-process locking is not supported.
 
@@ -880,13 +907,13 @@ that is on, named after its country, such as `Popular right now · Japan`.
 
 To listen before downloading, import a list and turn on **Stream without downloading** on the
 dashboard's **Import** page. The list then shows as a private, read-only playlist in apps
-connected to Octo: songs you have play from your library, and the rest play as previews.
-Heart a preview to keep it, the same way as any outside song. Once the copy is in your library,
+connected to Octo: songs you have play from your library, and the rest play straight from
+YouTube. Heart one to keep it, the same way as any outside song. Once the copy is in your library,
 the playlist plays it in the same spot.
 
 The switch never downloads anything by itself. **Keep as playlist** and **Get missing songs** work
 as before, and a list with either of them on still follows its link for songs added later. To
-listen with previews and hearts only, leave **Get missing songs** and download on play off.
+listen by streaming and hearts only, leave **Get missing songs** and download on play off.
 
 The dashboard's **Import** page, and the same view in the Octo apps, shows what your library
 has of the playlists and liked songs you bring from another service. A list can be kept as a
@@ -924,7 +951,15 @@ Set `LIDARR_URL` and `LIDARR_API_KEY`, restart Octo, then open the **Lidarr** ad
 
 The selected Lidarr root and Octo's effective Navidrome library root must expose the same underlying files. Their container paths may differ: Octo translates the imported path relative to the selected Lidarr root. For example, Lidarr `/data/music/Artist/Album/file.flac` can map to Octo `/music/Artist/Album/file.flac` when both mounts point at the same host directory.
 
-A heart through Lidarr keeps the same promises as one through Soulseek. Lidarr brings the whole album, so a song already in your library is deleted from what it brought (an MP3 you own is queued for Better quality instead), a song removed with a library action stays removed, and an album Octo had Lidarr monitor goes back to unmonitored once it lands, so Lidarr does not fetch the songs Octo moved into its own layout again. Every song Lidarr imports then goes through the same pipeline as a Soulseek download: AcoustID (a wrong recording, or a live take you did not ask for, is deleted), the spectrum check, release matching, tags, ReplayGain, lyrics and your folder layout.
+A heart downloads the song you heard. When the artist has no music in your Lidarr yet, Octo asks Lidarr for the album you were listening from; otherwise your other sources look for it. A download is kept only when its sound proves it is the recording you heard: AcoustID must be certain, or it must be the very master you played, moment by moment. A file's own tags can rule it out but never prove it. When nothing can be proven yet, Octo keeps the version you heard and keeps looking for a better copy it can prove. A song you heart without playing waits for one play. Hearting a whole album keeps the tracks Octo can prove and holds the rest until you play them, or until you choose Keep these anyway. Octo's published images bring Octo's own AcoustID key, used while yours is blank; your own key in Settings takes its place (a server built from source without one needs your own). Tick On Grab and On Health Restored in Lidarr's webhook.
+
+Those two webhook events (beside On Release Import, in Lidarr's Settings, Connect, on the webhook pointed at Octo) let a heart waiting for Lidarr's indexers go on the moment they search again; without them Octo still reads Lidarr's health at the import poll pace. Such a heart needs nothing from you: it goes on by itself once the indexers search again. A kept copy waiting for Lidarr's download needs nothing from you either: it plays from where it waits, and joins your library once Lidarr's download for that artist is over. A song held while AcoustID is off and a hearted album's held tracks are listed under In progress on the dashboard's Fetched songs page, with Keep anyway or Keep these anyway for the person they wait for. While Record who asked is off, the dashboard lists those people as Listener 1, Listener 2 and so on, never by name.
+
+When a download Octo asked Lidarr for leaves Lidarr's queue while its download client lists nothing else, Lidarr gives no proof that it is gone, so Octo keeps following it, and taking every heart back does not settle it either. The dashboard's Lidarr card then lists it ("Octo is still following a Lidarr download it cannot see: Artist - Album") with **Put Lidarr back**: once you have checked the download client, that counts the download gone, ends the follow and gives Lidarr back what Octo changed for that album.
+
+Octo compares times on Lidarr's own clock, read only from what Lidarr stamps itself (its commands, its history and its queue), so the clock of a reverse proxy in front of Lidarr never counts.
+
+A heart through Lidarr keeps the same promises as one through Soulseek. Lidarr brings the whole album, so a song already in your library is deleted from what it brought (an MP3 you own is queued for Better quality instead), a song removed with a library action stays removed, and what Octo adds to Lidarr stays unmonitored, so Lidarr does not fetch the songs Octo moved into its own layout again; when Octo's search brings nothing it keeps, what Octo added is taken back out of Lidarr, never off the disk. Every song Lidarr imports then goes through the same pipeline as a Soulseek download: the checks by sound above, the spectrum check, release matching, tags, ReplayGain, lyrics and your folder layout.
 
 A heart waits for Lidarr's import, up to `LIDARR_IMPORT_TIMEOUT_SECONDS` (default 1800), and any song that did not land (Lidarr found nothing in time, or the file failed a check) goes to the next source in **Heart download priority**, which skips the songs that did. The wait never blocks playback or later hearts. `LIDARR_COMPLETION_MODE=Accepted` (default) sends a notice when Lidarr accepts the search and one for the album when an album heart lands; `Imported` also sends one when a track heart's album lands, and one when an import fails or times out.
 
@@ -932,21 +967,25 @@ A heart waits for Lidarr's import, up to `LIDARR_IMPORT_TIMEOUT_SECONDS` (defaul
 
 For songs Soulseek does not have, Octo can ask a Mornye server you run yourself. Mornye is the SpotiFLAC Python module under its new name (since October 2026), and an older SpotiFLAC (5.x) still works the same way. It is off by default. Octo includes no Mornye, no extensions and no places to download from: Mornye (its Python module, `pip install mornye`, or its Docker image) loads the extension registry you choose, it installs every extension your registry lists by itself, and what it can find depends on them. Octo finds the song in Mornye's catalog (by ISRC first, then by artist, title, version and length), asks Mornye to save it into a hidden folder of the music folder, and checks the file like a Soulseek download: its length, the version its own title names, AcoustID and the spectrum. A file that fails is thrown away and the next source is asked. A file that passes is tagged by Octo, never by Mornye's tags alone.
 
-1. In `.env`, add `spotiflac` to `COMPOSE_PROFILES` (comma-separated, for example `COMPOSE_PROFILES=navidrome,spotiflac`), set `SPOTIFLAC_REGISTRIES` to your registry's address and `SPOTIFLAC_WEB_TOKEN` to a long random string, then run `docker compose up -d`. This builds Mornye from its own repository at a pinned commit (a few minutes and about 2 GB the first time, cached afterwards) and starts it beside Octo, with the music folder mounted at the same path.
+1. In `.env`, add `spotiflac` to `COMPOSE_PROFILES` (comma-separated, for example `COMPOSE_PROFILES=navidrome,spotiflac`), set `SPOTIFLAC_REGISTRIES` to your registry's address and `SPOTIFLAC_WEB_TOKEN` to a long random string, then run `docker compose up -d`. This gets Octo's Mornye image ready (Mornye's own published 1.0.5 image, pinned by digest, with Octo's small helper added; about 2 GB to download the first time, cached afterwards) and starts it beside Octo, with the music folder mounted at the same path.
 2. Mornye installs every extension your registry lists by itself, when it starts and again every hour. Its page on port 8010 (`SPOTIFLAC_PORT`, opened with `?token=` and your token) shows them.
 3. In Octo's dashboard, open **Mornye (SpotiFLAC)**, set the address to `http://spotiflac:8000` and the same token, press **Test connection**, turn on **Download with Mornye** and save. (Or set `SPOTIFLAC_ENABLED=true` and `SPOTIFLAC_URL=http://spotiflac:8000` in `.env`.)
 
 Mornye takes Soulseek's place in **Heart download priority**: after Soulseek finds nothing (the default), before it, or before it only for songs written in Chinese, Japanese, Korean or Thai script. With Soulseek off, Mornye is asked alone. A Mornye running elsewhere works too (`mornye --web --host 0.0.0.0 --web-token <token>`): it must see Octo's music folder, and **Music folder in Mornye** says where when its path differs. Multi-user mode (`--web-multiuser`) is not supported, since it saves into each account's own folder.
 
+**Pass Mornye's check:** some extensions reach their downloads through a gateway that first checks a person is there. Mornye passes that check by itself; when it cannot, it pauses that gateway for a while, and songs only Mornye could bring fail until it passes (Octo says so on the download, and sends one push with a link). On the dashboard's Mornye page, **Pass Mornye's check** ends Mornye's own pause, asks Mornye again for the last song it could not get so that Mornye opens its check, and shows you Mornye's own check browser, live, to pass with your own mouse or finger. Octo never clicks or types into it by itself, and keeps a pause the gateway itself asked for. It needs `SPOTIFLAC_WEB_TOKEN`, and Octo's `spotiflac` service (or `SPOTIFLAC_ASSIST_URL` pointing at a Mornye running Octo's image). Once it passes, songs ask Mornye again; the ones it could not get during the pause need a heart again.
+
 **Coming from SpotiFLAC:** the `spotiflac` service now runs Mornye, at the same address, with your `.env` unchanged. Mornye keeps its own settings folder (`spotiflac-data/mornye`) and installs your registry's extensions into it by itself on its first start. Your old SpotiFLAC folder is left as it was.
 
-Mornye is not part of Octo, so it never holds Octo back: when it can't be built, `install.sh` and **Update now** start Octo without it and say so. A plain `docker compose pull` leaves it alone, since it is never pulled.
+**Which Mornye:** the `spotiflac` service runs Mornye 1.0.5, Mornye's release with its dependencies pinned. `SPOTIFLAC_BUILD_REF` is no longer read; to run another Mornye, set `SPOTIFLAC_IMAGE` to its image (for Mornye 1.1.0, `ghcr.io/mornyeapp/mornye-python@sha256:4a63ebef218f02cd2072a3e683641565cdaa87b2f4d1764bb960d977dcbee862`, which also needs the utilities extension in your registry), then run `docker compose build spotiflac && docker compose up -d spotiflac`. Each release gets its own Mornye image ready, and an update removes the ones before it.
+
+Mornye is not part of Octo, so it never holds Octo back: when its image can't be got ready, `install.sh` and **Update now** start Octo without it and say so. A plain `docker compose pull` leaves it alone, since it is never pulled.
 
 | `.env` | Default | What it does |
 | --- | --- | --- |
 | `SPOTIFLAC_ENABLED` | `false` | Downloads ask Mornye |
 | `SPOTIFLAC_URL` | blank | Mornye's address, as Octo's container reaches it |
-| `SPOTIFLAC_WEB_TOKEN` | blank | Mornye's web token; the `spotiflac` service starts with the same one |
+| `SPOTIFLAC_WEB_TOKEN` | blank | Mornye's web token; the `spotiflac` service starts with the same one, and Octo needs it to pass Mornye's check |
 | `SPOTIFLAC_PLACEMENT` | `AfterSoulseek` | `AfterSoulseek`, `BeforeSoulseek` or `BeforeSoulseekForAsianScripts` |
 | `SPOTIFLAC_QUALITY` | `LOSSLESS` | `LOSSLESS`, or `HI_RES_LOSSLESS` for hi-res where there is one |
 | `SPOTIFLAC_SERVICES` | blank | Your extension ids to try, in order, separated by commas; blank leaves the order to Mornye |
@@ -955,7 +994,10 @@ Mornye is not part of Octo, so it never holds Octo back: when it can't be built,
 | `SPOTIFLAC_AT_ONCE` | `2` | Songs Mornye is asked for at once (1 to 4) |
 | `SPOTIFLAC_REGISTRIES` | blank | For the `spotiflac` service: your extension registry addresses, separated by commas |
 | `SPOTIFLAC_PORT` | `8010` | For the `spotiflac` service: the port of Mornye's page |
-| `SPOTIFLAC_BUILD_REF` | `5660533b…` (Mornye 1.0.3) | For the `spotiflac` service: the Mornye commit or tag Compose builds |
+| `SPOTIFLAC_WEB_URL` | blank | Mornye's page as your browser reaches it, for the dashboard's **Open Mornye**; blank is this machine at `SPOTIFLAC_PORT` with the `spotiflac` service, else `SPOTIFLAC_URL` |
+| `SPOTIFLAC_ASSIST_URL` | blank | Octo's helper beside Mornye, for **Pass Mornye's check**; blank is `http://spotiflac:8011` with the `spotiflac` service |
+| `SPOTIFLAC_IMAGE` | blank (Mornye 1.0.5) | For the `spotiflac` service: another Mornye image to run with Octo's helper; then `docker compose build spotiflac && docker compose up -d spotiflac` |
+| `NOTIFY_MORNYE_CHECK` | `true` | A push when Mornye could not pass its check, once until it passes again, with a link to pass it |
 | `SPOTIFLAC_DATA_DIR` | `./spotiflac-data` | For the `spotiflac` service: Mornye's settings and the extensions it installed, in its `mornye` folder |
 | `SPOTIFLAC_PUID`, `SPOTIFLAC_PGID` | `1000` | For the `spotiflac` service: the user Mornye runs as |
 
@@ -967,6 +1009,8 @@ Set `WAIT_FOR_LOSSLESS_ON_PLAY=true` if you would rather the first play wait for
 
 `WAIT_FOR_SEARCH_DURATIONS` (on by default) has a search wait for the YouTube lengths of the top rows from outside your library before it answers, so the length shown is the length of the video that plays. `SEARCH_DURATION_WAIT_MS` (1000 by default, up to 10000) caps that wait: rows whose length arrives in time show it, and the others show Deezer's length while Octo finds the YouTube one in the background. Turned off, a search never waits. Either way, apps that look the song up again when it starts playing, and the next search for the same words within 10 minutes, show the YouTube length. Both changes take effect without a restart. `SEARCH_LASTFM_WAIT_MS` (1000 by default, up to 10000, 0 waits however long it takes) is how long a search waits for Last.fm: past it, the songs from outside your library come from Deezer's own search for the words instead, and Last.fm's answer, once it arrives, is used by the next search for the same words.
 
+`SEARCH_LIBRARY_ONLY_UP_TO` (12 by default, 0 to 100) is the song count up to which a search looks only in your library. A search that small is taken for an app searching as you type, where asking Last.fm, Deezer and YouTube on every keystroke would be wasted. Some apps ask for few songs on a finished search too, such as the Music Assistant app, which asks for 10 in its search overview, and never show a song from outside your library there; set it below their count (0 searches outside at any count). For Octo's apps it is also how many places of a small page your library keeps for itself. It takes effect without a restart and is under **Music server** in the dashboard.
+
 Set `DOWNLOAD_ON_PLAY=true` to keep a copy of every song played from outside your library, radio included. The copy comes from the first song source in the heart download priority that Octo fetches itself (Soulseek or YouTube, never Lidarr), and playback still starts from YouTube at once. Only the start of a play counts, not a seek. Hearts always go ahead of these downloads, and at most one played song waits its turn: a song played while another is waiting is skipped, and tried again the next time it is played. Each one shows in the app's download list like a heart, and hearting a song that is already downloading this way makes it a heart. `LIDARR_ALBUM_ON_PLAY=true` hands the album of every played song to Lidarr, once per song until Octo restarts; one Lidarr turns down is tried again on the next play. Every hand-off makes Lidarr search all its indexers, so on radio it pulls in an album per song. Both are off by default and have switches under **Streams & hearts, Playing songs you don't own**.
 
 Octo sends plays to Last.fm itself: songs from outside your library, which Navidrome has never heard of, and your library songs too (the dashboard's "Also send library plays", on by default). Octo also sends outside plays to ListenBrainz when a token is set. For Last.fm, paste your API key and its shared secret on the dashboard's Last.fm page (or set `LASTFM_API_KEY` and `LASTFM_API_SECRET`); Save checks both with Last.fm. Then press **Connect** next to a listener and allow access on last.fm while signed in as that person. The dashboard notices by itself when that is done, and for someone else you can copy the link and send it to them. Each listener has their own connection. If Navidrome is also linked to the same Last.fm, or an app scrobbles to Last.fm itself, turn that off (or turn off "Also send library plays") or plays count twice.
@@ -975,7 +1019,12 @@ Octo sends plays to Last.fm itself: songs from outside your library, which Navid
 
 - `Flat` *(default)*: `Artist - Title.flac`.
 - `ByArtist`: `Artist/Title.flac`.
-- `Organized`: `Artist/Album/01 - Title.flac`. A track with no known album falls back to its own title as the folder. Existing files are never moved; this only affects new downloads.
+- `Organized`: `Artist/Album/01 - Title.flac`. A track with no known album falls back to its own title as the folder.
+- `Custom`: your own layout, typed on the dashboard (**Library folder, File layout**) or set with `FOLDER_TEMPLATE`. Names in braces are filled in for each song and a `/` starts a folder, so `{Artist}/{Album} ({Year})/{Track:00} - {Title}` files `Daft Punk/Discovery (2001)/01 - One More Time.flac`. The names are `{Artist}`, `{Album Artist}`, `{Track Artist}`, `{Album}`, `{Title}`, `{Track}` (`{Track:00}` for two digits), `{Disc}`, `{Year}` and `{Album Type}`; Lidarr's names (`{Artist Name}`, `{Album Title}`, `{Release Year}`, `{track:00}`, `{Track Title}`) work too, so a Lidarr layout can be pasted as its artist folder, a `/`, then its track format. A name with no value takes the brackets around it with it (`({Year})` disappears when the year is unknown). `FOLDER_TEMPLATE_SINGLES` and `FOLDER_TEMPLATE_COMPILATIONS` give singles and compilations their own layout; blank, they use the albums one. The dashboard shows where three sample songs would go as you type, and refuses a layout with a mistake, saying how to fix it.
+
+Every layout makes names safe for Windows and network shares: `: * ? " < > |` become their full-width look-alikes (`Are You Ready?` is filed as `Are You Ready？`, which Windows shows as typed), a name never ends in a dot or a space, a name starting with a dot gets a full-width one (Navidrome and Samba hide names that start with a dot), and Windows' device names such as `CON` get a `_`. Folder names are kept short enough for Windows' path length. A new song joins the folder its album already has, even when that folder was named by an older rule or with other capitals.
+
+Changing the layout files new downloads only; songs already in the library stay where they are. To move them into the layout, use **Tidy the library**, **File layout**: it previews every folder and file it would move, moves what you keep ticked with the same scan safety as the tidy's other task, and **Undo** puts them back. Songs Lidarr keeps are left to Lidarr.
 
 A download is filed once it has been tagged, so the album Deezer finds for a track that arrived without one names its folder. When no album turns up anywhere (the source, Deezer or the file's own tags), the track is filed as a single under its title (`ALBUM_FROM_TITLE`, on by default) rather than joining the one `[Unknown Album]` Navidrome gives every album-less track; a compilation is left alone, since a hundred one-track albums would be worse. A collaboration's folder is named after its first artist, and only when MusicBrainz or Deezer says who that is: `Bizarrap, Rauw Alejandro` is filed under `Bizarrap/`, while `Earth, Wind & Fire` and `Tyler, The Creator` stay whole because every source names them whole. The full credit stays in the artist tag, and each artist also gets a value of their own in the `ARTISTS` tag, so Navidrome lists the track under every one of them. File names keep annotations that name a different recording, such as `(Live)`, `[Remix]` and `(feat. X)`, and drop only upload noise like `(Official Video)`. A file already at the chosen path is replaced only when it is provably the same song; anything else keeps both.
 
@@ -993,13 +1042,13 @@ The tag set a sure match writes is the one Picard writes and Navidrome reads, na
 
 A file named for another format than it holds (a FLAC named `.mp3`, an M4A named `.flac`) is renamed to the extension its first bytes call for before anything is tagged, since the tagger writes by the extension; the download's log and its tag report both say so.
 
-A peer tags a file for the release it ripped, so Octo cleans what the file arrived with before writing its own. The album id, `RELEASEDATE` (and a Vorbis `YEAR`, which Navidrome also reads as one) and `ALBUMVERSION` never stay on a download, for the same reason Octo never writes them; the one exception is a song joining an album folder that already carries them (the `Organized` layout), which gets that album's exact values so it lands in the same album. When the song is filed under another album than the one the file named (a compilation rip filed under the studio album, say), everything else the peer wrote about that release goes too: its barcode, label, catalog number, release ids, original date, album gain and its track and disc numbers. A field Octo writes is the only value under any of its names, so a peer's `ORGANIZATION` or `UPC` cannot stand beside Octo's `LABEL` or `BARCODE` as a second label or barcode. `DISCTOTAL` is written when the release says how many discs it has. Whether the words are explicit goes into `ITUNESADVISORY` (the `rtng` atom on MP4: 1 explicit, 2 the clean edit, 0 neither), which Navidrome shows as each song's explicit status; it comes from the Deezer hit whose ISRC is the downloaded file's (the one asked for stands in only when neither the file nor the fingerprint names one), and a file name that says clean always wins.
+A peer tags a file for the release it ripped, so Octo cleans what the file arrived with before writing its own. The album id, `RELEASEDATE` (and a Vorbis `YEAR`, which Navidrome also reads as one) and `ALBUMVERSION` never stay on a download, for the same reason Octo never writes them; the one exception is a song joining an album folder that already carries them (`Organized`, or a `Custom` layout with an album folder), which gets that album's exact values so it lands in the same album. When the song is filed under another album than the one the file named (a compilation rip filed under the studio album, say), everything else the peer wrote about that release goes too: its barcode, label, catalog number, release ids, original date, album gain and its track and disc numbers. A field Octo writes is the only value under any of its names, so a peer's `ORGANIZATION` or `UPC` cannot stand beside Octo's `LABEL` or `BARCODE` as a second label or barcode. `DISCTOTAL` is written when the release says how many discs it has. Whether the words are explicit goes into `ITUNESADVISORY` (the `rtng` atom on MP4: 1 explicit, 2 the clean edit, 0 neither), which Navidrome shows as each song's explicit status; it comes from the Deezer hit whose ISRC is the downloaded file's (the one asked for stands in only when neither the file nor the fingerprint names one), and a file name that says clean always wins.
 
 `REPLAYGAIN` (on) measures each download's loudness once, beside the lookups, and writes `REPLAYGAIN_TRACK_GAIN` and `REPLAYGAIN_TRACK_PEAK` by the ReplayGain 2.0 convention (-18 LUFS, true peak), which the Octo apps and most players use to even out volume; an album fetched whole gets `REPLAYGAIN_ALBUM_GAIN` and `REPLAYGAIN_ALBUM_PEAK` once the walk ends. `REPLAYGAIN_TIMEOUT_SECONDS` (45) caps the measurement; past it the download goes on without ReplayGain. Every lookup has its own cap too, and a timeout costs fields, never the download.
 
 Under each row of **Fetched songs**, "How it was tagged" shows the release that won and how sure Octo is, every candidate it weighed with its biggest penalties, what each field was set to and from, the notes (a catalog that did not answer, a release lookup that timed out), the seconds each stage took and the measured loudness. **Try it on a song** (Tags & genres) runs the same identification on a file in the music folder (fingerprint and loudness included) or on an artist and title alone, and shows the same report without writing anything, including whether the song is explicit and what a download would take off the file. `TAG_REHEARSAL` (off) runs the matching on every real download and shows the report, but writes only what Octo wrote before, plus ReplayGain, the ISRC and the fingerprint id, which do not depend on the match: a way to watch it on real downloads before trusting it.
 
-Cover art comes from a chain, and the largest cover found wins: Apple's full-size master of the same album (often 3000 px, taken only when the artist and album name match), the Cover Art Archive when a fingerprint named the release (`COVER_ART_ARCHIVE`), then the catalog's own cover, then Deezer, iTunes and Last.fm by name, and last the file's own art. A cover that is not square is a video thumbnail and counts as missing (`REPLACE_VIDEO_COVERS`); when nothing better turns up its centre square is used, which for a YouTube "Topic" upload is the real cover inside the letterbox. Each song carries the cover at 1500 px, or at the full size it was found with `FULL_SIZE_COVERS=true`. `COVER_FILE` also writes a full-size `cover.jpg` beside the file, only in the `Organized` layout and only in a folder the download created, because Navidrome ranks `cover.*` above embedded art and a new file in an existing album folder would change that album's cover. A `cover.jpg` Octo wrote itself gives way to a larger one later; one you put there never changes.
+Cover art comes from a chain, and the largest cover found wins: Apple's full-size master of the same album (often 3000 px, taken only when the artist and album name match), the Cover Art Archive when a fingerprint named the release (`COVER_ART_ARCHIVE`), then the catalog's own cover, then Deezer, iTunes and Last.fm by name, and last the file's own art. A cover that is not square is a video thumbnail and counts as missing (`REPLACE_VIDEO_COVERS`); when nothing better turns up its centre square is used, which for a YouTube "Topic" upload is the real cover inside the letterbox. Each song carries the cover at 1500 px, or at the full size it was found with `FULL_SIZE_COVERS=true`. `COVER_FILE` also writes a full-size `cover.jpg` beside the file, only in a folder the layout gives each album alone (`Organized`, or a `Custom` layout with an album folder) and only in a folder the download created, because Navidrome ranks `cover.*` above embedded art and a new file in an existing album folder would change that album's cover. A `cover.jpg` Octo wrote itself gives way to a larger one later; one you put there never changes.
 
 **Soft covers** (dashboard, Cover art) finds soft covers and replaces the ones you pick. A scan reads your songs only (album by album, using Navidrome's own song list), Octo's downloads or the whole library, and shows every album whose cover is smaller than the size you choose (or missing) as a wall of covers. Pick all of them or just some and find better covers: albums are matched at Apple in bulk by barcode (from the song's own tag, or from Deezer), 20 to 40 per request, and each tile then shows the larger cover found, with its true size, without downloading it yet. A cover that does not look like the album's current one (another edition, or another album with the same name) is marked Different art and left unpicked. Replace downloads Apple's master at up to 5000 px and puts it in every song and, if you ask, in a JPEG `cover.jpg` or `folder.jpg` beside it. A cover is replaced only when the new one is clearly larger, and every cover replaced is kept so Undo puts them all back.
 
@@ -1034,15 +1083,16 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `getLyricsBySongId`, `getLyrics` | lyrics for outside songs and for library songs Navidrome has none for; chosen or hidden lyrics for every client; word cues with `enhanced=true` |
 | `getLyricsCandidates`, `setLyricsChoice` | the `octoLyrics` extension: every lyrics entry for a song, and pinning one, hiding lyrics, or going back to automatic |
 | `getLibraryActions`, `libraryAction`, `getLibraryTrash` | the `octoLibraryActions` extension: what the caller may do to library files, removing one song the way the Delete playlist does, putting it back, and the tag, album and cover fixes of Library health |
-| `getAcquisitions`, `getAcquisition`, `clearAcquisitions` | the `octoAcquisitions` extension: the caller's downloads; version 2 adds each one's log and clearing finished ones |
-| `findSongs`, `getFoundSongs`, `pickFoundSong` | `octoAcquisitions` 2: a song's search run again on the caller's download sources, every copy found, and fetching the one picked |
+| `getAcquisitions`, `getAcquisition`, `clearAcquisitions` | the `octoAcquisitions` extension: the caller's downloads; version 2 adds each one's log and clearing finished ones; version 4 adds `keepAnyway: true` on a row the caller may keep anyway (a song held while AcoustID is off, or a hearted album's held tracks; only for someone waiting in its hold, and dropped once they asked), and `heldTracks` (how many tracks a hearted album's row holds: the button reads Keep these anyway at 2 or more, else Keep anyway); each is left out otherwise |
+| `keepAcquisitionAnyway` | `octoAcquisitions` 4, by the row's `key`: keeps a held row for the caller (a song keeps the version they heard, a hearted album lands its held tracks, each marked "kept by you, version not proven", and a copy proven later still replaces it). It acts for the caller alone: a hearted album's held tracks land in the caller's library, and stay held for the others who hearted it. It answers a plain `ok` only once the keep is saved, so a restart in the middle still finishes it. An admin may add `user` to keep for someone. Errors: 10 for a missing `key`, and "Name the person whose copy to keep" for an admin who named nobody on a row others wait in; 50 "Only someone who hearted this can keep it" for someone the row is not theirs; 70 "Nothing is waiting to be kept" when nothing waits for the caller (or, for the admin, nothing waits at all) |
+| `findSongs`, `getFoundSongs`, `pickFoundSong` | `octoAcquisitions` 2: a song's search run again on the caller's download sources, every copy found, and fetching the one picked; version 3 adds `anyway` to `pickFoundSong`, so a pick asked about first can replace the library song anyway |
 | `getImports`, `getImport`, `importAction` | the `octoImports` extension: the caller's imported lists with what the library has of each, and the trickle |
 | `getTopSongs` | the standard top songs of an artist (by name, or by id as Navidrome's `topSongsByArtistId`), for every app: ranked as `getArtistTopSongs` ranks them, songs you have as your library's own and the rest as outside songs (only yours while search discovery is off); Navidrome's answer when Octo has none |
 | `getArtistTopSongs`, `getTopChart`, `getCharts` | the `octoTopSongs` extension: an artist's most played songs and the chart of the moment, each marked in the caller's library or playable from outside it, and the charts a country has; `getTopChart` and `getCharts` take `country` (any Apple Music country, the caller's own when not sent or `auto`; error 10 for one Apple does not have, error 0 "Still loading your other countries. Try again in a moment." while two other countries are already loading for the caller; it frees as they finish) |
 | `setChartCountry`, `pinChartCountry` | `octoTopSongs` 3: the caller's own chart country (`country`, or `auto` to follow the server's), and pinning (`pinned=true` or `1`) or unpinning (`pinned=false` or `0`) one more `country`, at most 3; error 10 for a country Apple does not have, error 0 while two other countries are already loading for the caller, which frees as they finish; each answers like `getCharts`, which then says the caller's `setting`, `pinned`, the `serverCountry`, Apple's `countries` and `maxPinned` |
 | `getPlace` | the `octoPlaces` extension, for the apps' Live radio near you: a postal code (`code` and `country`, any case or spacing, `UK` for `GB`; a full UK, Canadian or Dutch code finds the part GeoNames keeps, and a ZIP+4 its five digits), a city (`name`, optional `state` by name or code, and `country`; of the towns with that name, and that state when one is sent, the one with the most postal codes, at the postal code nearest its others) or a coordinate (`latitude` and `longitude` in decimal degrees: the nearest place within 30 km), in that order when several are sent, answered as `place` with `code`, `name`, `state` (when known), `country`, `latitude` and `longitude` (2 decimals). Error 70 for a place Octo does not know, error 10 for missing parameters or coordinates that are not decimal degrees. Answered from GeoNames' postal codes, built into the image; nothing is sent anywhere |
 | `/api/artist/{id}`, `/api/album?artist_id=` | Navidrome's own API, for clients that use it (Feishin): an outside artist's page and its albums |
-| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 and 2, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` 1 to 3 (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`), `octoPlaces` (while the place data can be read, so an app without it keeps to its own lookup) and `songLyrics` 1 and 2 |
+| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 to 4, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` 1 to 3 (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`), `octoPlaces` (while the place data can be read, so an app without it keeps to its own lookup) and `songLyrics` 1 and 2 |
 
 ### Soulseek download details
 
@@ -1183,7 +1233,7 @@ Project layout:
 - [**slskd**](https://github.com/slskd/slskd): Soulseek with a REST API.
 - [**GeoNames**](https://www.geonames.org/): place data from GeoNames ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)), converted and simplified by Octo, behind `getPlace`; the image carries GeoNames' readme as `licenses/GeoNames-postal-codes.txt`.
 - [**Lidarr**](https://github.com/Lidarr/Lidarr): optional album acquisition and import manager.
-- [**yt-dlp**](https://github.com/yt-dlp/yt-dlp): makes YouTube preview feasible.
+- [**yt-dlp**](https://github.com/yt-dlp/yt-dlp): makes streaming from YouTube feasible.
 - [**Last.fm**](https://www.last.fm/api): similar-tracks API.
 - [**V1ck3s/octo-fiesta**](https://github.com/V1ck3s/octo-fiesta): the upstream root of this lineage. The Qobuz/Deezer/Yandex Subsonic-proxy concept that Octo eventually rebuilt around YouTube + Soulseek started here.
 - [**bransoned/octo-fiestarr**](https://github.com/bransoned/octo-fiestarr): the intermediate fork of octo-fiesta whose codebase Octo's earliest commits descended from.

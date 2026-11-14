@@ -21,6 +21,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::TryStreamExt;
 use octo_core::common::version_gap::{self, Against};
 use octo_core::common::{dotnet, romanize};
+use octo_core::fingerprint::heart_gate::HeardSource;
 use octo_core::fingerprint::recording_identity::{RecordingKind, Takes};
 use octo_core::fingerprint::{InconclusiveReason, VerificationResult, VerificationVerdict};
 use octo_core::models::domain::{Album, Song};
@@ -54,12 +55,15 @@ use super::soulseek_metadata_service::SoulseekMetadataService;
 use crate::services::common::acquisition_tracker::acquisition_event_kinds;
 use crate::services::common::base_download_service::AheadBusy;
 use crate::services::common::download_picks::{LIDARR_SOURCE, SOULSEEK_SOURCE};
+use crate::services::common::soulseek_hold_store::HeldLidarrFile;
 use crate::services::common::{
-    AcquisitionState, BaseDownloadService, DownloadBackend, DownloadCore, DownloadServices,
+    AcquisitionHeld, AcquisitionState, BaseDownloadService, DownloadBackend, DownloadCore, DownloadServices,
     OperationCanceled, TrackDownload,
 };
 use crate::services::fingerprint::DownloadVerificationService;
-use crate::services::fingerprint::download_verification_service::trustworthy;
+use crate::services::fingerprint::acoust_id_rate_limiter::{AcoustIdRateLimiter, LookupClass};
+use crate::services::fingerprint::download_verification_service::YOUTUBE_PEER;
+use crate::services::fingerprint::download_verification_service::{LabelSource, trustworthy};
 use crate::services::fingerprint::preview_check::{
     self, Heard, PreviewFacts, PreviewOutcome, PreviewRequest,
 };
@@ -266,12 +270,7 @@ impl SoulseekDownloadService {
     }
 
     fn routing_for(&self, external_id: &str) -> Option<SharedRouting> {
-        self.id_registry.lookup(external_id).or_else(|| {
-            SoulseekMetadataService::try_decode_external_id(Some(external_id)).map(|mut routing| {
-                self.id_registry.apply_refusals(&mut routing);
-                SharedRouting::new(routing)
-            })
-        })
+        self.id_registry.resolve_song(external_id, false)
     }
 
     // =========================================================================
@@ -279,9 +278,10 @@ impl SoulseekDownloadService {
     // =========================================================================
 
     /// A file a Lidarr heart brought in, taken into a job folder and held to the checks a Soulseek
-    /// download meets. AcoustID naming another recording, or a live take nobody asked for, throws
-    /// the file away: Lidarr has no second copy, so the heart's next source tries instead. A
-    /// FLAC made from an MP3 is kept and marked, as Soulseek keeps its last resort.
+    /// download meets (a heart's or a play's by each asker's own gate). A file they refuse is
+    /// thrown away, or given back to its album's hold folder when it waits there as a track of the
+    /// album: Lidarr has no second copy, so the heart's next source tries instead. A FLAC made
+    /// from an MP3 is kept and marked, as Soulseek keeps its last resort.
     async fn adopt_lidarr_import(
         &self,
         base: &BaseDownloadService,
@@ -317,88 +317,144 @@ impl SoulseekDownloadService {
             &base.download_path(),
         );
 
-        let song = &mut download.song;
-        let verdict = self.check_lidarr_file(base, routing, song, &local).await?;
-        verdict.apply_tags_to(song);
-        song.verification = Some(Box::new(verdict));
+        let refused_to = import.refused_to.clone();
+        let verdict = match import.filed {
+            // Filed among a hearted album's tracks by its own sound already: it is this track,
+            // proven by its clear reading for everyone whose album gate it was filed by.
+            Some(filed) => {
+                for gate in &download.gates {
+                    download.ledger.record(
+                        &gate.user,
+                        gate.origin,
+                        crate::services::common::GateOutcome::Accepted,
+                    );
+                    download.ledger.record_accepted(
+                        &gate.user,
+                        gate.origin,
+                        octo_core::fingerprint::heart_gate::Acceptance::Sound,
+                    );
+                }
+                self.mark_transcode(routing, download, &local).await;
+                *filed
+            }
+            None => {
+                self.check_lidarr_file(
+                    base,
+                    routing,
+                    download,
+                    &local,
+                    import.labels,
+                    refused_to.as_deref(),
+                )
+                .await?
+            }
+        };
+        verdict.apply_tags_to(&mut download.song);
+        download.song.verification = Some(Box::new(verdict));
         info!("Took Lidarr's import of '{artist} - {title}' into the pipeline: {local}");
         Ok(local)
     }
 
     /// The checks every file Lidarr hands over meets, whether it was imported ahead of time or
-    /// fetched for this download: AcoustID, then the song's YouTube preview, then the lossless
-    /// spectrum check, which marks a transcode on the song. A file either check refuses is removed
-    /// and an `Err` returned; otherwise the verdict to keep comes back, for the caller to tag the
-    /// song with and record.
+    /// fetched for this download, the same as Soulseek's and Mornye's files: a heart's or a play's
+    /// file (and a replacement of a file a heart kept) is judged by each asker's own gate, never by
+    /// the shipped checks or the song's YouTube preview, each acceptance recorded for its person;
+    /// every other origin keeps the shipped checks, with the import rule's refusals when its R is
+    /// known, a Wrong song or Wrong version replacement refused by its original's sound, a Find
+    /// songs pick's own Busy line, and every joiner judged by their own gate. The file's labels are
+    /// read from `labels`, never from Lidarr's own matching. Then the lossless spectrum check,
+    /// which marks a transcode on the song. A file the checks refuse is removed (or moved back to
+    /// `refused_to`) and an `Err` returned; one that waits is in the one hold path and its hold is
+    /// the `Err`; otherwise the verdict to keep comes back, for the caller to tag the song with and
+    /// record.
     async fn check_lidarr_file(
         &self,
         base: &BaseDownloadService,
         routing: &SoulseekRouting,
-        song: &mut Song,
+        download: &mut TrackDownload,
         local: &str,
+        labels: LabelSource,
+        refused_to: Option<&str>,
     ) -> anyhow::Result<VerificationResult> {
         let (artist, title) = names(routing);
         if let (Some(provider), Some(id)) = (
-            song.external_provider.clone().filter(|p| !p.is_empty()),
-            song.external_id.clone().filter(|i| !i.is_empty()),
+            download.song.external_provider.clone().filter(|p| !p.is_empty()),
+            download.song.external_id.clone().filter(|i| !i.is_empty()),
         ) {
             base.track(|t| t.stage(&provider, &id, AcquisitionState::Verifying, Some("Lidarr"), None));
         }
-        let verdict = self
-            .verification
-            .verify(
-                local,
-                routing.artist.as_deref(),
-                routing.title.as_deref(),
-                song.isrc.as_deref().or(routing.isrc.as_deref()),
-                &self.verification.takes_for_routing(routing),
-            )
-            .await;
-        if verdict.verdict == VerificationVerdict::Mismatch {
-            warn!(
-                "Lidarr brought {} for '{artist} - {title}' (AcoustID score {}); discarding it",
-                verdict.describe(),
-                percent(verdict.score)
-            );
-            base.log_song_step_heard(
-                song,
-                acquisition_event_kinds::CHECK,
-                &mismatch_text(&verdict),
-                Some("Not the song asked for; thrown away"),
-                verdict.heard(),
-            );
-            // Swept with the job folders when it cannot be removed now.
-            let _ = std::fs::remove_file(local);
-            return Err(file_not_found(format!(
-                "AcoustID identified Lidarr's file as {}",
-                verdict.describe()
-            )));
-        }
         let length_known = routing.duration.is_some_and(|s| s > 0)
             && TagFile::open(local).is_ok_and(|file| file.duration_seconds() > 0);
-        let track_key = song.external_id.clone().unwrap_or_default();
-        let verdict = match self
-            .refused_by_preview(base, routing, &track_key, local, verdict, length_known)
-            .await
-        {
-            PreviewSays::Keep(kept) => kept,
-            PreviewSays::Refuse(reason) => {
-                // Swept with the job folders when it cannot be removed now.
+        let judged = self
+            .judge_file_labeled(base, routing, download, local, None, length_known, labels.clone())
+            .await;
+        let verdict = match judged {
+            FileJudged::Keep(verdict) => verdict,
+            FileJudged::Hold(mut held) => {
+                info!("Lidarr's file for '{artist} - {title}' waits: {}", held.line);
+                // The hold carries the labels beside the file, so wherever it is judged again it
+                // is by the same labels, and they end with the hold.
+                held.lidarr = held
+                    .files
+                    .iter()
+                    .map(|file| HeldLidarrFile::of(file, &labels))
+                    .collect();
+                return Err(held.into());
+            }
+            FileJudged::NotProven(why) => {
+                info!("Lidarr's file for the play of '{artist} - {title}' is not kept: {why}");
                 let _ = std::fs::remove_file(local);
+                return Err(not_proven());
+            }
+            FileJudged::Refuse {
+                reason,
+                shared,
+                verdict,
+                ..
+            } => {
+                give_back_or_remove(local, refused_to);
+                if shared && verdict.verdict == VerificationVerdict::Mismatch {
+                    warn!(
+                        "Lidarr brought {} for '{artist} - {title}' (AcoustID score {}); discarding it",
+                        verdict.describe(),
+                        percent(verdict.score)
+                    );
+                    base.log_song_step_heard(
+                        &download.song,
+                        acquisition_event_kinds::CHECK,
+                        &mismatch_text(&verdict),
+                        Some("Not the song asked for; thrown away"),
+                        verdict.heard(),
+                    );
+                    return Err(file_not_found(format!(
+                        "AcoustID identified Lidarr's file as {}",
+                        verdict.describe()
+                    )));
+                }
                 return Err(file_not_found(format!(
                     "Lidarr's file for '{artist} - {title}' {reason}"
                 )));
             }
         };
-        if let Some(said) = verdict.acoust_id_text() {
+        if !gated(download)
+            && let Some(said) = verdict.acoust_id_text()
+        {
             base.log_song_step_heard(
-                song,
+                &download.song,
                 acquisition_event_kinds::CHECK,
                 "Checked the recording",
                 Some(&sentence(&said)),
                 verdict.heard(),
             );
         }
+        self.mark_transcode(routing, download, local).await;
+        Ok(verdict)
+    }
+
+    /// The lossless spectrum check on a Lidarr file its checks keep: a FLAC made from lossy audio
+    /// is kept, marked as a transcode.
+    async fn mark_transcode(&self, routing: &SoulseekRouting, download: &mut TrackDownload, local: &str) {
+        let (artist, title) = names(routing);
         let spectrum = self
             .verification
             .check_lossless(local, routing.artist.as_deref(), routing.title.as_deref())
@@ -408,9 +464,8 @@ impl SoulseekDownloadService {
                 "Lidarr's copy of '{artist} - {title}' is {}; keeping it, marked as a transcode",
                 spectrum.describe()
             );
-            song.transcoded_from = spectrum.estimate.clone();
+            download.song.transcoded_from = spectrum.estimate.clone();
         }
-        Ok(verdict)
     }
 
     /// One song through Lidarr, copied into a job folder under the incoming dot folder, which no
@@ -464,7 +519,15 @@ impl SoulseekDownloadService {
         let picked = taken.and_then(|pick| pick.release());
         let base_arc = base.arc();
         let step_id = external_id.clone();
-        let request = LidarrTrackRequest {
+        // A kept file's own gate names the recording it is: the album is the walk's pick for it
+        // when its tags and its album name find none, and the search is pinned to a carrier of it.
+        let recordings: Vec<String> = download
+            .gates
+            .iter()
+            .find_map(|gate| gate.r.as_ref().filter(|r| !r.ids.is_empty()))
+            .map(|r| r.ids.clone())
+            .unwrap_or_default();
+        let mut request = LidarrTrackRequest {
             artist: routing.artist.clone().unwrap_or_default(),
             title: routing.title.clone().unwrap_or_default(),
             album: routing.album.clone(),
@@ -475,9 +538,21 @@ impl SoulseekDownloadService {
             step: Some(LidarrStep::new(move |text, detail| {
                 base_arc.log_step(&step_id, acquisition_event_kinds::TRY, text, detail)
             })),
+            song: song
+                .external_provider
+                .as_deref()
+                .filter(|provider| !provider.is_empty() && !external_id.is_empty())
+                .map(|provider| format!("{provider}:{external_id}")),
+            recordings,
         };
+        // Otherwise a Better quality (taken anyway too) aims at what the original is. A Wrong
+        // song or a Wrong version never does: its original is the recording the person rejected.
+        if request.recordings.is_empty() && download.upgrade_search {
+            request.recordings = fetcher.original_recordings(&request).await;
+        }
         download.fetched_from = Some("Lidarr".to_string());
-        let path = fetcher.fetch(&request, &job_dir, ct).await?;
+        let fetched = fetcher.fetch(&request, &job_dir, ct).await?;
+        let path = fetched.path;
         let (quality, _) = AudioSummary::describe(Some(&path));
         base.log_step(
             &external_id,
@@ -485,10 +560,13 @@ impl SoulseekDownloadService {
             "Lidarr brought a copy",
             quality.as_deref(),
         );
-        let song = &mut download.song;
-        let verdict = self.check_lidarr_file(base, routing, song, &path).await?;
-        verdict.apply_tags_to(song);
-        song.verification = Some(Box::new(verdict));
+        // Lidarr's import is never a label: the file's own labels are read from the download as
+        // delivered, or from the file itself only when Lidarr writes no tags.
+        let verdict = self
+            .check_lidarr_file(base, routing, download, &path, fetched.labels, None)
+            .await?;
+        verdict.apply_tags_to(&mut download.song);
+        download.song.verification = Some(Box::new(verdict));
         Ok(path)
     }
 
@@ -543,6 +621,28 @@ impl SoulseekDownloadService {
         let incoming = combine(&download_path, INCOMING_FOLDER_NAME);
         sweep_incoming(&incoming);
 
+        // A heart's or a play's own heard video first: the very stream that played, kept as it is.
+        if gated(download) {
+            match self.heard_stream_copy(base, &first, download, &incoming).await {
+                Some(Ok(path)) => return Ok(path),
+                Some(Err(e)) => return Err(e),
+                None => {}
+            }
+            // Nothing proves which recording played: only the heard audio itself or its very master
+            // may be kept, and YouTube's copies are transcodes of neither.
+            if only_heard_or_master(download) {
+                base.log_step(
+                    &track_key,
+                    acquisition_event_kinds::NOTE,
+                    "YouTube's copies are not tried",
+                    Some("Only the audio you heard itself, or its very master, can be kept for this song"),
+                );
+                return Err(file_not_found(format!(
+                    "Only the audio heard or its master can be kept for '{artist} - {title}'; YouTube's copies are not tried"
+                )));
+            }
+        }
+
         /// How many videos one download tries before it gives up.
         const MAX_VIDEOS: usize = 3;
         // Every video this download used, so none is downloaded twice.
@@ -550,7 +650,20 @@ impl SoulseekDownloadService {
         let mut last_refusal: Option<String> = None;
         for pass in 0..MAX_VIDEOS {
             let r = routing.snapshot();
-            let skip: Vec<String> = r.refused_videos.iter().chain(tried.iter()).cloned().collect();
+            // A video a heart's or a play's gate refused for this version is not tried for it.
+            let refused_here: Vec<String> = r
+                .you_tube_id
+                .iter()
+                .filter(|video| self.denied_for_gates(download, YOUTUBE_PEER, video))
+                .cloned()
+                .collect();
+            let skip: Vec<String> = r
+                .refused_videos
+                .iter()
+                .chain(tried.iter())
+                .chain(refused_here.iter())
+                .cloned()
+                .collect();
             let mut video_id = r
                 .you_tube_id
                 .clone()
@@ -624,9 +737,15 @@ impl SoulseekDownloadService {
             })
             .await?;
             let Some(path) = path.filter(|p| !p.is_empty() && file_exists(p)) else {
-                return Err(file_not_found(format!(
-                    "YouTube MP3 download failed for '{artist} - {title}'"
-                )));
+                // One video the shim could not save is no reason to give up: the next is tried.
+                warn!(
+                    "YouTube MP3 download failed for video {video_id} of '{artist} - {title}'; trying the next video"
+                );
+                last_refusal = Some(format!("YouTube MP3 download failed for '{artist} - {title}'"));
+                if ct.is_cancelled() {
+                    return Err(OperationCanceled.into());
+                }
+                continue;
             };
 
             info!("YouTube MP3 download complete: {path}");
@@ -636,17 +755,100 @@ impl SoulseekDownloadService {
             // disagreement is kept and asked about in Review.
             base.track(|t| t.stage(&provider, &track_key, AcquisitionState::Verifying, None, None));
             let takes = self.verification.takes_for_routing(&r);
-            let song = &mut download.song;
-            let mut verdict = self
-                .verification
-                .verify(
+            if gated(download) {
+                let length_known = r.duration.is_some_and(|s| s > 0);
+                match self
+                    .judge_file(base, &r, download, &path, None, length_known)
+                    .await
+                {
+                    FileJudged::Keep(verdict) => {
+                        verdict.apply_tags_to(&mut download.song);
+                        download.song.verification = Some(Box::new(verdict));
+                        download.fetched_video = Some(video_id.clone());
+                        return Ok(path);
+                    }
+                    FileJudged::Hold(held) => return Err(held.into()),
+                    FileJudged::NotProven(_) => {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(not_proven());
+                    }
+                    FileJudged::Refuse {
+                        reason,
+                        verdict,
+                        refused,
+                        ..
+                    } => {
+                        let _ = std::fs::remove_file(&path);
+                        if !refused.is_empty()
+                            && names_another_recording(&verdict, &artist, &title, r.duration, &takes)
+                        {
+                            // Another recording altogether: refused for the song, as for any download.
+                            routing.lock().refuse_video(&video_id);
+                            self.id_registry.refuse_video(&track_key, &video_id);
+                            self.id_registry.refuse_song_video(&artist, &title, &video_id);
+                        } else {
+                            self.deny_for_gates(download, &refused, YOUTUBE_PEER, &video_id, &reason);
+                        }
+                        last_refusal = Some(format!("YouTube's video for '{artist} - {title}' {reason}"));
+                        if ct.is_cancelled() {
+                            return Err(OperationCanceled.into());
+                        }
+                        continue;
+                    }
+                }
+            }
+            // The shipped checks, on the origin's class: an import's or a replacement's only when
+            // its bulk turn is free at once, else its file waits for it in the one hold path.
+            let isrc = download.song.isrc.clone().or(r.isrc.clone());
+            let class = download
+                .origin
+                .map_or_else(AcoustIdRateLimiter::class_now, LookupClass::for_origin);
+            let asked = AcoustIdRateLimiter::with_class(
+                class,
+                self.verification.verify(
                     &path,
                     r.artist.as_deref(),
                     r.title.as_deref(),
-                    song.isrc.as_deref().or(r.isrc.as_deref()),
+                    isrc.as_deref(),
                     &takes,
-                )
-                .await;
+                ),
+            );
+            let (mut verdict, turned_away) = if class == LookupClass::Bulk && download.origin.is_some() {
+                AcoustIdRateLimiter::if_free(asked).await
+            } else {
+                (asked.await, false)
+            };
+            if turned_away && let Some(moved) = move_to_hold(base, &download.song, &path) {
+                return Err(AcquisitionHeld {
+                    waiting_for: octo_core::fingerprint::heart_gate::WaitingFor::AcoustId,
+                    line: "Waiting for AcoustID".to_string(),
+                    files: vec![moved],
+                    lidarr: Vec::new(),
+                    users: Vec::new(),
+                }
+                .into());
+            }
+            if verdict.verdict != VerificationVerdict::Mismatch
+                && self.import_refuses(base, download, &path, &mut verdict, &LabelSource::TheFile)
+            {
+                let _ = std::fs::remove_file(&path);
+                last_refusal = Some(format!(
+                    "AcoustID's reading names another recording than '{artist} - {title}' for YouTube's video"
+                ));
+                if ct.is_cancelled() {
+                    return Err(OperationCanceled.into());
+                }
+                continue;
+            }
+            if let Some(why) = self.denied_by_sound(base, download, &verdict) {
+                let _ = std::fs::remove_file(&path);
+                last_refusal = Some(format!("YouTube's video for '{artist} - {title}' {why}"));
+                if ct.is_cancelled() {
+                    return Err(OperationCanceled.into());
+                }
+                continue;
+            }
+            let song = &mut download.song;
             if verdict.verdict == VerificationVerdict::Mismatch {
                 if verdict.r#match.is_none() && verdict.matched_title.as_deref().is_none_or(str::is_empty) {
                     // No decodable audio at all: a broken file, not a question.
@@ -729,6 +931,9 @@ impl SoulseekDownloadService {
                 verdict.apply_tags_to(song);
             }
             song.verification = Some(Box::new(verdict));
+            download.fetched_video = Some(video_id.clone());
+            self.judge_joiners(download, &path, None, LabelSource::TheFile)
+                .await;
             return Ok(path);
         }
         Err(file_not_found(last_refusal.unwrap_or_else(|| {
@@ -744,8 +949,11 @@ impl SoulseekDownloadService {
     /// reason, for the deny list) when the file is thrown away, Keep(the verdict it is judged by)
     /// otherwise. A lone link a believed preview backs is kept as a confirmation.
     /// `length_known`: the file's length and the song's were both read, so the length check
-    /// before this one had something to compare.
-    pub(crate) async fn refused_by_preview(
+    /// before this one had something to compare. `background`: the preview is fetched in the
+    /// shim's background lane, for work nobody waits on (an import's or a replacement's file), so
+    /// it never goes ahead of a heart's or a play's fetch.
+    #[allow(clippy::too_many_arguments)] // the preview check's inputs and its lane
+    pub(crate) async fn refused_by_preview_on(
         &self,
         base: &BaseDownloadService,
         routing: &SoulseekRouting,
@@ -753,6 +961,7 @@ impl SoulseekDownloadService {
         path: &str,
         verdict: VerificationResult,
         length_known: bool,
+        background: bool,
     ) -> PreviewSays {
         let (artist, title) = names(routing);
         let request = PreviewRequest {
@@ -770,7 +979,7 @@ impl SoulseekDownloadService {
                 }))
                 .filter(|s| *s > 0),
             video_id: routing.you_tube_id.as_deref(),
-            background: false,
+            background,
         };
         let outcome = self
             .verification
@@ -813,7 +1022,7 @@ impl SoulseekDownloadService {
                 base.log_step(
                     track_key,
                     acquisition_event_kinds::CHECK,
-                    "Sounds like its YouTube preview",
+                    "Sounds like its YouTube stream",
                     None,
                 );
                 if trusted {
@@ -831,7 +1040,7 @@ impl SoulseekDownloadService {
                     track_key,
                     acquisition_event_kinds::CHECK,
                     "Did not sound like the song",
-                    Some("Nothing in it sounds like the song's YouTube preview; thrown away"),
+                    Some("Nothing in it sounds like the song's YouTube stream; thrown away"),
                 );
                 PreviewSays::Refuse("did not sound like the song".to_string())
             }
@@ -1470,14 +1679,23 @@ impl SoulseekDownloadService {
         // delivers, never a reason to fail the song or fall back to YouTube.
         let mut reserve: Option<TranscodedReserve> = None;
 
-        let isrc = download.song.isrc.clone().or(routing.isrc.clone());
-        let takes = self.verification.takes_for_routing(routing);
-
         // Every peer tried, across the album folder's copy and the search after it.
         let mut tried = 0;
+        // A heart's or a play's open heard-master rounds, paused while a peer keeps the download
+        // in its queue.
+        let rounds = gated(download).then(|| (download.acquisition_key.clone(), download.gates.clone()));
         loop {
             for (index, hit) in ranked.iter().enumerate() {
                 let attempt_idx = index + 1;
+                // A file a heart's or play's gate refused before for this same version is not
+                // fetched again for it; it still serves imports and other people's hearts.
+                if self.denied_for_gates(download, &hit.username, &hit.filename) {
+                    info!(
+                        "Soulseek attempt {attempt_idx}: {} -> {} was refused for this version before; skipping",
+                        hit.username, hit.filename
+                    );
+                    continue;
+                }
                 tried += 1;
                 info!(
                     "Soulseek attempt {attempt_idx}/{}: {} -> {} (queue={}, speed={})",
@@ -1631,6 +1849,10 @@ impl SoulseekDownloadService {
                                 Some(&words),
                             )
                         });
+                        // A wait on a peer's queue never keeps a heard copy or its place.
+                        if let Some((key, gates)) = &rounds {
+                            self.verification.pause_rounds(key, gates);
+                        }
                     }
                     if p.is_moving() {
                         moved.store(true, Ordering::Relaxed);
@@ -1771,107 +1993,116 @@ impl SoulseekDownloadService {
                     //
                     // Second on purpose. The check above reads a header; this one spawns a
                     // process and makes a network call, and neither is worth spending on a file
-                    // already known to be wrong.
-                    let mut verdict = self
-                        .verification
-                        .verify(
-                            &local_path,
-                            routing.artist.as_deref(),
-                            routing.title.as_deref(),
-                            isrc.as_deref(),
-                            &takes,
-                        )
+                    // already known to be wrong. A heart's or a play's file is judged by each
+                    // asker's own gate; every other download keeps the shipped checks (AcoustID,
+                    // then the song's YouTube preview when AcoustID has never heard the sound).
+                    let length_known = routing.duration.is_some_and(|s| s > 0) && actual_secs > 0;
+                    let mut judged = self
+                        .judge_file(base, routing, download, &local_path, None, length_known)
                         .await;
-                    // fpcalc reports a file that is not there as undecodable audio, which is a Mismatch.
-                    // If the file moved during the check, find it and ask again instead of blaming the
-                    // peer for slskd's own move.
-                    if verdict.verdict == VerificationVerdict::Mismatch
+                    // fpcalc reports a file that is not there as undecodable audio. If the file
+                    // moved during the check, find it and ask again instead of blaming the peer for
+                    // slskd's own move.
+                    if matches!(judged, FileJudged::Refuse { .. })
                         && !file_exists(&local_path)
                         && let Some(moved_to) = find_own_file()
                     {
                         local_path = moved_to;
-                        verdict = self
-                            .verification
-                            .verify(
-                                &local_path,
-                                routing.artist.as_deref(),
-                                routing.title.as_deref(),
-                                isrc.as_deref(),
-                                &takes,
-                            )
+                        judged = self
+                            .judge_file(base, routing, download, &local_path, None, length_known)
                             .await;
                     }
-                    if verdict.verdict == VerificationVerdict::Mismatch && file_exists(&local_path) {
-                        let file_ms = TagFile::open(&local_path)
-                            .ok()
-                            .map(|file| file.duration().as_millis() as i64);
-                        verdict = DownloadVerificationService::settle_stray_link(
-                            verdict,
-                            routing.title.as_deref().unwrap_or(""),
-                            routing.duration,
-                            file_ms,
-                        );
-                    }
-                    if verdict.verdict == VerificationVerdict::Mismatch {
-                        if !file_exists(&local_path) {
-                            // Nothing was judged, so nothing is held against the peer: a deny-list entry
-                            // lasts weeks and this one would be wrong.
-                            warn!(
-                                "Soulseek attempt {attempt_idx}: {local_path} disappeared while it was being identified; \
-                                 advancing without blaming {}",
-                                hit.username
+                    let verdict = match judged {
+                        FileJudged::Keep(verdict) => verdict,
+                        FileJudged::Hold(held) => {
+                            info!(
+                                "Soulseek attempt {attempt_idx} for '{artist} - {title}' waits: {}",
+                                held.line
                             );
-                            last_error =
-                                Some("the downloaded file disappeared while it was being identified".into());
-                            // Like the held-back copy: with the caller gone, no other peer is tried.
-                            if caller_gave_up {
-                                break;
+                            if let Some(kept) = &reserve {
+                                discard_rejected_download(&kept.path, kept.started_utc);
                             }
-                            continue;
+                            return Err(held.into());
                         }
-                        warn!(
-                            "Soulseek attempt {attempt_idx} delivered {} for a request of '{artist} - {title}' \
-                             (AcoustID score {}); discarding, remembering the peer and advancing",
-                            verdict.describe(),
-                            percent(verdict.score)
-                        );
-                        discard_rejected_download(&local_path, attempt_started_utc);
-                        self.deny_candidate(hit, routing, &verdict.deny_reason);
-                        base.log_step_heard(
-                            &track_key,
-                            acquisition_event_kinds::CHECK,
-                            &mismatch_text(&verdict),
-                            Some(
-                                if verdict.kind.is_some_and(|kind| kind != RecordingKind::Studio) {
-                                    "Not the take asked for; thrown away"
-                                } else {
-                                    "Not the song asked for; thrown away"
-                                },
-                            ),
-                            verdict.heard(),
-                        );
-                        let identified = format!("AcoustID identified the file as {}", verdict.describe());
-                        if !verdict.deny_reason.is_empty() {
-                            last_refusal = Some((identified.clone(), verdict.deny_reason.clone()));
-                        }
-                        last_error = Some(identified);
-                        continue;
-                    }
-
-                    // AcoustID has never heard this sound, or no length stood behind the file:
-                    // the song's YouTube preview is asked instead, and a clear no is a failed check.
-                    let length_known = routing.duration.is_some_and(|s| s > 0) && actual_secs > 0;
-                    verdict = match self
-                        .refused_by_preview(base, routing, &track_key, &local_path, verdict, length_known)
-                        .await
-                    {
-                        PreviewSays::Keep(kept) => kept,
-                        PreviewSays::Refuse(reason) => {
+                        FileJudged::NotProven(why) => {
+                            info!(
+                                "Soulseek attempt {attempt_idx} for the play of '{artist} - {title}' is not kept: {why}"
+                            );
                             discard_rejected_download(&local_path, attempt_started_utc);
-                            self.deny_candidate(hit, routing, &reason);
-                            let refused = format!("the file {reason}");
-                            last_refusal = Some((refused.clone(), reason));
-                            last_error = Some(refused);
+                            if let Some(kept) = &reserve {
+                                discard_rejected_download(&kept.path, kept.started_utc);
+                            }
+                            return Err(not_proven());
+                        }
+                        FileJudged::Refuse {
+                            reason,
+                            shared,
+                            verdict,
+                            refused,
+                        } => {
+                            if !file_exists(&local_path) {
+                                // Nothing was judged, so nothing is held against the peer: a
+                                // deny-list entry lasts weeks and this one would be wrong.
+                                warn!(
+                                    "Soulseek attempt {attempt_idx}: {local_path} disappeared while it was being identified; \
+                                     advancing without blaming {}",
+                                    hit.username
+                                );
+                                last_error = Some(
+                                    "the downloaded file disappeared while it was being identified".into(),
+                                );
+                                // Like the held-back copy: with the caller gone, no other peer is tried.
+                                if caller_gave_up {
+                                    break;
+                                }
+                                continue;
+                            }
+                            discard_rejected_download(&local_path, attempt_started_utc);
+                            if shared {
+                                self.deny_candidate(hit, routing, &reason);
+                            } else {
+                                self.deny_for_gates(
+                                    download,
+                                    &refused,
+                                    &hit.username,
+                                    &hit.filename,
+                                    &reason,
+                                );
+                            }
+                            if shared && verdict.verdict == VerificationVerdict::Mismatch {
+                                warn!(
+                                    "Soulseek attempt {attempt_idx} delivered {} for a request of '{artist} - {title}' \
+                                     (AcoustID score {}); discarding, remembering the peer and advancing",
+                                    verdict.describe(),
+                                    percent(verdict.score)
+                                );
+                                base.log_step_heard(
+                                    &track_key,
+                                    acquisition_event_kinds::CHECK,
+                                    &mismatch_text(&verdict),
+                                    Some(
+                                        if verdict.kind.is_some_and(|kind| kind != RecordingKind::Studio) {
+                                            "Not the take asked for; thrown away"
+                                        } else {
+                                            "Not the song asked for; thrown away"
+                                        },
+                                    ),
+                                    verdict.heard(),
+                                );
+                                let identified =
+                                    format!("AcoustID identified the file as {}", verdict.describe());
+                                if !verdict.deny_reason.is_empty() {
+                                    last_refusal = Some((identified.clone(), verdict.deny_reason.clone()));
+                                }
+                                last_error = Some(identified);
+                            } else {
+                                warn!(
+                                    "Soulseek attempt {attempt_idx} for '{artist} - {title}' is not kept: {reason}; advancing"
+                                );
+                                let refused = format!("the file {reason}");
+                                last_refusal = Some((refused.clone(), reason));
+                                last_error = Some(refused);
+                            }
                             continue;
                         }
                     };
@@ -2311,15 +2542,18 @@ impl SoulseekDownloadService {
 
     /// What take a file already in the library is, by its audio: the studio take, a live take,
     /// an instrumental. None when fingerprinting is off or nothing was decided. A link to the song
-    /// one person's submissions make still says which take the file is.
+    /// one person's submissions make still says which take the file is. Its lookup is work nobody
+    /// waits on, so it never goes ahead of a heart's.
     pub async fn take_of_file(&self, path: &str, artist: &str, title: &str) -> Option<RecordingKind> {
         if !self.verification.is_fingerprinting_enabled() {
             return None;
         }
-        let verdict = self
-            .verification
-            .verify_in_background(path, Some(artist), Some(title))
-            .await;
+        let verdict = AcoustIdRateLimiter::with_class(
+            LookupClass::Bulk,
+            self.verification
+                .verify_in_background(path, Some(artist), Some(title)),
+        )
+        .await;
         take_of(&verdict)
     }
 
@@ -2336,6 +2570,176 @@ impl SoulseekDownloadService {
     /// The Soulseek settings the downloads run with.
     pub fn soulseek_settings(&self) -> &SoulseekSettings {
         &self.settings
+    }
+}
+
+impl SoulseekDownloadService {
+    /// A play judged inside its own acquisition (Wait for lossless) gets its own gate when the
+    /// download has none for its asker yet, whatever gates of others' joined it: built from what
+    /// they heard of the song, which is held under a run of its own from before the gate is built
+    /// (the returned hold, kept until the download returns) so no sweep or cap takes it meanwhile.
+    /// False when nothing at all can prove a copy for the download: no gate could be built for the
+    /// play and it carries no other.
+    pub(crate) async fn own_play_gate(
+        &self,
+        download: &mut TrackDownload,
+    ) -> (bool, Option<crate::services::prefetch::heard_samples::RunHold>) {
+        use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
+        if download.origin != Some(AcquisitionOrigin::Play) || !self.verification.heart_ready() {
+            return (true, None);
+        }
+        let user = download.requested_by.first().cloned().unwrap_or_default();
+        let has_own = download.gates.iter().any(|gate| {
+            gate.origin == AcquisitionOrigin::Play
+                && octo_core::common::dotnet::eq_ignore_case(gate.user.trim(), user.trim())
+        });
+        if has_own {
+            return (true, None);
+        }
+        let external_id = download.track_id.clone();
+        let heard = Some(user.trim())
+            .filter(|user| !user.is_empty())
+            .and_then(|user| self.id_registry.heard_by(&external_id, user));
+        let held = match (&heard, self.verification.heard_samples()) {
+            (Some(record), Some(samples)) => {
+                let song = crate::services::common::HeldAcquisition {
+                    kind: crate::services::common::HeldKind::Track,
+                    provider: self.provider_name().to_string(),
+                    external_id: external_id.clone(),
+                    ..Default::default()
+                };
+                samples.hold_for_run(&song.base_key(), &[(user.trim(), record)], true)
+            }
+            _ => None,
+        };
+        let built = self
+            .verification
+            .build_heart_gate(
+                self.provider_name(),
+                &external_id,
+                &user,
+                AcquisitionOrigin::Play,
+                heard,
+                &mut Default::default(),
+            )
+            .await;
+        match built {
+            crate::services::fingerprint::download_verification_service::GateBuild::Ready(gate)
+                if gate.r.as_ref().is_some_and(|r| !r.ids.is_empty()) =>
+            {
+                download.gates.push(gate);
+                (true, held)
+            }
+            _ => (!download.gates.is_empty(), held),
+        }
+    }
+
+    /// The first of a resumed hold's files that is still there and passes the checks a fresh
+    /// download's file meets (a heart's or a play's by its askers' own gates); each one that fails
+    /// is thrown away. A file Lidarr brought meets the check every Lidarr file meets, its labels
+    /// read as the hold carried them from delivery, never from the tags Lidarr wrote. None when
+    /// none is left; an error when one holds again, still in the hold path with the labels of the
+    /// files waiting with it, or when Lidarr's own check refused the file of a download from
+    /// Lidarr, which is the end of that download as it is in time.
+    async fn take_held_file(
+        &self,
+        base: &BaseDownloadService,
+        routing: &SoulseekRouting,
+        download: &mut TrackDownload,
+    ) -> anyhow::Result<Option<String>> {
+        let held = std::mem::take(&mut download.held_files);
+        let lidarr = std::mem::take(&mut download.held_lidarr);
+        if held.is_empty() {
+            return Ok(None);
+        }
+        // The files that wait on with a hold, with the labels of those Lidarr brought.
+        let waiting_on = |mut again: AcquisitionHeld, rest: Vec<String>| {
+            again
+                .lidarr
+                .extend(lidarr.iter().filter(|file| rest.contains(&file.path)).cloned());
+            again.files.extend(rest);
+            again
+        };
+        let length_known = routing.duration.is_some_and(|s| s > 0);
+        let mut refused_by_lidarr = None;
+        let mut left = held.into_iter().filter(|file| file_exists(file));
+        // Other people of the hold judge the same files on their own requests: a file this download
+        // does not take stays held for them.
+        let for_others = download.held_for_others;
+        let let_go = |rest: &mut dyn Iterator<Item = String>| {
+            if !for_others {
+                for other in rest {
+                    let _ = std::fs::remove_file(&other);
+                }
+            }
+        };
+        while let Some(file) = left.next() {
+            if let Some(brought) = lidarr.iter().find(|known| known.path == file) {
+                let refused_to = for_others.then_some(file.as_str());
+                match self
+                    .check_lidarr_file(base, routing, download, &file, brought.labels(), refused_to)
+                    .await
+                {
+                    Ok(verdict) => {
+                        info!("Resumed with Lidarr's held file: {file}");
+                        download.fetched_from = Some("Lidarr".to_string());
+                        verdict.apply_tags_to(&mut download.song);
+                        download.song.verification = Some(Box::new(verdict));
+                        let_go(&mut left);
+                        return Ok(Some(file));
+                    }
+                    Err(e) => match e.downcast::<AcquisitionHeld>() {
+                        Ok(again) => return Err(waiting_on(again, left.collect()).into()),
+                        Err(e) => {
+                            info!(
+                                "Lidarr's held file of '{}' failed its checks again ({e}); thrown away: {file}",
+                                download.song.title
+                            );
+                            refused_by_lidarr = Some(e);
+                            continue;
+                        }
+                    },
+                }
+            }
+            match self
+                .judge_file(base, routing, download, &file, None, length_known)
+                .await
+            {
+                FileJudged::Keep(verdict) => {
+                    info!("Resumed with its held file: {file}");
+                    verdict.apply_tags_to(&mut download.song);
+                    download.song.verification = Some(Box::new(verdict));
+                    let_go(&mut left);
+                    return Ok(Some(file));
+                }
+                FileJudged::Hold(again) => {
+                    // Still waiting: the rest wait with it.
+                    return Err(waiting_on(again, left.collect()).into());
+                }
+                // Other people of the hold judge the same file on their own requests: it stays
+                // held for them, and goes with the hold.
+                FileJudged::NotProven(_) | FileJudged::Refuse { .. } if download.held_for_others => {
+                    info!(
+                        "A held file of '{}' is not this download's; it stays held for the others: {file}",
+                        download.song.title
+                    );
+                }
+                FileJudged::NotProven(_) | FileJudged::Refuse { .. } => {
+                    info!(
+                        "A held file of '{}' failed its checks again; thrown away: {file}",
+                        download.song.title
+                    );
+                    let _ = std::fs::remove_file(&file);
+                }
+            }
+        }
+        // Lidarr is not searched again for a download its own copy failed.
+        if download.source_override == Some(DownloadSource::Lidarr)
+            && let Some(refused) = refused_by_lidarr
+        {
+            return Err(refused);
+        }
+        Ok(None)
     }
 }
 
@@ -2557,6 +2961,15 @@ impl DownloadBackend for SoulseekDownloadService {
             copies.start(&video_id, total);
         }
 
+        // The format is the pinned video's, when the song is pinned to the video that played.
+        let itag = {
+            let now = routing.snapshot();
+            now.you_tube_id
+                .as_deref()
+                .filter(|pinned| *pinned == video_id)
+                .and(now.stream_itag.as_deref())
+                .and_then(|itag| itag.trim().parse::<u32>().ok())
+        };
         // The response owns the shim's connection: dropping the stream closes it.
         Ok(Some(DirectStreamInfo {
             audio_stream: Box::pin(opened.response.bytes_stream().map_err(std::io::Error::other)),
@@ -2565,7 +2978,39 @@ impl DownloadBackend for SoulseekDownloadService {
             quality: Some("youtube-m4a".to_string()),
             status_code: opened.status_code,
             content_range: opened.content_range,
+            video_id: Some(video_id),
+            itag,
         }))
+    }
+
+    async fn judge_ahead(
+        &self,
+        _base: &BaseDownloadService,
+        download: &mut TrackDownload,
+        path: &str,
+        identity: HeardSource,
+    ) -> bool {
+        self.judge_ahead_copy(download, path, identity).await
+    }
+
+    async fn judge_ahead_joiners(&self, download: &TrackDownload, path: &str, identity: HeardSource) {
+        self.judge_joiners(download, path, Some(identity), LabelSource::TheFile)
+            .await;
+    }
+
+    async fn owned_passes(&self, path: &str, gate: &octo_core::fingerprint::heart_gate::HeartGate) -> bool {
+        use crate::services::common::heart_acquisition_coordinator::HeartGates;
+        self.verification.heart_ready()
+            && HeartGates::owned_passes(self.verification.as_ref(), path, gate).await
+    }
+
+    async fn judge_landed(
+        &self,
+        base: &BaseDownloadService,
+        download: &mut TrackDownload,
+        path: &str,
+    ) -> Option<bool> {
+        self.judge_landed_file(base, download, path).await
     }
 
     // =========================================================================
@@ -2588,6 +3033,37 @@ impl DownloadBackend for SoulseekDownloadService {
             ))
             .into());
         };
+        // A person's keep lands a file its hold kept, as it is, or else only the audio they heard
+        // (YouTube's own copy of it): nothing is searched for.
+        if download.keep_anyway {
+            if let Some(path) = self.keep_held_file(base, download).await {
+                return Ok(path);
+            }
+            if download.source_override != Some(DownloadSource::YouTube) {
+                anyhow::bail!("Nothing this download held is left to keep");
+            }
+        }
+        // A resumed hold brings back the files it held: the first still there that passes the
+        // checks is the download, before any source is asked.
+        let held_track = download.origin
+            == Some(octo_core::fingerprint::heart_gate::AcquisitionOrigin::AlbumHeart)
+            && !download.held_files.is_empty();
+        if let Some(path) = self.take_held_file(base, &routing.snapshot(), download).await? {
+            return Ok(path);
+        }
+        // A hearted album's held track is checked by its own held files alone: nothing else is
+        // fetched for it.
+        if held_track {
+            anyhow::bail!("The held copy of this album track is not its recording");
+        }
+        // A play judged inside its own acquisition (Wait for lossless, queued with no gate of its
+        // own) gets its gate now, what its asker heard held until the download returns; one with
+        // nothing to prove anything by, and no other gate, is not proven at once.
+        let (proven_somehow, _heard) = self.own_play_gate(download).await;
+        if !proven_somehow {
+            info!("The play of {external_id} has nothing to prove its copy by; it keeps none");
+            return Err(not_proven());
+        }
         let profile = if download.upgrade_search {
             SearchProfile::upgrade(&self.settings)
         } else {
@@ -2621,7 +3097,7 @@ impl DownloadBackend for SoulseekDownloadService {
             }
             source => source,
         };
-        match source {
+        let fetched = match source {
             DownloadSource::YouTube => {
                 self.download_via_you_tube(base, &routing, download, true, cancellation_token)
                     .await
@@ -2636,16 +3112,29 @@ impl DownloadBackend for SoulseekDownloadService {
                     .await
                 {
                     Ok(path) => Ok(path),
-                    Err(e) if !cancellation_token.is_cancelled() => {
+                    // A file that waits in the hold path, or a play nothing proved, is no reason
+                    // to fetch an MP3.
+                    Err(e)
+                        if !cancellation_token.is_cancelled()
+                            && e.downcast_ref::<AcquisitionHeld>().is_none()
+                            && e.downcast_ref::<crate::services::common::PlayOutcome>().is_none() =>
+                    {
                         warn!("Lossless download failed ({e}); falling back to YouTube MP3");
                         if !download.suppress_notify {
+                            let why = match crate::services::spotiflac::mornye_waited(&e) {
+                                Some(wait) if self.slskd.is_on() => format!(
+                                    "Soulseek brought no FLAC and Mornye could not pass its check for {}",
+                                    octo_core::spotiflac::check::names_list(wait.pause.shared())
+                                ),
+                                _ => e.to_string(),
+                            };
                             base.notifications().notify(NotificationEvent {
                                 artist: snapshot.artist.clone(),
                                 title: snapshot.title.clone(),
                                 album: snapshot.album.clone(),
                                 source: Some("YouTube".into()),
                                 format: Some("MP3".into()),
-                                detail: Some(e.to_string()),
+                                detail: Some(why),
                                 ..NotificationEvent::new(NotificationEventType::LosslessFallback)
                             });
                         }
@@ -2662,6 +3151,24 @@ impl DownloadBackend for SoulseekDownloadService {
                 self.download_lossless(base, &snapshot, download, &profile, cancellation_token)
                     .await
             }
+        };
+        // A play's download that no gate passed resolves "not proven", so a play waiting on it
+        // serves its stand-in.
+        let plays_only = gated(download)
+            && download
+                .gates
+                .iter()
+                .all(|gate| gate.origin == octo_core::fingerprint::heart_gate::AcquisitionOrigin::Play);
+        match fetched {
+            Err(e)
+                if plays_only
+                    && e.downcast_ref::<OperationCanceled>().is_none()
+                    && e.downcast_ref::<AcquisitionHeld>().is_none() =>
+            {
+                info!("The play of {external_id} keeps no copy: {e}");
+                Err(not_proven())
+            }
+            other => other,
         }
     }
 
@@ -3170,6 +3677,29 @@ fn discard_rejected_download(path: &str, attempt_started_utc: DateTime<Utc>) {
     }
 }
 
+/// A refused file moved back to `back` (where it waits as a track of its album), else removed;
+/// swept with the job folders when neither can be done now.
+fn give_back_or_remove(path: &str, back: Option<&str>) {
+    // Given back to where it already is: it stays as it is.
+    if back == Some(path) {
+        return;
+    }
+    if let Some(back) = back.filter(|back| !back.is_empty()) {
+        // Taking the file out may have left its folder empty, and so removed it.
+        if let Some(folder) = Path::new(back).parent() {
+            let _ = std::fs::create_dir_all(folder);
+        }
+        let moved = std::fs::rename(path, back).is_ok()
+            || (std::fs::copy(path, back).is_ok() && std::fs::remove_file(path).is_ok());
+        if moved {
+            info!("Gave the refused {path} back to {back}");
+            return;
+        }
+        warn!("Could not give the refused {path} back to {back}; deleting it");
+    }
+    let _ = std::fs::remove_file(path);
+}
+
 /// Clear what a crash or a failed download left in the staging folder. A day old is long past
 /// any download still in flight, and nothing outside this one folder is touched.
 fn sweep_incoming(incoming: &str) {
@@ -3443,6 +3973,12 @@ fn find_directory(root: &str, name: &str, accept: impl Fn(&str) -> bool) -> std:
 
 #[path = "spotiflac_download.rs"]
 mod spotiflac_download;
+
+#[path = "soulseek_gate.rs"]
+mod soulseek_gate;
+
+pub(crate) use soulseek_gate::record_joiner;
+use soulseek_gate::{FileJudged, gated, move_to_hold, not_proven, only_heard_or_master};
 pub use spotiflac_download::SPOTIFLAC_SOURCE;
 
 #[cfg(test)]

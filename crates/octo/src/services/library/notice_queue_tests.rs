@@ -281,7 +281,7 @@ fn a_preview_question_is_kept_under_a_cause_every_release_reads() {
     let entry = only(&reopened, "alice");
     assert_eq!(entry.cause, InconclusiveReason::SoundsLikeAnother);
     assert!(
-        entry.reason.contains("YouTube preview (47% of its bits differ)"),
+        entry.reason.contains("YouTube stream (47% of its bits differ)"),
         "{}",
         entry.reason
     );
@@ -447,6 +447,32 @@ fn a_question_follows_a_moved_folder() {
         &song(),
         &verdict(InconclusiveReason::NoEntry)
     ));
+}
+
+/// A batch follows each move in order: the question in `A` that moves to `B` and then to `C`
+/// ends in `C`, under the key of where it is now.
+#[test]
+fn a_question_follows_a_batch_of_moves_in_order() {
+    let queue = NoticeQueue::new();
+    queue.add_review(
+        "alice",
+        "/music/Artist/A/a.flac",
+        &song(),
+        &verdict(InconclusiveReason::NoEntry),
+    );
+
+    let moved = queue.move_paths_batch(&[
+        ("/music/Artist/A".to_string(), "/music/Artist/B".to_string()),
+        ("/music/Artist/B".to_string(), "/music/Artist/C".to_string()),
+    ]);
+
+    assert_eq!(moved, 2);
+    let entry = only(&queue, "alice");
+    assert_eq!(entry.local_path, "/music/Artist/C/a.flac");
+    assert_eq!(
+        entry.key,
+        NoticeQueue::review_key("alice", "/music/Artist/C/a.flac")
+    );
 }
 
 // ---- AcoustID's numbers on a question ------------------------------------------------------

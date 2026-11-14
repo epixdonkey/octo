@@ -1,7 +1,7 @@
 //! The data half of the AcoustID client: the records an AcoustID lookup answers with
-//! (`VerificationResult` and the release chooser hold them), and the pure reading of its answer
-//! ([`parse_lookup`]) and building of its forms. The HTTP client and its rate limiter
-//! are in `octo::services::fingerprint`.
+//! (`VerificationResult` and the release chooser hold them), the pure reading of its answer
+//! ([`parse_lookup`], and [`parse_answer`] for the whole answer) and the building of its forms.
+//! The HTTP client and its rate limiter are in `octo::services::fingerprint`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,8 +10,8 @@ use crate::common::dotnet;
 use crate::common::octo_user_agent;
 use crate::fingerprint::music_brainz_client;
 use crate::json::element::{
-    ElementResult, array_length, enumerate_array, get_double, get_int32, get_string, str_prop, string_prop,
-    try_get_int32, try_get_property,
+    ElementResult, array_length, enumerate_array, get_double, get_int32, get_int64, get_string, str_prop,
+    string_prop, try_get_int32, try_get_property,
 };
 
 /// One credited artist and the text MusicBrainz joins it to the next one with.
@@ -183,6 +183,9 @@ pub struct AcoustIdLookup {
     pub is_ok: bool,
     pub error: Option<String>,
     pub results: Vec<AcoustIdResult>,
+    /// The same answer read whole ([`parse_answer`]), every result and recording with no cut, when
+    /// its status was `ok`: what the heart gate's reading takes.
+    pub answer: Option<AcoustIdAnswer>,
 }
 
 impl AcoustIdLookup {
@@ -191,8 +194,67 @@ impl AcoustIdLookup {
             is_ok,
             error: error.map(str::to_string),
             results,
+            answer: None,
         }
     }
+}
+
+/// One artist an answer credits on a recording, with its MusicBrainz id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnswerArtist {
+    pub id: Option<String>,
+    pub name: String,
+}
+
+/// One recording a result of AcoustID's whole answer links.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AnswerRecording {
+    pub id: String,
+    pub title: String,
+    pub artists: Vec<AnswerArtist>,
+    /// The recording's length in seconds.
+    pub duration_seconds: Option<f64>,
+    /// The ISRCs AcoustID copies from MusicBrainz for the recording, normalized.
+    pub isrcs: Vec<String>,
+    /// How many submissions tie the fingerprint to the recording.
+    pub sources: i64,
+}
+
+/// One result of AcoustID's whole answer: a fingerprint, its score and every recording it links.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AnswerResult {
+    /// AcoustID's own id for the fingerprint.
+    pub id: Option<String>,
+    pub score: f64,
+    pub recordings: Vec<AnswerRecording>,
+}
+
+/// AcoustID's whole lookup answer with `status: ok`: every result and every recording, with no cut.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AcoustIdAnswer {
+    pub results: Vec<AnswerResult>,
+}
+
+/// An answer whose status is not `ok`: AcoustID's error code and message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnswerError {
+    pub code: Option<i64>,
+    pub message: Option<String>,
+}
+
+/// What one AcoustID lookup came to, as the heart gate reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AcoustIdOutcome {
+    /// AcoustID answered `status: ok`.
+    Answered(AcoustIdAnswer),
+    /// AcoustID has not answered yet: a 5xx, a 429, codes 5, 13 or 14, a timeout, a network error
+    /// or a body that cannot be read. Asked again later.
+    Busy,
+    /// AcoustID could not check this one fingerprint by its sound (codes 1, 2, 3, 7, 8, 9, 10, 11
+    /// and 19, any code it does not list, or none). Never sent again.
+    Unreadable { code: Option<i64> },
+    /// AcoustID is off: the `off` setting, or every key Octo has was rejected.
+    Off,
 }
 
 impl AcoustIdRelease {
@@ -322,6 +384,7 @@ pub fn parse_lookup(root: &Value) -> ElementResult<AcoustIdLookup> {
             is_ok: false,
             error: Some(message.unwrap_or_else(|| "unknown error".to_string())),
             results: Vec::new(),
+            answer: None,
         });
     }
 
@@ -345,6 +408,7 @@ pub fn parse_lookup(root: &Value) -> ElementResult<AcoustIdLookup> {
         is_ok: true,
         error: None,
         results,
+        answer: parse_answer(root).ok().and_then(Result::ok),
     })
 }
 
@@ -357,6 +421,104 @@ pub fn error_message_or(root: &Value, fallback: Option<&str>) -> ElementResult<O
         return Ok(get_string(m)?.map(str::to_string));
     }
     Ok(fallback.map(str::to_string))
+}
+
+/// Reads AcoustID's lookup answer whole: every result, and every recording each result links with
+/// its id, title, artists, length, ISRCs and submissions, with no cut (a popular song's answer
+/// links dozens of recordings). A `status` other than `ok` is AcoustID's own error, its code and
+/// message, never an empty answer, so a refusal is never read as "no entry". A recording with no
+/// id links nothing and is left out. A field of the wrong kind fails the whole read, as
+/// [`parse_lookup`]'s do.
+pub fn parse_answer(root: &Value) -> ElementResult<Result<AcoustIdAnswer, AnswerError>> {
+    let status = match try_get_property(root, "status")? {
+        Some(s) => get_string(s)?,
+        None => None,
+    };
+    if !status.is_some_and(|s| dotnet::eq_ignore_case(s, "ok")) {
+        return Ok(Err(answer_error(root)?));
+    }
+
+    let mut results = Vec::new();
+    for result in list_prop(root, "results")? {
+        let mut recordings = Vec::new();
+        for recording in list_prop(result, "recordings")? {
+            if let Some(read) = answer_recording(recording)? {
+                recordings.push(read);
+            }
+        }
+        results.push(AnswerResult {
+            id: text_prop(result, "id")?,
+            score: number_prop(result, "score")?.unwrap_or(0.0),
+            recordings,
+        });
+    }
+    Ok(Ok(AcoustIdAnswer { results }))
+}
+
+/// The error object of an answer whose status is not `ok`; both fields empty when it has none.
+fn answer_error(root: &Value) -> ElementResult<AnswerError> {
+    match try_get_property(root, "error")? {
+        None | Some(Value::Null) => Ok(AnswerError::default()),
+        Some(error) => Ok(AnswerError {
+            code: whole_prop(error, "code")?,
+            message: text_prop(error, "message")?,
+        }),
+    }
+}
+
+/// One linked recording of a result, or None when it carries no id.
+fn answer_recording(recording: &Value) -> ElementResult<Option<AnswerRecording>> {
+    let Some(id) = text_prop(recording, "id")?.filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+    let mut artists = Vec::new();
+    for artist in list_prop(recording, "artists")? {
+        let name = text_prop(artist, "name")?.unwrap_or_default();
+        let artist_id = text_prop(artist, "id")?.filter(|id| !id.is_empty());
+        if !name.is_empty() || artist_id.is_some() {
+            artists.push(AnswerArtist { id: artist_id, name });
+        }
+    }
+    Ok(Some(AnswerRecording {
+        id,
+        title: text_prop(recording, "title")?.unwrap_or_default(),
+        artists,
+        duration_seconds: number_prop(recording, "duration")?.filter(|seconds| *seconds > 0.0),
+        isrcs: music_brainz_client::parse_isrcs(recording)?,
+        sources: whole_prop(recording, "sources")?.unwrap_or(0),
+    }))
+}
+
+/// The items of an array property; none when it is missing or null.
+fn list_prop<'a>(element: &'a Value, name: &str) -> ElementResult<&'a [Value]> {
+    match try_get_property(element, name)? {
+        None | Some(Value::Null) => Ok(&[]),
+        Some(list) => enumerate_array(list),
+    }
+}
+
+/// A string property; None when it is missing or null.
+fn text_prop(element: &Value, name: &str) -> ElementResult<Option<String>> {
+    match try_get_property(element, name)? {
+        Some(value) => Ok(get_string(value)?.map(str::to_string)),
+        None => Ok(None),
+    }
+}
+
+/// A number property; None when it is missing or null.
+fn number_prop(element: &Value, name: &str) -> ElementResult<Option<f64>> {
+    match try_get_property(element, name)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => get_double(value).map(Some),
+    }
+}
+
+/// A whole-number property; None when it is missing or null.
+fn whole_prop(element: &Value, name: &str) -> ElementResult<Option<i64>> {
+    match try_get_property(element, name)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => get_int64(value).map(Some),
+    }
 }
 
 fn parse_recordings(result: &Value) -> ElementResult<Vec<AcoustIdRecording>> {

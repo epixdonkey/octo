@@ -1,17 +1,20 @@
-//! The process and status actions: the service health dots (`status`), the library path chain
-//! (`library-status`), server discovery, Lidarr's choices and connection test, the restart, the
-//! test notification, the fetched-songs log, the hearted downloads, and the two recovery levers
-//! (clear rejected peers, clear the metadata caches).
+//! The process and status actions: the service health dots and the downloads card (`status`), the
+//! library path chain (`library-status`), server discovery, Lidarr's choices and connection test,
+//! the restart, the test notification, the fetched-songs log, the hearted downloads, and the two
+//! recovery levers (clear rejected peers, clear the metadata caches).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use chrono::Utc;
 use octo_core::common::dotnet::is_blank;
+use octo_core::fingerprint::heart_gate::WaitingFor;
+use octo_core::lidarr::lidarr_heart_acquisition_service::{IndexerHealth, indexer_health};
 use octo_core::settings::HeartDownloadSource;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -19,15 +22,40 @@ use tracing::{info, warn};
 
 use super::json_body::bind_body;
 use super::json_body::{FromBody, Shape, text_record};
-use super::plumbing::{camel_case_value, object_result, ok};
+use super::plumbing::{camel_case_value, cover_reply, object_result, ok};
+use super::request_binding::query;
 use crate::app::AppState;
-use crate::http::error::json_ok;
+use crate::http::error::{json_ok, problem};
 use crate::middleware::admin_sign_in_gate::{Caller, caller_of};
 use crate::services::admin::AdminCaller;
 use crate::services::admin::directory_browser::is_writable;
+use crate::services::admin::fetched_covers::{entry_cover_path, side_for};
+use crate::services::common::acquisition_tracker::key_of;
+use crate::services::common::heart_acquisition_coordinator::waiting_line;
 use crate::services::http_client_factory::{connect_failure_message, timeout_message};
+use crate::services::lidarr::{CANNOT_SEE, NO_INDEXER_SEARCHES};
+use crate::services::metadata::Reach;
 use crate::services::soulseek::soulseek_link::ISoulseekLink;
 use crate::services::subsonic::subsonic_response_builder::acquisition_json;
+use crate::services::you_tube::you_tube_resolver::FRESH_HEADER;
+
+/// The downloads card's line while imported downloads go unchecked, with the switch that turns
+/// the checks on.
+pub const VERIFICATION_OFF: &str = "Octo is not checking imported downloads by their sound. Turn it on";
+/// The downloads card's line while AcoustID is off.
+pub const ACOUST_ID_OFF: &str = "AcoustID is off: Octo checks what played against the catalog's own clip of each song, and keeps a copy only when it is the very master you played";
+/// The downloads card's line while a heart waits for AcoustID to answer.
+pub const ACOUST_ID_HOLDS: &str = "AcoustID is not answering; hearts wait for it";
+/// The downloads card's line once AcoustID refused the user's submission key.
+pub const SUBMISSION_KEY_REFUSED: &str = "AcoustID refused your submission key";
+/// The downloads card's line once AcoustID refused Octo's own key, set aside until the settings
+/// change.
+pub const BUILT_IN_KEY_REFUSED: &str =
+    "AcoustID refused Octo's own key. Add a free key of your own under Soulseek, Verify downloads";
+/// The yt-dlp shim's line when it is too old to answer a fresh lookup.
+pub const OLD_SHIM: &str = "Update the yt-dlp shim so Octo can check YouTube";
+/// The setting the verification line's switch turns on.
+const VERIFY_DOWNLOADS_SETTING: &str = "Soulseek.VerifyDownloads";
 
 /// `GET /api/admin/discover-servers`: scans the local network for Subsonic/Navidrome servers so
 /// the setup UI can offer a detected upstream URL instead of requiring it typed by hand. Empty
@@ -91,9 +119,13 @@ pub async fn test_notification(State(state): State<AppState>) -> Response {
 
 /// `GET /api/admin/downloads`: the running log of songs Octo has fetched, newest first. Each
 /// entry's saved download log stays out of the list (it can run to hundreds of lines); `hasLog`
-/// says one was kept, and `downloads/log` reads it.
-pub async fn downloads(State(state): State<AppState>) -> Response {
-    let recent = state.download_history.get_recent(200);
+/// says one was kept, and `downloads/log` reads it. With `q`, the kept entries matching every
+/// word of it instead (artist, title, album or path), so an older download can be looked up.
+pub async fn downloads(State(state): State<AppState>, uri: Uri) -> Response {
+    let recent = match query(&uri, "q").filter(|q| !is_blank(q)) {
+        Some(q) => state.download_history.search(&q, DOWNLOAD_SEARCH_LIMIT),
+        None => state.download_history.get_recent(200),
+    };
     // The entries are written to disk PascalCase; the API answer is camelCase, with the
     // report's dictionaries keeping their keys.
     let downloads: Vec<serde_json::Value> = recent
@@ -107,6 +139,12 @@ pub async fn downloads(State(state): State<AppState>) -> Response {
                     "hasLog".into(),
                     serde_json::Value::Bool(entry.log.as_ref().is_some_and(|log| !log.is_empty())),
                 );
+                // Where Octo serves the song's cover (read from its file, else the saved
+                // address), so no page loads a cover from another host.
+                fields.insert(
+                    "cover".into(),
+                    serde_json::Value::String(entry_cover_path(&entry.downloaded_at)),
+                );
             }
             value
         })
@@ -114,18 +152,50 @@ pub async fn downloads(State(state): State<AppState>) -> Response {
     ok(&json!({ "downloads": downloads }))
 }
 
+/// The most entries a search of the fetched-songs log answers with.
+const DOWNLOAD_SEARCH_LIMIT: usize = 50;
+
+/// `GET /api/admin/downloads/cover?at=<downloadedAt>&size=`: a fetched song's cover as a JPEG,
+/// read from its file, else from the cover address saved with it, fetched by Octo. Small unless
+/// more than 200 px is asked for; 404 when Octo has no picture for it. Reaches whoever may read
+/// the list it belongs to.
+pub async fn download_cover(State(state): State<AppState>, uri: Uri) -> Response {
+    let Some(entry) = query(&uri, "at").and_then(|at| state.download_history.find_written(at.trim())) else {
+        return problem(StatusCode::NOT_FOUND);
+    };
+    let side = side_for(query(&uri, "size").as_deref());
+    match state.fetched_covers.entry_cover(&entry, side).await {
+        Some(picture) => cover_reply(picture),
+        None => problem(StatusCode::NOT_FOUND),
+    }
+}
+
 /// `GET /api/admin/acquisitions`: every hearted download in flight or ended in the last half
 /// hour, everyone's, newest first. The rows the app reads through getAcquisitions, plus the
 /// provider key, and who asked only while Record who asked is on, the rule the fetched-songs
-/// log follows too.
+/// log follows too. A row says `keepAnyway` while someone waiting in its holds may keep it
+/// anyway, and `heldTracks` on a hearted album holding tracks; who may keep it is read from
+/// `acquisitions/holders`.
 pub async fn acquisitions(State(state): State<AppState>) -> Response {
     let show_askers = state.settings.current().subsonic.record_requested_by;
+    let coordinator = &state.heart_acquisition_coordinator;
+    let held = coordinator.keep_marks("");
+    // The rows someone may keep anyway now, read once for every row.
+    let keepable: HashSet<String> = coordinator.keepable_rows();
     let rows: Vec<serde_json::Value> = state
         .acquisition_tracker
         .all()
-        .iter()
+        .into_iter()
+        .map(|mut row| {
+            // The holds decide, never the row's own flag, which stays set after a keep is asked.
+            row.keep_anyway = keepable.contains(&key_of(&row.provider, &row.external_id));
+            row.held_tracks = held
+                .held_tracks(&row.key)
+                .map(|count| i32::try_from(count).unwrap_or(i32::MAX));
+            row
+        })
         .map(|row| {
-            let mut fields = acquisition_json(row);
+            let mut fields = acquisition_json(&row);
             fields.insert("provider".into(), json!(row.provider));
             fields.insert("externalId".into(), json!(row.external_id));
             if show_askers && !row.requested_by.is_empty() {
@@ -138,13 +208,20 @@ pub async fn acquisitions(State(state): State<AppState>) -> Response {
 }
 
 /// Health of one backing service. `configured` is false for an optional service nobody set
-/// up, which the dashboard shows as off rather than as a failure.
+/// up, which the dashboard shows as off rather than as a failure. `indexers` (sent only when
+/// set) says Lidarr answers and its warning is about its indexers, not its setup. `follows` (sent
+/// only when there are any) lists the Lidarr follows Octo cannot settle, each with its line and
+/// the album "Put Lidarr back" names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ServiceProbe {
     ok: bool,
     detail: String,
     warning: bool,
     configured: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    indexers: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    follows: Vec<serde_json::Value>,
 }
 
 impl ServiceProbe {
@@ -154,6 +231,8 @@ impl ServiceProbe {
             detail: detail.into(),
             warning: false,
             configured: true,
+            indexers: false,
+            follows: Vec::new(),
         }
     }
 
@@ -226,7 +305,27 @@ async fn probe_slskd(state: &AppState) -> ServiceProbe {
     ServiceProbe::new(up, detail).warning(warning)
 }
 
+/// Lidarr's card: how Lidarr answers, and the follows Octo cannot settle, whatever Lidarr answers
+/// now (a follow outlives a Lidarr cleared from the settings).
 async fn probe_lidarr(state: &AppState) -> ServiceProbe {
+    let mut probe = probe_lidarr_service(state).await;
+    probe.follows = state
+        .lidarr_hearts
+        .unsettled_follows()
+        .into_iter()
+        .map(|follow| {
+            json!({
+                "follow": follow.follow,
+                "artist": follow.artist,
+                "album": follow.album,
+                "text": CANNOT_SEE,
+            })
+        })
+        .collect();
+    probe
+}
+
+async fn probe_lidarr_service(state: &AppState) -> ServiceProbe {
     let settings = state.settings.current();
     let lidarr = &settings.lidarr;
     let lidarr_enabled = settings
@@ -255,15 +354,41 @@ async fn probe_lidarr(state: &AppState) -> ServiceProbe {
     {
         return ServiceProbe::new(true, "select a root folder and profiles").warning(true);
     }
-    let ok = state.lidarr_client.is_reachable().await;
-    ServiceProbe::new(
-        ok,
-        if ok {
-            "reachable"
-        } else {
-            "unreachable / API key invalid"
-        },
-    )
+    if !state.lidarr_client.is_reachable().await {
+        return ServiceProbe::new(false, "unreachable / API key invalid");
+    }
+    match lidarr_indexer_lines(state).await {
+        Some(lines) => {
+            let mut probe = ServiceProbe::new(true, lines).warning(true);
+            probe.indexers = true;
+            probe
+        }
+        None => ServiceProbe::new(true, "reachable"),
+    }
+}
+
+/// What Lidarr's card says of its indexers, or None when nothing is wrong with them: hearts
+/// waiting for them (their holds), and Lidarr's own health read now saying no indexer can search.
+/// A health read that fails says nothing; the card already says Lidarr answers.
+async fn lidarr_indexer_lines(state: &AppState) -> Option<String> {
+    let waiting = state
+        .soulseek_holds
+        .snapshot()
+        .iter()
+        .any(|record| record.waiting_for == Some(WaitingFor::LidarrIndexers));
+    let none_can_search = state
+        .lidarr_client
+        .health()
+        .await
+        .is_ok_and(|checks| indexer_health(&checks) == IndexerHealth::NoneCanSearch);
+    let lines: Vec<&str> = [
+        waiting.then(|| waiting_line(WaitingFor::LidarrIndexers)),
+        none_can_search.then_some(NO_INDEXER_SEARCHES),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!lines.is_empty()).then(|| lines.join(". "))
 }
 
 async fn probe_you_tube_shim(state: &AppState) -> ServiceProbe {
@@ -273,8 +398,26 @@ async fn probe_you_tube_shim(state: &AppState) -> ServiceProbe {
         .unwrap_or_else(|| "http://yt-dlp-shim:8080".to_string());
     let target = format!("{}/health", shim.trim_end_matches('/'));
     match probe_get(state, &target).await {
+        Ok(status) if status.is_success() && shim_is_old(state, &shim).await => {
+            ServiceProbe::new(true, OLD_SHIM).warning(true)
+        }
         Ok(status) => ServiceProbe::new(status.is_success(), format!("HTTP {}", status.as_u16())),
         Err(message) => ServiceProbe::new(false, message),
+    }
+}
+
+/// Whether the shim is one from before fresh lookups, which hearts need to check what played: a
+/// shim that has them marks every answer to `fresh=1` with its header, its refusal of a request
+/// naming no video included, so asking that resolves nothing. An older shim answers without it.
+/// A shim that does not answer the question is not called old: its health already said it works.
+async fn shim_is_old(state: &AppState, shim: &str) -> bool {
+    let target = format!("{}/facts?fresh=1&bg=1", shim.trim_end_matches('/'));
+    let Ok(request) = state.http.get(&target).timeout(PROBE_TIMEOUT).build() else {
+        return false;
+    };
+    match state.http.execute(request).await {
+        Ok(answer) => answer.headers().get(FRESH_HEADER).and_then(|v| v.to_str().ok()) != Some("1"),
+        Err(_) => false,
     }
 }
 
@@ -346,6 +489,36 @@ async fn probe_last_fm(state: &AppState) -> ServiceProbe {
     }
 }
 
+/// Where albums, artists and song details come from: Deezer, or Apple Music's catalog standing in
+/// where Deezer does not serve the server or cannot be reached. Read from the reach; asks nothing.
+fn probe_catalog(state: &AppState) -> ServiceProbe {
+    catalog_probe(state.deezer_reach.as_ref().map(|reach| reach.reach()))
+}
+
+fn catalog_probe(reach: Option<Reach>) -> ServiceProbe {
+    let Some(reach) = reach else {
+        return ServiceProbe::new(true, "Deezer answers.");
+    };
+    match reach {
+        Reach::Unknown => ServiceProbe::new(true, "Checking Deezer…"),
+        Reach::Open { .. } => ServiceProbe::new(true, "Deezer answers."),
+        Reach::Closed { country, .. } => ServiceProbe::new(
+            true,
+            format!(
+                "Deezer does not serve {}, so albums, artists and song details come from Apple Music's catalog.",
+                if country.is_empty() { "this server's country" } else { country.as_str() }
+            ),
+        ),
+        Reach::Unreachable { error } => ServiceProbe::new(
+            true,
+            format!(
+                "Octo cannot reach Deezer ({error}), so albums, artists and song details come from Apple Music's catalog."
+            ),
+        )
+        .warning(true),
+    }
+}
+
 /// `now` in the round-trip form with an offset: seven fraction digits and `+00:00`.
 fn round_trip_offset(now: chrono::DateTime<Utc>) -> String {
     format!(
@@ -357,17 +530,276 @@ fn round_trip_offset(now: chrono::DateTime<Utc>) -> String {
 
 /// `GET /api/admin/status`: a quick health snapshot of each backing service, so the dashboard
 /// shows at a glance whether Octo can reach Navidrome, slskd, Lidarr, the yt-dlp shim, octo-sonic
-/// and Last.fm. Open without a sign-in, but then it answers only `ok` and `configured` per service
-/// (see [`anonymous_status`]).
+/// and Last.fm, and the downloads card's lines (`downloads`, see [`download_lines`]), and whether
+/// this build carries Octo's own AcoustID key (`acoustIdBuiltInKey`, which the AcoustID key's
+/// setting says). Open without a sign-in, but then it answers only `ok` and `configured` per
+/// service (see [`anonymous_status`]).
 pub async fn get_status(State(state): State<AppState>, caller: Caller) -> Response {
     if !caller_of(&caller).is_some_and(AdminCaller::is_admin) {
         return json_ok(&anonymous_status(&state).await);
     }
+    let (mut services, mornye) = tokio::join!(probe_all(&state), mornye_row(&state));
+    // Only for an admin, so a signed-out caller never learns that a Mornye exists, and only while
+    // Mornye is switched on: a server that never set it up lists no row for it.
+    if let Some(mornye) = mornye {
+        services.insert("mornye".to_string(), mornye);
+    }
     json_ok(&json!({
         "octo": ServiceProbe::new(true, "Octo is responding"),
-        "services": probe_all(&state).await,
+        "services": services,
+        "downloads": download_lines(&state),
+        "acoustIdBuiltInKey": state.acoust_id.has_built_in_key(),
         "time": round_trip_offset(Utc::now()),
     }))
+}
+
+/// Mornye's row of the admin status, kept between answers so a slow Mornye never holds the
+/// status up: one probe at a time, each keeping its row for Mornye's settings as they were when
+/// it was asked.
+pub struct MornyeRowKeeper {
+    kept: parking_lot::Mutex<Option<KeptRow>>,
+    asking: std::sync::atomic::AtomicBool,
+    answered: tokio::sync::Notify,
+    /// How long a status answer waits for a probe, in milliseconds.
+    wait_ms: std::sync::atomic::AtomicU64,
+}
+
+/// A row a probe kept: the address it asked, how many times Mornye's settings had changed when
+/// it was asked (`SettingsStore::spotiflac_changes`), and the row.
+struct KeptRow {
+    url: String,
+    changes: u64,
+    row: serde_json::Value,
+}
+
+impl Default for MornyeRowKeeper {
+    fn default() -> Self {
+        MornyeRowKeeper {
+            kept: parking_lot::Mutex::new(None),
+            asking: std::sync::atomic::AtomicBool::new(false),
+            answered: tokio::sync::Notify::new(),
+            wait_ms: std::sync::atomic::AtomicU64::new(Self::WAIT.as_millis() as u64),
+        }
+    }
+}
+
+impl MornyeRowKeeper {
+    /// How long a status answer waits for a probe of Mornye before it uses the kept row.
+    pub const WAIT: Duration = Duration::from_secs(1);
+
+    fn wait(&self) -> Duration {
+        Duration::from_millis(self.wait_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Waits `wait` for a probe instead (tests).
+    #[cfg(test)]
+    pub(super) fn set_wait(&self, wait: Duration) {
+        self.wait_ms
+            .store(wait.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The row the last probe of the Mornye at `url` kept, while Mornye's settings have not
+    /// changed since it was asked (`changes` is the count now): any change, a switch off and on
+    /// again included, wants a new probe. Other settings changing does not.
+    pub(super) fn kept_for(&self, url: &str, changes: u64) -> Option<serde_json::Value> {
+        self.kept
+            .lock()
+            .as_ref()
+            .filter(|kept| kept.url == url && kept.changes == changes)
+            .map(|kept| kept.row.clone())
+    }
+
+    /// Keeps `row`, from a probe of the Mornye at `asked` begun when Mornye's settings had
+    /// changed `changes` times. One that outlived a change is kept too, but [`Self::kept_for`]
+    /// never shows it. Each probe reads the count while it alone may probe, so a later probe
+    /// never keeps an older count.
+    pub(super) fn keep(&self, changes: u64, asked: String, row: serde_json::Value) {
+        *self.kept.lock() = Some(KeptRow {
+            url: asked,
+            changes,
+            row,
+        });
+    }
+}
+
+/// Ends a probe: lets the next one start and wakes the answers waiting for it, also when the
+/// probe stopped short.
+struct ProbeDone(AppState);
+
+impl Drop for ProbeDone {
+    fn drop(&mut self) {
+        let keeper = &self.0.mornye_row;
+        keeper.asking.store(false, std::sync::atomic::Ordering::Release);
+        keeper.answered.notify_waiters();
+    }
+}
+
+/// Mornye's row for an admin: None while Mornye is switched off. Switched on with no address, a
+/// warning that says so. Otherwise the row of a probe that answers within the keeper's wait
+/// ([`MornyeRowKeeper::WAIT`]), else the row the last probe kept while Mornye's settings stayed
+/// as they are, else a warning that Mornye has not answered yet; a probe still asking keeps its
+/// row for the next answer.
+async fn mornye_row(state: &AppState) -> Option<serde_json::Value> {
+    let snapshot = state.settings.current();
+    let settings = &snapshot.spotiflac;
+    if !settings.enabled {
+        return None;
+    }
+    if !settings.is_on() {
+        return Some(json!(
+            ServiceProbe::new(
+                true,
+                "Switched on, but it has no address. Set it on the Mornye page."
+            )
+            .warning(true)
+        ));
+    }
+    let url = settings.effective_url();
+    let keeper = &state.mornye_row;
+    let answered = keeper.answered.notified();
+    tokio::pin!(answered);
+    answered.as_mut().enable();
+    if !keeper.asking.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let state = state.clone();
+        // Read while this probe alone may probe: the count first, so a change after it makes the
+        // row one no status shows.
+        let changes = state.settings.spotiflac_changes();
+        let asked = state.settings.current().spotiflac.effective_url();
+        tokio::spawn(async move {
+            let done = ProbeDone(state.clone());
+            let row = probe_mornye(&state).await;
+            state.mornye_row.keep(changes, asked, row);
+            drop(done);
+        });
+    }
+    let _ = tokio::time::timeout(keeper.wait(), answered).await;
+    Some(
+        keeper
+            .kept_for(&url, state.settings.spotiflac_changes())
+            .unwrap_or_else(|| json!(ServiceProbe::new(true, "Mornye has not answered yet.").warning(true))),
+    )
+}
+
+/// Mornye's row: off (optional), unreachable, its check paused (with "pass" when the dashboard can
+/// pass it), its utilities extension missing, or its name and version.
+pub(super) async fn probe_mornye(state: &AppState) -> serde_json::Value {
+    if !state.spotiflac.settings().is_on() {
+        return json!(ServiceProbe::new(true, "Off. Optional.").unconfigured());
+    }
+    let status = match tokio::time::timeout(PROBE_TIMEOUT, super::spotiflac::mornye_status(state, "")).await {
+        Ok(status) => status,
+        Err(_) => {
+            return json!(ServiceProbe::new(
+                false,
+                "Mornye did not answer within 5 seconds."
+            ));
+        }
+    };
+    let text = |key: &str| {
+        status
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    if !status.get("reachable").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return json!(ServiceProbe::new(false, text("problem")));
+    }
+    if status
+        .get("utilitiesMissing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return json!(
+            ServiceProbe::new(
+                true,
+                "Mornye needs its utilities extension, which your registry does not list."
+            )
+            .warning(true)
+        );
+    }
+    let now = Utc::now();
+    let next_try = status
+        .get("checks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|check| check.get("pausedUntilUtc").and_then(|v| v.as_str()))
+        .filter_map(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|t| t.with_timezone(&Utc))
+        .min();
+    let flag = |key: &str| status.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    if flag("paused") {
+        let detail = match next_try {
+            Some(until) => format!(
+                "Check paused; next try {}",
+                octo_core::spotiflac::check::until_words(until, now)
+            ),
+            None => "Check paused".to_string(),
+        };
+        let mut row = json!(ServiceProbe::new(true, detail).warning(true));
+        // The same rule as the dashboard's Pass button, decided once in the status.
+        if flag("passable")
+            && let Some(object) = row.as_object_mut()
+        {
+            object.insert("action".to_string(), json!("pass"));
+        }
+        return row;
+    }
+    let version = text("version");
+    json!(ServiceProbe::new(
+        true,
+        if version.is_empty() {
+            "Mornye".to_string()
+        } else {
+            format!("Mornye {version}")
+        }
+    ))
+}
+
+/// The downloads card's lines: what Octo's checks of downloads by their sound cannot do right
+/// now, in the order the card shows them, each with its `id` and whether it is a `warning` (AcoustID
+/// switched off is a choice, so it only informs). The line for imported downloads going unchecked
+/// names the setting its switch turns on (`turnOn`), the same one the Verify downloads card's
+/// switch saves. Empty when there is nothing to say.
+fn download_lines(state: &AppState) -> Vec<serde_json::Value> {
+    let holds = state.soulseek_holds.snapshot();
+    let waits_for_acoust_id = holds
+        .iter()
+        .any(|record| record.waiting_for == Some(WaitingFor::AcoustId));
+    let lines = [
+        (
+            !state.settings.current().soulseek.verify_downloads,
+            "verificationOff",
+            VERIFICATION_OFF,
+            true,
+        ),
+        (
+            state.acoust_id.built_in_key_refused(),
+            "builtInKeyRefused",
+            BUILT_IN_KEY_REFUSED,
+            true,
+        ),
+        (!state.acoust_id.is_on(), "acoustIdOff", ACOUST_ID_OFF, false),
+        (waits_for_acoust_id, "acoustIdHolds", ACOUST_ID_HOLDS, true),
+        (
+            state.acoust_id.submission_key_refused(),
+            "submissionKeyRefused",
+            SUBMISSION_KEY_REFUSED,
+            true,
+        ),
+    ];
+    lines
+        .into_iter()
+        .filter(|(shown, ..)| *shown)
+        .map(|(_, id, text, warning)| {
+            let mut line = json!({ "id": id, "text": text, "warning": warning });
+            if id == "verificationOff" {
+                line["turnOn"] = json!(VERIFY_DOWNLOADS_SETTING);
+            }
+            line
+        })
+        .collect()
 }
 
 /// Every service's probe, by name. They run in parallel: the total is the slowest, not the sum.
@@ -387,6 +819,7 @@ async fn probe_all(state: &AppState) -> serde_json::Map<String, serde_json::Valu
         ("ytDlpShim", shim),
         ("sonic", sonic),
         ("lastfm", lastfm),
+        ("catalog", probe_catalog(state)),
     ]
     .into_iter()
     .map(|(name, probe)| (name.to_string(), json!(probe)))
@@ -588,6 +1021,38 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 4, 8, 7, 57).unwrap()
             + chrono::TimeDelta::nanoseconds(635_173_300);
         assert_eq!(round_trip_offset(now), "2026-10-04T08:07:57.6351733+00:00");
+    }
+
+    #[test]
+    fn the_music_catalog_card_says_where_albums_come_from_in_each_state() {
+        let checking = catalog_probe(Some(Reach::Unknown));
+        assert!(checking.ok && !checking.warning);
+        assert_eq!(checking.detail, "Checking Deezer…");
+        assert_eq!(catalog_probe(None).detail, "Deezer answers.");
+        let open = catalog_probe(Some(Reach::Open {
+            country_iso: "US".into(),
+            country: "United States of America".into(),
+        }));
+        assert!(open.ok && !open.warning);
+        assert_eq!(open.detail, "Deezer answers.");
+        let closed = catalog_probe(Some(Reach::Closed {
+            country_iso: "IN".into(),
+            country: "India".into(),
+        }));
+        assert!(closed.ok && !closed.warning, "a closed country is no fault");
+        assert_eq!(
+            closed.detail,
+            "Deezer does not serve India, so albums, artists and song details come from Apple Music's catalog."
+        );
+        let unreachable = catalog_probe(Some(Reach::Unreachable {
+            error: "connection refused".into(),
+        }));
+        assert!(unreachable.ok && unreachable.warning);
+        assert!(
+            unreachable
+                .detail
+                .starts_with("Octo cannot reach Deezer (connection refused)")
+        );
     }
 }
 

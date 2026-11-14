@@ -200,6 +200,54 @@ async fn native_artist_an_outside_artist_opens_with_their_albums() {
     assert_eq!(opened.status, StatusCode::OK, "{}", opened.body);
 }
 
+/// An outside album opened through Navidrome's own API (Feishin, Navidrome's web UI) records, for
+/// each of its songs, the reader's context under `navidrome-native` with the catalog's album, the
+/// song's place on it and its code.
+#[tokio::test]
+async fn opening_an_outside_album_natively_records_each_songs_context_for_its_reader() {
+    use octo_core::fingerprint::heart_gate::NATIVE_CLIENT;
+
+    let fixture = fixture().await;
+    let album_id = fixture.state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Album,
+        artist: Some("Test Artist".into()),
+        album: Some("Test Album".into()),
+        external_album_id: Some("1".into()),
+        ..Default::default()
+    });
+
+    let opened = get(&fixture.app, &format!("/api/album/{album_id}?u=brandon")).await;
+    assert_eq!(opened.status, StatusCode::OK, "{}", opened.body);
+    let listed = get(&fixture.app, &format!("/api/song?album_id={album_id}&u=anna")).await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+
+    let rows = listed.json();
+    let songs = rows.as_array().expect("a list");
+    assert_eq!(songs.len(), 4);
+    for (place, song) in songs.iter().enumerate() {
+        let id = song["id"].as_str().expect("an id");
+        let contexts = fixture.state.external_id_registry.contexts(id);
+        let read: Vec<(&str, Option<&str>, &str)> = contexts
+            .iter()
+            .map(|c| (c.user.as_str(), c.client.as_deref(), c.catalog_album_id.as_str()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("brandon", Some(NATIVE_CLIENT), "1"),
+                ("anna", Some(NATIVE_CLIENT), "1")
+            ],
+            "{id}"
+        );
+        assert_eq!(contexts[0].track, Some(place as i32 + 1));
+        assert_eq!(contexts[0].total, Some(4));
+        assert_eq!(
+            contexts[0].isrc.as_deref(),
+            Some(format!("GBAAA000000{}", place + 1).as_str())
+        );
+    }
+}
+
 #[tokio::test]
 async fn native_artist_the_page_and_its_albums_at_once_ask_the_catalog_once() {
     // Feishin asks for the artist and the album list together. Each walked the catalog,
@@ -540,5 +588,184 @@ fn native_album_objects_keep_their_wire_shape() {
     assert_eq!(
         text,
         r#"{"id":"al","libraryId":3,"name":"T","albumArtist":"A","albumArtistId":"al-ar","maxYear":0,"minYear":0,"compilation":false,"missing":false,"songCount":2,"duration":150,"size":0,"playCount":0,"createdAt":"2020-01-01T00:00:00Z","updatedAt":"2020-01-01T00:00:00Z","tags":{"releasetype":["ep"]}}"#
+    );
+}
+
+/// Deezer, MusicBrainz, AcoustID and the shim for the Help! context: Deezer and MusicBrainz answer
+/// from what they answered when it was recorded (Deezer under `/deezer`, MusicBrainz under
+/// `/ws/2`); anything else, AcoustID and the shim included, is refused and kept, so a test sees
+/// every question that left Octo.
+#[derive(Clone)]
+struct RecordedHosts {
+    deezer: Arc<octo_core::fingerprint::heart_release::RecordedAnswers>,
+    music_brainz: Arc<octo_core::fingerprint::heart_release::RecordedAnswers>,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordedHosts {
+    fn open() -> RecordedHosts {
+        let folder = |name: &str| {
+            Arc::new(
+                octo_core::fingerprint::heart_release::RecordedAnswers::open(
+                    &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../octo-core/tests/fixtures/heart_album")
+                        .join(name),
+                )
+                .expect("the folder's urls.tsv reads"),
+            )
+        };
+        RecordedHosts {
+            deezer: folder("deezer"),
+            music_brainz: folder("rows/beatles-yesterday_a0"),
+            asked: Arc::default(),
+        }
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().clone()
+    }
+}
+
+impl Respond for RecordedHosts {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        use octo_core::fingerprint::heart_release::RecordedAnswer;
+
+        let path = request.url.path();
+        let question = |prefix: &str| {
+            let path = path.strip_prefix(prefix)?;
+            Some(match request.url.query() {
+                Some(query) => format!("{path}?{query}"),
+                None => path.to_string(),
+            })
+        };
+        self.asked.lock().push(match request.url.query() {
+            Some(query) => format!("{path}?{query}"),
+            None => path.to_string(),
+        });
+        let recorded = match (question("/deezer/"), question("/ws/2/")) {
+            (Some(asked), _) => self.deezer.get(&asked),
+            (_, Some(asked)) => self.music_brainz.get(&asked),
+            _ => None,
+        };
+        match recorded {
+            Some(RecordedAnswer::Found(doc)) => json(&doc.to_string()),
+            Some(RecordedAnswer::NotFound) => ResponseTemplate::new(404),
+            None if path.ends_with("/rest/ping") => {
+                json(r#"{"subsonic-response":{"status":"ok","version":"1.16.1"}}"#)
+            }
+            None => ResponseTemplate::new(404),
+        }
+    }
+}
+
+/// Opening Help! through Navidrome's own API and hearting Yesterday reads the Help! context: the
+/// heart gate the app wires (with fake hosts) asks the catalog for that very album and its barcode
+/// release, never searches for an album by its title, and takes R from it: the 2009 remaster's
+/// recording, the 1987 remix.
+#[tokio::test]
+async fn opening_help_natively_and_hearting_yesterday_reads_the_help_context() {
+    use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, NATIVE_CLIENT};
+
+    use crate::services::common::{GateStart, HeartGates, Holder};
+
+    let hosts = RecordedHosts::open();
+    let server = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(hosts.clone())
+        .mount(&server)
+        .await;
+    let state = AppState::for_tests_with(
+        AppSettings {
+            subsonic: SubsonicSettings {
+                url: Some(server.uri()),
+                auto_detect_download_path: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        TestServices {
+            deezer_base_url: Some(format!("{}/deezer", server.uri())),
+            music_brainz_base_url: Some(format!("{}/ws/2/", server.uri())),
+            acoust_id_base_url: Some(format!("{}/acoustid/", server.uri())),
+            raw_settings: vec![("YouTube:ShimUrl".into(), format!("{}/shim", server.uri()))],
+            heart_gate: true,
+            ..Default::default()
+        },
+    );
+    let app = app(state.clone());
+    assert!(
+        state.download_verification.heart_ready(),
+        "the app wired the gate"
+    );
+    let album = state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Album,
+        artist: Some("The Beatles".into()),
+        album: Some("Help! (Remastered 2009)".into()),
+        external_album_id: Some("12047944".into()),
+        ..Default::default()
+    });
+
+    let opened = get(&app, &format!("/api/album/{album}?u=brandon")).await;
+    assert_eq!(opened.status, StatusCode::OK, "{}", opened.body);
+    let listed = get(&app, &format!("/api/song?album_id={album}&u=brandon")).await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    let rows = listed.json();
+    let yesterday = rows
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|song| {
+            song["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with("Yesterday"))
+        })
+        .and_then(|song| song["id"].as_str())
+        .expect("Yesterday is on Help!")
+        .to_string();
+    let contexts = state.external_id_registry.contexts(&yesterday);
+    assert_eq!(contexts.len(), 1, "{contexts:?}");
+    assert_eq!(contexts[0].client.as_deref(), Some(NATIVE_CLIENT));
+    assert_eq!(contexts[0].catalog_album_id, "12047944");
+
+    let before = hosts.asked().len();
+    let (_, provider, external_id) = state.local_library.parse_song_id(&yesterday);
+    let gates: &dyn HeartGates = state.download_verification.as_ref();
+    let built = gates
+        .build(
+            &provider.expect("an outside song"),
+            &external_id.expect("an outside song"),
+            &Holder {
+                user: "brandon".into(),
+                ..Default::default()
+            },
+            AcquisitionOrigin::Heart,
+        )
+        .await;
+    let GateStart::Ready(gate) = built else {
+        panic!("the heart held: {built:?}");
+    };
+    assert_eq!(
+        gate.r.expect("R").ids,
+        ["c05194a3-f6f0-4f52-b78a-13fb5580bc0f"],
+        "the 1987 remix the 2009 Help! carries"
+    );
+    let asked: Vec<String> = hosts.asked().split_off(before);
+    assert!(
+        asked.iter().any(|q| q.starts_with("/deezer/album/12047944")),
+        "the context's album: {asked:?}"
+    );
+    assert!(
+        asked.iter().any(|q| q.contains("barcode")),
+        "its barcode release: {asked:?}"
+    );
+    assert!(
+        !asked.iter().any(|q| q.contains("search/album")),
+        "no album found by its title: {asked:?}"
+    );
+    assert!(
+        asked
+            .iter()
+            .all(|q| q.starts_with("/deezer/") || q.starts_with("/ws/2/") || q.starts_with("/shim/")),
+        "nothing else was asked: {asked:?}"
     );
 }

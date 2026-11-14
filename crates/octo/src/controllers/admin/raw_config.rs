@@ -130,6 +130,9 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Subsonic:AutoDetectDownloadPath",
     "Subsonic:LibraryPath",
     "Subsonic:FolderStructure",
+    "Subsonic:FolderTemplate",
+    "Subsonic:FolderTemplateSingles",
+    "Subsonic:FolderTemplateCompilations",
     "Subsonic:UseLocalStaging",
     "Subsonic:ExplicitFilter",
     "Subsonic:CacheDurationHours",
@@ -308,6 +311,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Subsonic:CoverCacheMb",
     "Subsonic:SearchDurationWaitMs",
     "Subsonic:SearchLastFmWaitMs",
+    "Subsonic:SearchLibraryOnlyUpTo",
     "Subsonic:SizeFlagClients",
     "GeneratedPlaylists:Years",
     "GeneratedPlaylists:MaxYearPlaylists",
@@ -321,6 +325,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Subsonic:CoverBadge",
     "LibraryActions:YoutubeCheckPerHour",
     "LibraryActions:ReviewSweepAutoReplacePreview",
+    "Notifications:NotifyMornyeCheck",
 ];
 
 /// Whether a config-sources key names a secret: a password, an API key, a secret, a token

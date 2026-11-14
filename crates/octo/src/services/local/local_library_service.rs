@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use indexmap::IndexMap;
 use octo_core::common::dotnet::{self, eq_ignore_case, escape_data_string};
-use octo_core::common::{PathHelper, SongIdentity};
+use octo_core::common::{LayoutValues, PathHelper, SongIdentity};
+use octo_core::fingerprint::heart_gate::{HeardRecord, HeardRecording, HeardSource};
 use octo_core::json::{self, datetime};
 use octo_core::models::domain::Song;
 use octo_core::models::subsonic::ScanStatus;
@@ -68,6 +69,115 @@ pub struct LocalSongMapping {
     /// lossless ("about 128 kbps MP3"). Optional, like `source_peer`; None for a genuine file and
     /// for every mapping written before the check existed.
     pub transcoded_from: Option<String>,
+
+    /// What its sound proved the file is when that is less than a recording: "as heard", "as
+    /// heard on YouTube", "version not proven" or "kept by you, version not proven". Written only
+    /// when set, so a mapping without it is written as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_mark: Option<String>,
+
+    /// The hearts and plays whose own gate passed this file, with what they heard. Written only
+    /// when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heart: Option<KeptHeart>,
+
+    /// What the file layout's names were filled from when Octo placed the file, so the Tidy's
+    /// File layout task files it again from the same names. Written only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<LayoutValues>,
+}
+
+/// The hearts and plays a file was kept for: who, the recording their gate judged it against, and
+/// for a file kept as heard what they heard and the file's own print, so a later check of it sends
+/// one lookup and runs no `fpcalc`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct KeptHeart {
+    /// The people whose own gate passed the file.
+    pub users: Vec<String>,
+    /// R, the recording the file was judged against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording: Option<HeardRecording>,
+    /// What the person heard of the song.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heard: Option<HeardRecord>,
+    /// The file is the very audio that played, or its master, and no clear reading said which
+    /// recording it is.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub as_heard: bool,
+    /// The file's compressed print and the seconds it covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub print: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<i32>,
+}
+
+impl KeptHeart {
+    /// Whether `user` is one of the people this file was kept for.
+    pub fn is_for(&self, user: &str) -> bool {
+        self.users
+            .iter()
+            .any(|known| eq_ignore_case(known.trim(), user.trim()))
+    }
+}
+
+impl LocalSongMapping {
+    /// The version this mapping is of, beside the song's other versions: the heard identity of a
+    /// file kept as heard (the video that played, or the copy and when it was ready), else the
+    /// recording the file was proven to be. None for a mapping with neither, which keeps the
+    /// song's plain key.
+    pub fn version(&self) -> Option<String> {
+        if let Some(heard) = self
+            .heart
+            .as_ref()
+            .filter(|heart| heart.as_heard)
+            .and_then(|heart| heart.heard.as_ref())
+        {
+            return Some(heard_identity(&heard.source));
+        }
+        self.music_brainz_recording_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| format!("recording:{}", id.to_ascii_lowercase()))
+    }
+
+    /// The key this mapping is saved under: `provider:id`, with its version after a `#` when it
+    /// has one, so two versions of one song are two mappings.
+    pub fn key(&self) -> String {
+        let plain = format!("{}:{}", self.external_provider, self.external_id);
+        match self.version() {
+            Some(version) => format!("{plain}#{version}"),
+            None => plain,
+        }
+    }
+
+    /// Whether the file is kept as heard, kept anyway, or otherwise carries no proven recording:
+    /// never the same song as another file by its name alone.
+    pub fn kept_unproven(&self) -> bool {
+        self.heart.as_ref().is_some_and(|heart| heart.as_heard)
+            || self
+                .proof_mark
+                .as_deref()
+                .is_some_and(|mark| mark.starts_with("as heard") || mark.starts_with("kept by you"))
+    }
+
+    fn is_song(&self, provider: &str, external_id: &str) -> bool {
+        self.external_provider == provider && self.external_id == external_id
+    }
+}
+
+/// The identity of one heard source, as a mapping keys a file kept as heard.
+pub fn heard_identity(source: &HeardSource) -> String {
+    match source {
+        HeardSource::Video { id, .. } => format!("video:{id}"),
+        HeardSource::Copy { key, ready_at, .. } => {
+            format!("copy:{key}@{}", ready_at.map_or(0, |at| at.timestamp_millis()))
+        }
+        HeardSource::Library { path } | HeardSource::Acquired { path } => {
+            format!("file:{}", full_path_or_self(path))
+        }
+    }
 }
 
 impl Default for LocalSongMapping {
@@ -86,6 +196,9 @@ impl Default for LocalSongMapping {
             source_file: None,
             music_brainz_recording_id: None,
             transcoded_from: None,
+            proof_mark: None,
+            heart: None,
+            layout: None,
         }
     }
 }
@@ -129,6 +242,9 @@ pub struct LocalLibraryService {
     scan_window: Duration,
     /// Told whenever Octo starts a scan, so the library index can be read again after it.
     scan_notice: Option<Arc<tokio::sync::Notify>>,
+    /// How many times the mappings file was written (tests count them).
+    #[cfg(test)]
+    saves: std::sync::atomic::AtomicUsize,
 }
 
 /// One library's scans.
@@ -175,7 +291,15 @@ impl LocalLibraryService {
                 .to_std()
                 .unwrap_or(Duration::from_secs(30)),
             scan_notice: None,
+            #[cfg(test)]
+            saves: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many times the mappings file was written (tests count them).
+    #[cfg(test)]
+    pub(crate) fn saves(&self) -> usize {
+        self.saves.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Notifies `notice` whenever this service starts a scan.
@@ -268,6 +392,8 @@ impl LocalLibraryService {
 
     /// Writes the mappings, indented and atomically.
     fn save(&self, mappings: &DotnetDictionary<LocalSongMapping>) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let text = json::to_string_indented(&MappingsFile(mappings));
         state_file::save_atomic(&self.mapping_file_path, &text)?;
         Ok(())
@@ -391,34 +517,102 @@ impl ILocalLibraryService for LocalLibraryService {
         external_provider: &str,
         external_id: &str,
     ) -> Option<String> {
-        let key = format!("{external_provider}:{external_id}");
-        let path = self.read(|map| map.get(&key).map(|m| m.local_path.clone()))??;
-        file_exists(&path).then_some(path)
+        self.get_local_path_for_external_song_as(None, external_provider, external_id)
+            .await
+    }
+
+    async fn get_local_path_for_external_song_as(
+        &self,
+        user: Option<&str>,
+        external_provider: &str,
+        external_id: &str,
+    ) -> Option<String> {
+        let user = user.map(str::trim).filter(|user| !user.is_empty());
+        let heard = user
+            .and_then(|user| self.id_registry.heard_by(external_id, user))
+            .map(|record| heard_identity(&record.source));
+        // Newest first, so each rule below takes the version that landed last.
+        let mut versions: Vec<LocalSongMapping> = self.read(|map| {
+            map.values()
+                .filter(|mapping| mapping.is_song(external_provider, external_id))
+                .filter(|mapping| !mapping.local_path.is_empty())
+                .cloned()
+                .collect()
+        })?;
+        versions.sort_by_key(|mapping| std::cmp::Reverse(mapping.downloaded_at));
+        let versions: Vec<LocalSongMapping> = versions
+            .into_iter()
+            .filter(|mapping| file_exists(&mapping.local_path))
+            .collect();
+        let Some(user) = user else {
+            return versions.first().map(|mapping| mapping.local_path.clone());
+        };
+        let theirs = versions.iter().find(|mapping| {
+            mapping.heart.as_ref().is_some_and(|heart| {
+                heart.is_for(user)
+                    || (heard.is_some() && heart.heard.as_ref().map(|h| heard_identity(&h.source)) == heard)
+            })
+        });
+        let anyones = || versions.iter().find(|mapping| mapping.heart.is_none());
+        theirs.or_else(anyones).map(|mapping| mapping.local_path.clone())
     }
 
     async fn register_downloaded_song(&self, song: &Song, local_path: &str) -> anyhow::Result<()> {
+        self.register_downloaded_song_as(song, local_path, None).await
+    }
+
+    async fn register_downloaded_song_as(
+        &self,
+        song: &Song,
+        local_path: &str,
+        heart: Option<KeptHeart>,
+    ) -> anyhow::Result<()> {
         let (Some(provider), Some(external_id)) = (&song.external_provider, &song.external_id) else {
             return Ok(());
         };
+        let mapping = LocalSongMapping {
+            external_provider: provider.clone(),
+            external_id: external_id.clone(),
+            local_path: local_path.to_string(),
+            title: song.title.clone(),
+            artist: song.artist.clone(),
+            album: song.album.clone(),
+            downloaded_at: Utc::now(),
+            source_peer: song.source_peer.clone(),
+            source_file: song.source_file.clone(),
+            transcoded_from: song.transcoded_from.clone(),
+            music_brainz_recording_id: song.music_brainz_recording_id.clone(),
+            local_subsonic_id: None,
+            proof_mark: song
+                .verification
+                .as_deref()
+                .and_then(|verification| verification.proof.row_mark())
+                .map(str::to_string),
+            heart,
+            layout: song.layout_values.as_deref().cloned(),
+        };
+        let key = mapping.key();
+        let version = mapping.version();
+        let at = full_path_or_self(local_path);
         let mut cached = self.mappings.lock();
         let mappings = self.loaded(&mut cached)?;
-        mappings.set(
-            format!("{provider}:{external_id}"),
-            LocalSongMapping {
-                external_provider: provider.clone(),
-                external_id: external_id.clone(),
-                local_path: local_path.to_string(),
-                title: song.title.clone(),
-                artist: song.artist.clone(),
-                album: song.album.clone(),
-                downloaded_at: Utc::now(),
-                source_peer: song.source_peer.clone(),
-                source_file: song.source_file.clone(),
-                transcoded_from: song.transcoded_from.clone(),
-                music_brainz_recording_id: song.music_brainz_recording_id.clone(),
-                local_subsonic_id: None,
-            },
-        );
+        // This version of the song, under any key it was saved by before, and whatever mapping
+        // of the song pointed at the very file this one replaced, give way to the new mapping.
+        // Other versions of the song stay beside it.
+        let stale: Vec<String> = mappings
+            .iter()
+            .filter(|(known, old)| {
+                **known != key
+                    && old.is_song(provider, external_id)
+                    && ((version.is_some() && old.version() == version)
+                        || eq_ignore_case(&full_path_or_self(&old.local_path), &at))
+            })
+            .map(|(known, _)| known.clone())
+            .collect();
+        for known in &stale {
+            mappings.remove(known);
+        }
+        mappings.set(key, mapping);
         self.save(mappings)
     }
 
@@ -560,6 +754,19 @@ impl ILocalLibraryService for LocalLibraryService {
         Ok(stale.into_iter().map(|(_, mapping)| mapping).collect())
     }
 
+    async fn forget_mapping_keyed(&self, key: &str) -> anyhow::Result<bool> {
+        if dotnet::is_blank(key) {
+            return Ok(false);
+        }
+        let mut cached = self.mappings.lock();
+        let mappings = self.loaded(&mut cached)?;
+        if mappings.remove(key).is_none() {
+            return Ok(false);
+        }
+        self.save(mappings)?;
+        Ok(true)
+    }
+
     async fn restore_mappings(&self, mappings: &[LocalSongMapping], local_path: &str) -> anyhow::Result<()> {
         if mappings.is_empty() || dotnet::is_blank(local_path) {
             return Ok(());
@@ -571,7 +778,9 @@ impl ILocalLibraryService for LocalLibraryService {
             if mapping.external_provider.is_empty() || mapping.external_id.is_empty() {
                 continue;
             }
-            let key = format!("{}:{}", mapping.external_provider, mapping.external_id);
+            // Under the key it was saved by, so a version kept for one person comes back as that
+            // version, with what they heard.
+            let key = mapping.key();
             // Downloaded again while this one was in the trash: that copy is the song's now.
             if current
                 .get(&key)
@@ -599,16 +808,27 @@ impl ILocalLibraryService for LocalLibraryService {
     }
 
     async fn update_local_path(&self, old_path: &str, new_path: &str) -> anyhow::Result<usize> {
-        if dotnet::is_blank(old_path) || dotnet::is_blank(new_path) {
+        self.update_local_paths(&[(old_path.to_string(), new_path.to_string())])
+            .await
+    }
+
+    async fn update_local_paths(&self, moves: &[(String, String)]) -> anyhow::Result<usize> {
+        let moves: Vec<&(String, String)> = moves
+            .iter()
+            .filter(|(old_path, new_path)| !dotnet::is_blank(old_path) && !dotnet::is_blank(new_path))
+            .collect();
+        if moves.is_empty() {
             return Ok(0);
         }
         let mut cached = self.mappings.lock();
         let mappings = self.loaded(&mut cached)?;
         let mut moved = 0;
-        for mapping in mappings.values_mut() {
-            if let Some(now) = PathHelper::moved_path(&mapping.local_path, old_path, new_path) {
-                mapping.local_path = now;
-                moved += 1;
+        for (old_path, new_path) in moves {
+            for mapping in mappings.values_mut() {
+                if let Some(now) = PathHelper::moved_path(&mapping.local_path, old_path, new_path) {
+                    mapping.local_path = now;
+                    moved += 1;
+                }
             }
         }
         if moved > 0 {

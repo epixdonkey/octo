@@ -25,6 +25,14 @@ pub struct LidarrTrackRequest {
     pub release: Option<LidarrReleasePick>,
     /// Told, in words for the download's log, what became of the picked release.
     pub step: Option<LidarrStep>,
+    /// The download's own song, as `provider:id`.
+    pub song: Option<String>,
+    /// The recordings a Better quality's original is: a kept file's own, else what its own sound
+    /// reads clear as, else its recording tag; none for a Wrong song or a Wrong version, whose
+    /// original is not the recording wanted. Only a hint: the album is the walk's first pick for
+    /// them when the original's release group tag and its album name find none, and the search
+    /// is pinned to a release that carries them.
+    pub recordings: Vec<String>,
 }
 
 /// Takes a line for the download's log, and its detail.
@@ -121,6 +129,7 @@ mod tests {
             artist: Some("Massive Attack".into()),
             track_file_id: number,
             quality: None,
+            foreign_recording_id: None,
         }
     }
 
@@ -134,6 +143,8 @@ mod tests {
             original_path: None,
             release: None,
             step: None,
+            song: None,
+            recordings: Vec::new(),
         }
     }
 

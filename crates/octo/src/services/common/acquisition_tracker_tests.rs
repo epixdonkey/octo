@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use chrono::TimeZone;
 use futures::FutureExt;
+use octo_core::fingerprint::heart_gate::WaitingFor;
 use octo_core::settings::{
     AppSettings, HeartDownloadSource, HeartDownloadStep, SettingsStore, SubsonicSettings,
 };
@@ -20,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::services::common::test_fakes::{FakeDownloads, FakeLidarr};
 use crate::services::common::{
-    AcquisitionRequest, HeartAcquisitionCoordinator, HeartCoordinatorExtras, TrackAcquisitionQueue,
+    AcquisitionRequest, HeartAcquisitionCoordinator, HeartCoordinatorExtras, HeldAcquisition,
+    TrackAcquisitionQueue,
 };
 
 /// A clock the test moves by hand.
@@ -521,6 +523,167 @@ fn the_cap_drops_finished_rows_first_then_the_oldest() {
     assert!(ids.contains("newest"));
 }
 
+// --- Held rows ---------------------------------------------------------------------------
+
+fn held_record(id: &str, waiting: WaitingFor) -> HeldAcquisition {
+    HeldAcquisition {
+        provider: "soulseek".into(),
+        external_id: id.into(),
+        requested_by: Some("alice".into()),
+        waiting_for: Some(waiting),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_held_row_outlives_a_day_and_its_album_claim_stays_with_it() {
+    let clock = ManualClock::new();
+    let tracker = tracker_at(&clock);
+    tracker.begin_album("soulseek", "help-album", Some("alice"));
+    tracker.announce(
+        "soulseek",
+        Some("help-album"),
+        None,
+        &tracks(&[("held", "The Beatles", "Yesterday", "Help!")]),
+    );
+    tracker.hold_row(
+        "soulseek",
+        "held",
+        &["alice".to_string(), "bob".to_string()],
+        "Waiting for MusicBrainz",
+        false,
+    );
+    begin(&tracker, "plain", "alice");
+
+    clock.advance(TimeDelta::hours(25));
+    let rows = tracker.all();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].external_id, "held");
+    assert_eq!(rows[0].state, AcquisitionState::Searching);
+    assert_eq!(rows[0].note.as_deref(), Some("Waiting for MusicBrainz"));
+    assert_eq!(rows[0].requested_by, ["alice", "bob"]);
+    assert!(!rows[0].keep_anyway);
+    // The album the held track is listed under still lists it for whoever hearted it.
+    tracker.begin_album("soulseek", "help-album", Some("carol"));
+    tracker.announce(
+        "soulseek",
+        Some("help-album"),
+        None,
+        &tracks(&[("other", "The Beatles", "Help!", "Help!")]),
+    );
+    let other = tracker
+        .for_user("alice")
+        .into_iter()
+        .find(|row| row.external_id == "other")
+        .expect("listed for alice, whose album claim survived the day");
+    assert_eq!(other.state, AcquisitionState::Queued);
+}
+
+#[test]
+fn five_hundred_and_ten_rows_with_twenty_held_keep_every_held_one() {
+    let clock = ManualClock::new();
+    let tracker = tracker_at(&clock);
+    for i in 0..20 {
+        clock.advance(TimeDelta::seconds(1));
+        tracker.hold_row(
+            "soulseek",
+            &format!("held{i}"),
+            &["alice".to_string()],
+            "Waiting",
+            true,
+        );
+    }
+    for i in 0..490 {
+        clock.advance(TimeDelta::seconds(1));
+        begin(&tracker, &format!("run{i}"), "alice");
+    }
+    let rows = tracker.all();
+    assert_eq!(rows.len(), AcquisitionTracker::CAPACITY);
+    let held: Vec<&AcquisitionSnapshot> = rows.iter().filter(|row| row.keep_anyway).collect();
+    assert_eq!(held.len(), 20, "every held row kept");
+}
+
+#[test]
+fn a_held_row_is_let_go_only_once_no_hold_of_its_song_is_left() {
+    let clock = ManualClock::new();
+    let tracker = tracker_at(&clock);
+    let holds = SoulseekHoldStore::new(None::<std::path::PathBuf>);
+    let mb = holds.hold(held_record("song", WaitingFor::MusicBrainz));
+    holds.hold(held_record("song", WaitingFor::AcoustIdOff));
+    tracker.hold_row(
+        "soulseek",
+        "song",
+        &["alice".to_string()],
+        "AcoustID is off",
+        true,
+    );
+    assert!(only(&tracker, "alice").keep_anyway);
+
+    holds.release(&mb.key());
+    tracker.release_row("soulseek", "song", &holds);
+    assert!(
+        tracker.is_held("soulseek", "song"),
+        "the AcoustIdOff hold is still there"
+    );
+
+    holds.release(&held_record("song", WaitingFor::AcoustIdOff).key());
+    tracker.release_row("soulseek", "song", &holds);
+    assert!(!tracker.is_held("soulseek", "song"));
+    assert!(!only(&tracker, "alice").keep_anyway);
+    clock.advance(TimeDelta::hours(25));
+    assert!(tracker.all().is_empty(), "back to the usual rules");
+}
+
+/// A copy that waits aside for a Lidarr follow: the done row says so over its own line, never
+/// expires while it waits, and says its own line again once the wait ends, or keeps the line
+/// that says why it ended.
+#[test]
+fn a_row_whose_copy_waits_aside_says_so_outlives_a_day_and_ends_with_its_own_line() {
+    const WAITS: &str = "Plays now; joins your library when Lidarr's download for this artist finishes";
+    const PROVEN: &str = "Octo stopped waiting for Lidarr: another copy was proven";
+    let clock = ManualClock::new();
+    let tracker = tracker_at(&clock);
+    begin(&tracker, "kept", "alice");
+    tracker.done_line("soulseek", "kept", "Kept the version you heard");
+    tracker.complete("soulseek", "kept", None);
+    tracker.wait_aside("soulseek", "kept", &["alice".to_string()], WAITS);
+    assert_eq!(only(&tracker, "alice").note.as_deref(), Some(WAITS));
+    assert_eq!(only(&tracker, "alice").state, AcquisitionState::Done);
+
+    clock.advance(TimeDelta::hours(25));
+    assert_eq!(
+        only(&tracker, "alice").note.as_deref(),
+        Some(WAITS),
+        "still listed after a day"
+    );
+
+    tracker.end_aside("soulseek", "kept", None);
+    assert_eq!(
+        only(&tracker, "alice").note.as_deref(),
+        Some("Kept the version you heard"),
+        "its own line again"
+    );
+    clock.advance(TimeDelta::hours(4));
+    assert!(tracker.all().is_empty(), "back to the usual rules");
+
+    // A row a restart left out comes back, done, for the people the copy waits for; a proven
+    // copy that ended the wait is its last line.
+    tracker.wait_aside("soulseek", "again", &["bob".to_string()], WAITS);
+    let row = only(&tracker, "bob");
+    assert_eq!(row.state, AcquisitionState::Done);
+    assert_eq!(row.note.as_deref(), Some(WAITS));
+    tracker.end_aside("soulseek", "again", Some(PROVEN));
+    assert_eq!(only(&tracker, "bob").note.as_deref(), Some(PROVEN));
+    let lines: Vec<String> = tracker
+        .detail("soulseek:again", None)
+        .and_then(|row| row.events)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| event.text)
+        .collect();
+    assert_eq!(lines, [WAITS, PROVEN]);
+}
+
 // --- Seeing it in Navidrome ------------------------------------------------------------
 
 async fn wait_for(tracker: &AcquisitionTracker, user: &str, state: AcquisitionState) -> AcquisitionSnapshot {
@@ -824,4 +987,31 @@ fn a_check_line_keeps_what_acoust_id_heard() {
         .find(|e| e.text == "Nothing heard")
         .expect("the plain line");
     assert_eq!(plain.heard, None);
+}
+
+/// A heart that ended with nothing says why: a row that already failed says it instead of what it
+/// failed with, a row left looking fails with it, and a row with a file on its way or landed keeps
+/// its line.
+#[test]
+fn a_heart_that_ended_with_nothing_says_why_on_its_row() {
+    let tracker = new_tracker();
+    let why = "MusicBrainz could not answer for this song";
+    for id in ["failed", "looking", "landing", "landed"] {
+        tracker.begin("soulseek", id, None, Some("alice"), None, Some(id), None);
+    }
+    tracker.fail("soulseek", "failed", Some("No source had it"));
+    tracker.stage("soulseek", "landing", AcquisitionState::Importing, None, None);
+    tracker.complete("soulseek", "landed", Some("nd-1"));
+
+    for id in ["failed", "looking", "landing", "landed"] {
+        tracker.ended_with_nothing("soulseek", id, why);
+    }
+
+    let row = |id: &str| tracker.detail(&key_of("soulseek", id), None).expect("the row");
+    assert_eq!(row("failed").error.as_deref(), Some(why));
+    assert_eq!(row("looking").state, AcquisitionState::Failed);
+    assert_eq!(row("looking").error.as_deref(), Some(why));
+    assert_eq!(row("landing").state, AcquisitionState::Importing);
+    assert_eq!(row("landed").state, AcquisitionState::Done);
+    assert_ne!(row("landed").error.as_deref(), Some(why));
 }

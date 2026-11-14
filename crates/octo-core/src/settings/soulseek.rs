@@ -2,6 +2,33 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Octo's own AcoustID application key, which every install that sets no key of its own shares.
+/// It is never written in the source: the release build is given it as the
+/// `OCTO_ACOUSTID_APPLICATION_KEY` variable, read here at compile time. A build given none has a
+/// blank built-in key, which counts as no key at all, so AcoustID is off there for an install
+/// without one of its own.
+pub const OCTO_ACOUSTID_APPLICATION_KEY: &str = match option_env!("OCTO_ACOUSTID_APPLICATION_KEY") {
+    Some(key) => key,
+    None => "",
+};
+
+/// Whether the build was asked to carry Octo's own key: `OCTO_REQUIRE_ACOUSTID_KEY` set to
+/// anything but blank (the release build sets it to 1).
+const KEY_REQUIRED: bool = key_required(option_env!("OCTO_REQUIRE_ACOUSTID_KEY"));
+
+const fn key_required(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.is_empty())
+}
+
+/// A build asked to carry Octo's own key (the release build) does not build without it.
+const _: () = assert!(
+    !KEY_REQUIRED || !OCTO_ACOUSTID_APPLICATION_KEY.trim_ascii().is_empty(),
+    "this build needs OCTO_ACOUSTID_APPLICATION_KEY, Octo's own AcoustID application key"
+);
+
+/// The `ACOUSTID_API_KEY` value that turns AcoustID off.
+pub const ACOUSTID_OFF: &str = "off";
+
 /// Configuration for the Soulseek (slskd) integration.
 /// Octo talks to a self-hosted slskd instance which fronts the Soulseek P2P network.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -94,8 +121,10 @@ pub struct SoulseekSettings {
     /// Fingerprint every finished download with Chromaprint and ask AcoustID what it actually
     /// is before accepting it. A Soulseek file identified as a different recording is discarded
     /// and the next peer tried; a YouTube file has no second candidate, so it is kept and, with
-    /// the Review playlist on, asked about. Off by default: it needs a free AcoustID key and
-    /// the fpcalc binary, and without both it can only ever be a no-op.
+    /// the Review playlist on, asked about. Needs the fpcalc binary. On by default: Octo's
+    /// published images carry Octo's own AcoustID key, so a default install from them checks what
+    /// it downloads (a build given no key needs a key of the user's own). Hearts and plays are
+    /// checked by their sound whatever this says.
     ///
     /// This also switches on the rejected-peer memory. A file discarded for being the wrong
     /// recording, by this check OR by the pre-existing duration check, is remembered by peer
@@ -110,9 +139,9 @@ pub struct SoulseekSettings {
     /// Environment variable: SKIP_COVERS_AND_INSTRUMENTALS
     pub skip_covers_and_instrumentals: bool,
 
-    /// AcoustID application key, free from https://acoustid.org/new-application. Blank
-    /// disables the lookup half of VerifyDownloads; the duration check and its rejection
-    /// memory keep working without it. Named ...ApiKey so the Config-sources tab masks it.
+    /// Your own AcoustID application key, free from https://acoustid.org/new-application. Blank
+    /// uses Octo's own key, which every install without one shares; `off` turns AcoustID off.
+    /// Named ...ApiKey so the Config-sources tab masks it.
     /// Environment variable: ACOUSTID_API_KEY
     pub acoust_id_api_key: String,
 
@@ -229,7 +258,7 @@ impl Default for SoulseekSettings {
             min_file_size_bytes: 5 * 1024 * 1024,
             preferred_extension: "flac".to_string(),
             download_timeout_seconds: 180,
-            verify_downloads: false,
+            verify_downloads: true,
             skip_covers_and_instrumentals: true,
             acoust_id_api_key: String::new(),
             tag_from_music_brainz: false,
@@ -304,6 +333,48 @@ impl SoulseekSettings {
     /// The same threshold as AcoustID reports it, in 0..1.
     pub fn effective_min_score_fraction(&self) -> f64 {
         f64::from(self.effective_min_match_score()) / 100.0
+    }
+
+    /// AcoustID is switched off by the `off` setting.
+    pub fn acoust_id_off(&self) -> bool {
+        self.acoust_id_api_key.trim().eq_ignore_ascii_case(ACOUSTID_OFF)
+    }
+
+    /// The user's own application key: set, and not `off`.
+    pub fn acoust_id_user_key(&self) -> Option<String> {
+        let key = self.acoust_id_api_key.trim();
+        (!key.is_empty() && !self.acoust_id_off()).then(|| key.to_string())
+    }
+
+    /// Octo's own application key, when it has one.
+    pub fn acoust_id_built_in_key() -> Option<&'static str> {
+        Self::built_in_key_of(OCTO_ACOUSTID_APPLICATION_KEY)
+    }
+
+    /// The key one person's own action looks up with (a heart's or a play's gate, a family
+    /// request, a click): the user's key, else Octo's own. None when AcoustID is off.
+    pub fn acoust_id_key_for_heart(&self) -> Option<String> {
+        self.key_for_heart_with(Self::acoust_id_built_in_key())
+    }
+
+    /// The key work nobody waits on looks up with: the user's own only. Without one, such work
+    /// may still use Octo's own key, at the shared lane's lowest place, but never a submission.
+    pub fn acoust_id_key_for_bulk(&self) -> Option<String> {
+        self.acoust_id_user_key()
+    }
+
+    /// [`Self::acoust_id_key_for_heart`] with a given built-in key.
+    pub fn key_for_heart_with(&self, built_in: Option<&str>) -> Option<String> {
+        if self.acoust_id_off() {
+            return None;
+        }
+        self.acoust_id_user_key()
+            .or_else(|| built_in.and_then(Self::built_in_key_of).map(str::to_string))
+    }
+
+    fn built_in_key_of(key: &str) -> Option<&str> {
+        let key = key.trim();
+        (!key.is_empty()).then_some(key)
     }
 
     /// SharedFolders as a list, blanks dropped.
@@ -400,6 +471,175 @@ mod tests {
             );
         }
         assert_eq!(SoulseekSettings::default().effective_web_url(), None);
+    }
+}
+
+#[cfg(test)]
+mod acoust_id_key_tests {
+    use super::*;
+
+    fn with_key(key: &str) -> SoulseekSettings {
+        SoulseekSettings {
+            acoust_id_api_key: key.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A blank key means Octo's own; `off`, in any case and with spaces, turns AcoustID off; the
+    /// user's own key wins for both kinds of work, and bulk work never gets Octo's own as a key.
+    #[test]
+    fn a_blank_key_means_octos_own_and_off_turns_acoustid_off() {
+        let octo = Some("octo-key");
+        for blank in ["", "   "] {
+            let s = with_key(blank);
+            assert_eq!(
+                s.key_for_heart_with(octo).as_deref(),
+                Some("octo-key"),
+                "{blank:?}"
+            );
+            assert_eq!(s.acoust_id_key_for_bulk(), None);
+            assert!(!s.acoust_id_off());
+        }
+        for off in ["off", " OFF ", "Off"] {
+            let s = with_key(off);
+            assert!(s.acoust_id_off());
+            assert_eq!(s.key_for_heart_with(octo), None, "{off:?}");
+            assert_eq!(s.acoust_id_key_for_bulk(), None);
+            assert_eq!(s.acoust_id_user_key(), None);
+        }
+        let own = with_key(" user-key ");
+        assert_eq!(own.key_for_heart_with(octo).as_deref(), Some("user-key"));
+        assert_eq!(own.key_for_heart_with(None).as_deref(), Some("user-key"));
+        assert_eq!(own.acoust_id_key_for_bulk().as_deref(), Some("user-key"));
+    }
+
+    /// Octo's own key counts only once it is set: a blank one is no key, so an install without a
+    /// key of its own has AcoustID off until then.
+    #[test]
+    fn octos_own_key_counts_only_once_it_is_set() {
+        let keyless = SoulseekSettings::default();
+        assert_eq!(keyless.key_for_heart_with(None), None);
+        assert_eq!(keyless.key_for_heart_with(Some("  ")), None);
+        let built_in = OCTO_ACOUSTID_APPLICATION_KEY.trim();
+        if built_in.is_empty() {
+            assert_eq!(SoulseekSettings::acoust_id_built_in_key(), None);
+            assert_eq!(keyless.acoust_id_key_for_heart(), None);
+        } else {
+            assert_eq!(SoulseekSettings::acoust_id_built_in_key(), Some(built_in));
+            assert_eq!(keyless.acoust_id_key_for_heart().as_deref(), Some(built_in));
+        }
+        assert_eq!(with_key("off").acoust_id_key_for_heart(), None);
+    }
+
+    /// Verification is on by default in the code and in the three files an install starts from.
+    #[test]
+    fn downloads_are_verified_by_default_everywhere() {
+        assert!(SoulseekSettings::default().verify_downloads);
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read =
+            |name: &str| std::fs::read_to_string(repo.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(read("octo/appsettings.json").contains(r#""VerifyDownloads": true,"#));
+        assert!(
+            read("docker-compose.yml").contains("Soulseek__VerifyDownloads: ${SLSKD_VERIFY_DOWNLOADS:-true}")
+        );
+        let example = read(".env.example");
+        assert!(example.lines().any(|line| line == "SLSKD_VERIFY_DOWNLOADS=true"));
+        assert!(example.lines().any(|line| line == "ACOUSTID_API_KEY="));
+        assert!(example.contains("ACOUSTID_API_KEY=off"));
+    }
+
+    /// The published server image is built with Octo's own AcoustID key from the repository's
+    /// secret, and its build refuses to go on when that key is blank: the workflow checks the
+    /// secret before building and hands the key to the server's build only as a build secret
+    /// (never a build argument, which an image's history and provenance keep), with the
+    /// requirement and the key's hash as build arguments and the provenance kept to its minimum;
+    /// the Dockerfile mounts the secret as a file into the server's build step alone (no `env=`,
+    /// which an older BuildKit cannot build), reads the key from that file only, never prints it
+    /// or its hash, checks it again, and the compile refuses a blank key.
+    #[test]
+    fn the_published_image_is_built_with_octos_own_acoustid_key() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read =
+            |name: &str| std::fs::read_to_string(repo.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let workflow = read(".github/workflows/docker.yml");
+        assert!(
+            workflow.contains("OCTO_ACOUSTID_APPLICATION_KEY: ${{ secrets.OCTO_ACOUSTID_APPLICATION_KEY }}")
+        );
+        assert!(workflow.contains("'OCTO_REQUIRE_ACOUSTID_KEY=1'"));
+        assert!(workflow.contains("arg=OCTO_ACOUSTID_KEY_SHA256="));
+        let check = workflow
+            .find("name: Octo's own AcoustID key is set")
+            .expect("the check of the secret");
+        let build = workflow
+            .find("name: Build and push by digest")
+            .expect("the image build");
+        assert!(check < build, "the secret is checked before the build");
+        let step = &workflow[build..];
+        let step = &step[..step.find("\n      - name:").unwrap_or(step.len())];
+        let args = &step[step.find("build-args:").expect("the build arguments")..];
+        let args = &args[..args.find("\n          secrets:").expect("the secrets after them")];
+        assert!(
+            !args.contains("secrets."),
+            "no secret is a build argument: {args}"
+        );
+        assert!(args.contains("${{ steps.acoustid.outputs.arg }}"));
+        assert!(
+            step.contains("format('acoustid_key={0}', secrets.OCTO_ACOUSTID_APPLICATION_KEY)"),
+            "the key is a build secret"
+        );
+        assert!(step.contains("provenance: mode=min"));
+
+        let dockerfile = read("Dockerfile");
+        assert!(dockerfile.starts_with("# syntax=docker/dockerfile:1\n"));
+        assert!(
+            !dockerfile.contains("ARG OCTO_ACOUSTID_APPLICATION_KEY"),
+            "the key is no build argument"
+        );
+        let from_the_secret =
+            "OCTO_ACOUSTID_APPLICATION_KEY=\"$(cat /run/secrets/acoustid_key 2>/dev/null || true)\"";
+        assert_eq!(
+            dockerfile.matches("OCTO_ACOUSTID_APPLICATION_KEY=").count(),
+            dockerfile.matches(from_the_secret).count(),
+            "the Dockerfile names no key: it reads it from the secret's file alone"
+        );
+        let required = dockerfile
+            .find("ARG OCTO_REQUIRE_ACOUSTID_KEY")
+            .expect("the requirement's build argument");
+        let hash = dockerfile
+            .find("ARG OCTO_ACOUSTID_KEY_SHA256")
+            .expect("the key's hash, which rebuilds the server when the key changes");
+        let mount = dockerfile
+            .find("RUN --mount=type=secret,id=acoustid_key \\\n")
+            .expect("the secret mounted as a file into the server's build step");
+        let server = dockerfile
+            .find("cargo build --release --locked --package octo --bin octo")
+            .expect("the server's build");
+        assert!(required < mount && hash < mount && mount < server);
+        assert!(
+            !dockerfile.contains(",env="),
+            "no secret mounted as an environment variable"
+        );
+        assert_eq!(
+            dockerfile.matches("--mount=type=secret").count(),
+            1,
+            "no other step sees the key"
+        );
+        let step = &dockerfile[mount..server];
+        assert!(step.contains(from_the_secret));
+        assert!(step.contains("exit 1"));
+        assert!(
+            !dockerfile.contains("${OCTO_ACOUSTID_KEY_SHA256"),
+            "the build log prints neither the key nor its hash"
+        );
+    }
+
+    /// Only a requirement given a value asks the build for Octo's own key: one set but blank does
+    /// not.
+    #[test]
+    fn a_blank_requirement_asks_for_no_key() {
+        assert!(!key_required(None));
+        assert!(!key_required(Some("")));
+        assert!(key_required(Some("1")));
     }
 }
 

@@ -3,6 +3,8 @@
 pub mod acquisition_activity;
 pub mod acquisition_tracker;
 pub mod acquisition_worker;
+pub mod album_gates;
+pub mod album_identity;
 pub mod base_download_service;
 pub mod cache_cleanup_service;
 pub mod download_arrivals;
@@ -25,6 +27,7 @@ pub use acquisition_tracker::{
     AcquisitionEnd, AcquisitionSnapshot, AcquisitionState, AcquisitionTracker, TrackerServices, WatchSettings,
 };
 pub use acquisition_worker::AcquisitionWorker;
+pub use album_gates::{AlbumGate, AlbumGateTrack, AlbumGates};
 pub use base_download_service::{
     BaseDownloadService, CatalogBlanks, DownloadBackend, DownloadCore, DownloadOptions, DownloadServices,
     FileNotFoundException, LayoutChoice, MeterPreview, OperationCanceled, Placement, PlaylistTrackSync,
@@ -37,16 +40,17 @@ pub use download_log_keeper::DownloadLogKeeper;
 pub use download_picks::{DownloadPicks, PickedCopy};
 pub use external_search_service::ExternalSearchService;
 pub use heart_acquisition_coordinator::{
-    FamilyHooks, HeartAcquisitionCoordinator, HeartCoordinatorExtras, TrackOutcome,
+    FamilyHooks, GateStart, HeartAcquisitionCoordinator, HeartCoordinatorExtras, HeartGates, TrackOutcome,
 };
 pub use song_finder::{SongFinder, SongFinderServices};
 pub use soulseek_hold_resumer::SoulseekHoldResumer;
-pub use soulseek_hold_store::{HeldAcquisition, HeldKind, SoulseekHoldStore};
+pub use soulseek_hold_store::{HeldAcquisition, HeldKind, Holder, SoulseekHoldStore};
 pub use star_on_arrival::{StarNavidrome, StarOnArrival, WaitingStar};
 pub use top_songs_service::{ChartFetch, TopList, TopSong, TopSongsService};
 pub use track_acquisition_queue::{
-    AcquisitionOutcome, AcquisitionPlace, AcquisitionRequest, AcquisitionTarget, Completion,
-    TrackAcquisitionQueue,
+    AcquisitionHeld, AcquisitionOutcome, AcquisitionPlace, AcquisitionRequest, AcquisitionTarget, Completion,
+    GateLedger, GateOutcome, HeldFiles, PlayOutcome, SharedGates, SoundDeny, TrackAcquisitionQueue,
+    acquisition_key,
 };
 
 #[cfg(test)]

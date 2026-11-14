@@ -620,6 +620,20 @@ impl LibraryEditService {
             );
         }
         let restored = back.quarantine_path.clone().unwrap_or_default();
+        // The outside songs follow their files: the newer one's go to the trash with it, so
+        // swapping it in again gives them back, and the old file's come back to it, a file kept
+        // as heard still kept as heard.
+        if let Some(library) = &self.services.library {
+            match library.forget_mapping(&now).await {
+                Ok(newer_songs) => self.quarantine.record_mappings(&newer, &newer_songs),
+                Err(e) => warn!("The outside songs of {now} could not be moved aside with it: {e}"),
+            }
+            if let Some(mappings) = back.mappings.as_ref().filter(|mappings| !mappings.is_empty())
+                && let Err(e) = library.restore_mappings(mappings, &restored).await
+            {
+                warn!("The outside songs of {restored} could not be linked to it again: {e}");
+            }
+        }
         self.actions.complete(
             &entry.key,
             LibraryActionState::Restored,
@@ -850,9 +864,13 @@ impl LibraryEditService {
             current,
             suggested: suggested(&song),
             confidence: Some(plan.confidence.name().to_string()),
-            source: chosen
-                .map(|chosen| chosen.source.name().to_string())
-                .or_else(|| plan.catalog_best.as_ref().map(|_| "Deezer".to_string())),
+            source: chosen.map(|chosen| chosen.source.name().to_string()).or_else(|| {
+                plan.catalog_best.as_ref().map(|best| {
+                    // An id above Deezer's range is Apple's: Apple's catalog answered.
+                    octo_core::metadata::apple_as_deezer::catalog_name(best.track_id.as_deref().unwrap_or(""))
+                        .to_string()
+                })
+            }),
             release: chosen.map(TagPlan::describe),
         }
     }

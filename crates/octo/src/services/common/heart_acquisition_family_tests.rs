@@ -145,7 +145,14 @@ async fn owner_heart_downloads_even_if_a_member_owns_it() {
     let coordinator = chain.coordinator.clone();
     let running = tokio::spawn(async move {
         coordinator
-            .acquire_track_outcome("test", "1", Some("winters"), None, &AcquisitionTarget::Shared)
+            .acquire_track_outcome(
+                "test",
+                "1",
+                Some("winters"),
+                None,
+                &AcquisitionTarget::Shared,
+                AcquisitionOrigin::Heart,
+            )
             .await
     });
     let request = next_queued(&chain.queue)
@@ -153,7 +160,10 @@ async fn owner_heart_downloads_even_if_a_member_owns_it() {
         .expect("queued: Alex's copy is not the library's");
     assert_eq!(
         request.place(),
-        AcquisitionPlace::default(),
+        AcquisitionPlace {
+            origin: Some(AcquisitionOrigin::Heart),
+            ..Default::default()
+        },
         "into the shared library"
     );
     request.completion.try_set_result("/music/Artist/Album/1.flac");
@@ -174,6 +184,7 @@ async fn a_member_heart_counts_their_own_copy_and_never_anothers() {
             Some("alex"),
             None,
             &AcquisitionTarget::Member("alex".into()),
+            AcquisitionOrigin::Heart,
         )
         .await
         .expect("ran");
@@ -190,6 +201,7 @@ async fn a_member_heart_counts_their_own_copy_and_never_anothers() {
                 Some("sam"),
                 None,
                 &AcquisitionTarget::Member("sam".into()),
+                AcquisitionOrigin::Heart,
             )
             .await
     });
@@ -215,6 +227,7 @@ async fn member_chain_skips_lidarr() {
                 Some("sam"),
                 None,
                 &AcquisitionTarget::Member("sam".into()),
+                AcquisitionOrigin::Heart,
             )
             .await
     });
@@ -225,7 +238,14 @@ async fn member_chain_skips_lidarr() {
     // The owner's chain still starts with Lidarr.
     chain
         .coordinator
-        .acquire_track_outcome("test", "3", Some("winters"), None, &AcquisitionTarget::Shared)
+        .acquire_track_outcome(
+            "test",
+            "3",
+            Some("winters"),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::Heart,
+        )
         .await
         .expect("ran");
     assert_eq!(chain.lidarr.calls(), 1);
@@ -255,7 +275,13 @@ async fn plays_keep_a_copy_only_for_those_who_add_at_once() {
         .coordinator
         .queue_play("test", "8", Some("winters"), None, Some("winters"));
     let owner = next_queued(&chain.queue).await.expect("queued");
-    assert_eq!(owner.place(), AcquisitionPlace::default());
+    assert_eq!(
+        owner.place(),
+        AcquisitionPlace {
+            origin: Some(AcquisitionOrigin::Play),
+            ..Default::default()
+        }
+    );
 }
 
 #[tokio::test]
@@ -308,11 +334,24 @@ async fn family_off_plays_and_hearts_as_always() {
         .coordinator
         .queue_play("test", "9", Some("sam"), None, Some("sam"));
     let request = next_queued(&chain.queue).await.expect("queued");
-    assert_eq!(request.place(), AcquisitionPlace::default());
+    assert_eq!(
+        request.place(),
+        AcquisitionPlace {
+            origin: Some(AcquisitionOrigin::Play),
+            ..Default::default()
+        }
+    );
     // The file under the members folder is just the library's.
     let owner = chain
         .coordinator
-        .acquire_track_outcome("test", "1", Some("winters"), None, &AcquisitionTarget::Shared)
+        .acquire_track_outcome(
+            "test",
+            "1",
+            Some("winters"),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::Heart,
+        )
         .await
         .expect("ran");
     assert_eq!(owner, TrackOutcome::AlreadyThere);
@@ -326,13 +365,26 @@ async fn family_turned_off_never_counts_a_members_own_copy_as_the_librarys() {
     let coordinator = chain.coordinator.clone();
     let owner = tokio::spawn(async move {
         coordinator
-            .acquire_track_outcome("test", "1", Some("winters"), None, &AcquisitionTarget::Shared)
+            .acquire_track_outcome(
+                "test",
+                "1",
+                Some("winters"),
+                None,
+                &AcquisitionTarget::Shared,
+                AcquisitionOrigin::Heart,
+            )
             .await
     });
     // Alex's library is still there, so the shared library does not have the song: it is fetched.
     let request = next_queued(&chain.queue).await.expect("queued");
     assert_eq!(request.external_id, "1");
-    assert_eq!(request.place(), AcquisitionPlace::default());
+    assert_eq!(
+        request.place(),
+        AcquisitionPlace {
+            origin: Some(AcquisitionOrigin::Heart),
+            ..Default::default()
+        }
+    );
     owner.abort();
 }
 
@@ -417,5 +469,97 @@ async fn a_members_song_heart_brings_its_album_without_starring_its_songs() {
         })
         .await,
         "an album heart stars every song"
+    );
+}
+
+/// Gates that are ready, and pass a file that landed with nobody judging it for them.
+struct PassingLanded;
+
+#[async_trait]
+impl HeartGates for PassingLanded {
+    async fn build(&self, _: &str, _: &str, holder: &Holder, origin: AcquisitionOrigin) -> GateStart {
+        GateStart::Ready(HeartGate {
+            user: holder.user.clone(),
+            origin,
+            r: None,
+            heard: None,
+            heard_seconds: None,
+            reading: HeardReading::NotHeard,
+            stand_in: None,
+        })
+    }
+
+    async fn judge_landed(&self, _: &str, _: LabelSource, _: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
+        gates
+            .iter()
+            .map(|_| GateVerdict::Accept {
+                by: Acceptance::Sound,
+                tags: octo_core::fingerprint::heart_gate::TagClaim::AsHeard,
+            })
+            .collect()
+    }
+}
+
+/// A member's heart whose file landed with nobody judging it for them has it judged by their own
+/// gate, and a pass links it into their own library, as the worker links a member whose gate
+/// passed it: their row's Done means the file is theirs.
+#[tokio::test]
+async fn a_members_late_judged_landed_file_is_linked_into_their_own_library() {
+    let world = World::new(None);
+    configure(&world, &[HeartDownloadSource::YouTube], false);
+    let chain = chain(world);
+    let coordinator = HeartAcquisitionCoordinator::new(
+        chain.world.settings.clone(),
+        chain.queue.clone(),
+        Arc::new(FakeDownloads::default()),
+        chain.lidarr.clone(),
+        HeartCoordinatorExtras {
+            gates: Some(Arc::new(PassingLanded)),
+            ..Default::default()
+        },
+    );
+    coordinator.use_family(chain.coordinator.family.get().expect("family").clone());
+    let pooled = chain.world.pool_file("Artist/Album/Song 1.flac", 10);
+    chain
+        .world
+        .pool
+        .record(crate::services::family::family_pool_store::PoolFile {
+            path: pooled.clone(),
+            size: 10,
+            format: "flac".into(),
+            outside_ids: vec!["test:1".into()],
+            isrc: None,
+            title: "Song 1".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            refs: vec!["alex".into()],
+            transcoded_from: None,
+        });
+    let queue = chain.queue.clone();
+    let landed = pooled.clone();
+    tokio::spawn(async move {
+        // The file lands with nothing judged for sam, and nobody links it for her.
+        let request = next_queued(&queue).await.expect("queued");
+        queue.release(&request);
+        request.completion.try_set_result(landed);
+    });
+
+    let outcome = coordinator
+        .acquire_track_outcome(
+            "test",
+            "1",
+            Some("sam"),
+            None,
+            &AcquisitionTarget::Member("sam".into()),
+            AcquisitionOrigin::Heart,
+        )
+        .await
+        .expect("ran");
+
+    assert_eq!(outcome, TrackOutcome::Landed(pooled.clone()));
+    let link = chain.world.pool.link_path(&pooled, "sam").expect("a link path");
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "sam's own library has the file: {link}"
     );
 }

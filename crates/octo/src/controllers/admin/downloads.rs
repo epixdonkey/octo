@@ -1,21 +1,21 @@
 //! The download log and Find songs routes: the dashboard's side of what the Octo apps already
 //! do, for admins whose listeners use other Subsonic apps. A download's full log on Fetched
-//! songs, and Find songs (a search run again by hand, every copy listed, one picked). Recently
-//! removed and Put back (`trash`, `trash/restore`) are the library edits' (see `trash`).
+//! songs, Find songs (a search run again by hand, every copy listed, one picked), a held
+//! download's Keep anyway for one of the people it was held for, and Put Lidarr back on a Lidarr
+//! follow Octo cannot settle.
+//! Recently removed and Put back (`trash`, `trash/restore`) are the library edits' (see `trash`).
 //!
 //! Everything here names peers, files or people, or changes the library, so every call needs a
 //! Navidrome admin's own dashboard sign-in (never the recovery code) and acts as that person:
 //! their Find songs limits, and for a library file the library actions gates (switched on, on
 //! the allowed list, dry run only rehearses), exactly as in the apps.
 
-use axum::body::Body;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{get, post};
 use octo_core::common::dotnet::{self, is_blank};
 use octo_core::soulseek::RoutingKind;
-use octo_media::cover::cover_image;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -23,12 +23,15 @@ use tracing::{debug, info};
 
 use super::json_body::bind_optional_body;
 use super::json_body::{FromBody, Kind, Member, Shape, text_record};
-use super::plumbing::{BROWSE_COOKIE_NAME, BROWSE_TOKEN_HEADER, request_cookie};
+use super::plumbing::{BROWSE_COOKIE_NAME, BROWSE_TOKEN_HEADER, cover_reply, request_cookie};
 use super::request_binding::{error, ok, query, sign_in, split};
 use crate::app::AppState;
+use crate::controllers::subsonic::downloads::{NAME_THE_PERSON, NOTHING_WAITING};
 use crate::http::error::problem;
 use crate::http::routes::RouteSet;
+use crate::services::admin::fetched_covers::side_for;
 use crate::services::common::acquisition_tracker::AcquisitionSnapshot;
+use crate::services::common::heart_acquisition_coordinator::KeepAnyway;
 use crate::services::local::DownloadHistoryService;
 use crate::services::soulseek::SoulseekMetadataService;
 use crate::services::subsonic::subsonic_response_builder::{
@@ -38,11 +41,12 @@ use crate::services::subsonic::subsonic_response_builder::{
 /// Outside songs a search on the Find songs page lists.
 pub const OUTSIDE_LIMIT: usize = 20;
 
-const COVER_SIDE: u32 = 160;
-
 pub fn routes() -> RouteSet {
     RouteSet::new()
         .route("/api/admin/downloads/log", get(download_log))
+        .route("/api/admin/acquisitions/holders", get(held_for))
+        .route("/api/admin/acquisitions/keep", post(keep_anyway))
+        .route("/api/admin/lidarr/put-back", post(put_lidarr_back))
         .route("/api/admin/find", post(start_find))
         .route("/api/admin/find/outside", get(outside_songs))
         .route("/api/admin/find/cover", get(find_cover))
@@ -94,7 +98,12 @@ pub async fn download_log(State(state): State<AppState>, request: Request) -> Re
         Some(entry) => DownloadHistoryService::written_at(entry)
             .is_none_or(|written| row.started_at <= written + chrono::TimeDelta::seconds(1)),
     });
-    if let Some(row) = row.filter(|_| same_run) {
+    if let Some(mut row) = row.filter(|_| same_run) {
+        // The holds say what the row offers now, never the row's own flag, which stays set after
+        // a keep was asked.
+        row.keep_anyway = state.heart_acquisition_coordinator.keepable_rows().contains(
+            &crate::services::common::acquisition_tracker::key_of(&row.provider, &row.external_id),
+        );
         let mut json = acquisition_json(&row);
         json.insert("provider".into(), json!(row.provider));
         json.insert("externalId".into(), json!(row.external_id));
@@ -107,6 +116,185 @@ pub async fn download_log(State(state): State<AppState>, request: Request) -> Re
         return ok(&json!({ "key": key, "kept": "live", "row": json, "event": lines }));
     }
     ok(&json!({ "key": key, "kept": "none", "row": null, "event": [] }))
+}
+
+// ---- Keep anyway --------------------------------------------------------------------------
+
+/// `HeldRequest(string? Key, string? User, string? Token)`: a held download's row key and the
+/// person to act for, by name or by the token the holder menu gave for them.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct HeldRequest {
+    key: Option<String>,
+    user: Option<String>,
+    token: Option<String>,
+}
+
+impl FromBody for HeldRequest {
+    const SHAPE: &'static Shape = text_record!(
+        "Octo.Controllers.AdminDownloadsController+HeldRequest",
+        "key",
+        "user",
+        "token"
+    );
+}
+
+/// The row key and the person a Keep anyway names, trimmed: by name, or by a holder menu's token, matched among `people` (who may be acted for on the row now; a token
+/// naming nobody who still waits names nobody, and nothing waits for nobody). Or the words that
+/// say which is missing (`unnamed` when it is the person).
+fn held_request(
+    request: Option<HeldRequest>,
+    unnamed: &'static str,
+    people: impl FnOnce(&str) -> Vec<String>,
+) -> Result<(String, String), &'static str> {
+    let (key, user, token) = request.map_or((None, None, None), |r| (r.key, r.user, r.token));
+    let Some(key) = key.filter(|key| !is_blank(key)) else {
+        return Err("Which download? The key is missing.");
+    };
+    let key = key.trim().to_string();
+    if let Some(user) = user.filter(|user| !is_blank(user)) {
+        return Ok((key, user.trim().to_string()));
+    }
+    let Some(token) = token.filter(|token| !is_blank(token)) else {
+        return Err(unnamed);
+    };
+    let user = people(&key)
+        .into_iter()
+        .find(|user| dotnet::eq_ignore_case(&holder_token(&key, user), token.trim()))
+        .unwrap_or_default();
+    Ok((key, user))
+}
+
+/// An opaque token for one person on one row: a keyed hash of the two under a secret this
+/// process made at its start, so a holder menu acts for a person without naming them, and a
+/// token is good for that row only.
+fn holder_token(key: &str, user: &str) -> String {
+    use sha2::{Digest, Sha256};
+    static SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let secret = SECRET.get_or_init(rand::random::<[u8; 32]>);
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(secret);
+    let message = format!(
+        "{}\n{}",
+        dotnet::to_lower_invariant(key.trim()),
+        dotnet::to_lower_invariant(user.trim())
+    );
+    let mut inner = Sha256::new();
+    inner.update(block.map(|byte| byte ^ 0x36));
+    inner.update(message.as_bytes());
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(block.map(|byte| byte ^ 0x5c));
+    outer.update(inner);
+    hex::encode(outer.finalize())
+}
+
+/// One holder menu: each person with the token that names them back. Their name shows while
+/// Record who asked is on; with it off, nobody is named and each shows as "Listener 1", "Listener
+/// 2" and so on, numbered by their place on the menu (in the order they joined).
+fn holder_menu(state: &AppState, key: &str, people: &[String]) -> Vec<Value> {
+    let named = state.settings.current().subsonic.record_requested_by;
+    people
+        .iter()
+        .enumerate()
+        .map(|(at, user)| {
+            json!({
+                "label": if named { user.clone() } else { format!("Listener {}", at + 1) },
+                "token": holder_token(key, user),
+            })
+        })
+        .collect()
+}
+
+/// The holder menu of one held row: who may keep it anyway now (`keepers`), in the order they
+/// joined, each as a label and a token ([`holder_menu`]).
+pub async fn held_for(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, _) = split(request).await;
+    if admin(&state, &parts.headers).is_none() {
+        return sign_in();
+    }
+    let Some(key) = query(&parts.uri, "key").filter(|k| !is_blank(k)) else {
+        return error(StatusCode::BAD_REQUEST, "Which download? The key is missing.");
+    };
+    let key = key.trim().to_string();
+    let keepers = state.heart_acquisition_coordinator.keepers(&key);
+    ok(&json!({
+        "key": key,
+        "keepers": holder_menu(&state, &key, &keepers),
+    }))
+}
+
+/// Keep anyway (Keep these anyway on a hearted album's row) for one person waiting in the row's
+/// holds, the admin's own way to what keepAcquisitionAnyway does for the apps with `user`: the
+/// keep is saved with the holds before this answers a plain ok, then carried out. A conflict when
+/// nothing of the row waits to be kept for that person.
+pub async fn keep_anyway(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, body) = split(request).await;
+    let request: Option<HeldRequest> = match bind_optional_body(&parts.headers, &body) {
+        Ok(request) => request,
+        Err(answer) => return answer,
+    };
+    let Some(admin) = admin(&state, &parts.headers) else {
+        return sign_in();
+    };
+    let coordinator = &state.heart_acquisition_coordinator;
+    let (key, user) = match held_request(request, NAME_THE_PERSON, |key| coordinator.keepers(key)) {
+        Ok(named) => named,
+        Err(missing) => return error(StatusCode::BAD_REQUEST, missing),
+    };
+    match coordinator.keep_anyway(&key, &user) {
+        KeepAnyway::Keeping => {
+            info!("{admin} kept {key} anyway for {user} from the dashboard");
+            ok(&json!({ "status": "ok" }))
+        }
+        _ => error(StatusCode::CONFLICT, NOTHING_WAITING),
+    }
+}
+
+// ---- Put Lidarr back ----------------------------------------------------------------------
+
+/// `PutBackRequest(string? Follow)`: the album (its foreign id) of a follow the Lidarr card lists
+/// as one Octo cannot settle.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PutBackRequest {
+    follow: Option<String>,
+}
+
+impl FromBody for PutBackRequest {
+    const SHAPE: &'static Shape = text_record!(
+        "Octo.Controllers.AdminDownloadsController+PutBackRequest",
+        "follow"
+    );
+}
+
+/// What "Put Lidarr back" answers for a follow Octo can settle by itself, or one already over.
+pub const NOTHING_TO_PUT_BACK: &str = "Octo can see this download again, or its follow is over";
+
+/// "Put Lidarr back" on a follow the Lidarr card lists as one Octo cannot settle: the downloads
+/// Octo cannot see count as gone, the follow ends, and its pick is put back, held copies placed. A
+/// conflict when the follow is not one Octo cannot settle; nothing changes then.
+pub async fn put_lidarr_back(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, body) = split(request).await;
+    let request: Option<PutBackRequest> = match bind_optional_body(&parts.headers, &body) {
+        Ok(request) => request,
+        Err(answer) => return answer,
+    };
+    let Some(admin) = admin(&state, &parts.headers) else {
+        return sign_in();
+    };
+    let Some(follow) = request
+        .and_then(|request| request.follow)
+        .filter(|follow| !is_blank(follow))
+    else {
+        return error(StatusCode::BAD_REQUEST, "Which follow? The album is missing.");
+    };
+    let follow = follow.trim();
+    if !state.lidarr_hearts.put_lidarr_back(follow) {
+        return error(StatusCode::CONFLICT, NOTHING_TO_PUT_BACK);
+    }
+    info!("{admin} put Lidarr back for {follow} from the dashboard");
+    ok(&json!({ "status": "ok" }))
 }
 
 // ---- Find songs ---------------------------------------------------------------------------
@@ -255,8 +443,10 @@ pub async fn outside_songs(State(state): State<AppState>, request: Request) -> R
     ok(&json!({ "available": available, "songs": songs }))
 }
 
-/// A small cover for a song on the Find songs page: a library song's own picture, read from its
-/// file, or for an outside song the catalog's cover (a redirect to it).
+/// A cover for a song on the Find songs and Listening pages, at `size` (small unless more than
+/// 200 px is asked for): a library song's own picture, read from its file or its folder, or for
+/// an outside song the catalog's cover, fetched by Octo so the browser never loads it from the
+/// catalog's host.
 pub async fn find_cover(State(state): State<AppState>, request: Request) -> Response {
     let (parts, _) = split(request).await;
     if admin(&state, &parts.headers).is_none() {
@@ -265,6 +455,7 @@ pub async fn find_cover(State(state): State<AppState>, request: Request) -> Resp
     let Some(id) = query(&parts.uri, "id").filter(|id| !is_blank(id)) else {
         return problem(StatusCode::NOT_FOUND);
     };
+    let side = side_for(query(&parts.uri, "size").as_deref());
     let mut raw = id.trim().to_string();
     let prefix = format!("{}:", SoulseekMetadataService::PROVIDER_NAME);
     if dotnet::starts_with_ignore_case(&raw, &prefix) {
@@ -291,54 +482,21 @@ pub async fn find_cover(State(state): State<AppState>, request: Request) -> Resp
                 false,
             )
             .await;
-        let cover = meta
-            .and_then(|m| m.album_cover_url)
-            .filter(|url| !url.is_empty())
-            .and_then(|url| url::Url::parse(&url).ok())
-            .filter(|url| matches!(url.scheme(), "https" | "http"));
-        return match cover {
-            Some(cover) => {
-                let mut res = Response::new(Body::empty());
-                *res.status_mut() = StatusCode::FOUND;
-                if let Ok(location) = HeaderValue::from_str(cover.as_str()) {
-                    res.headers_mut().insert(header::LOCATION, location);
-                }
-                res.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("private, max-age=3600"),
-                );
-                res
-            }
-            None => problem(StatusCode::NOT_FOUND),
+        let picture = match meta.and_then(|m| m.album_cover_url).filter(|url| !is_blank(url)) {
+            Some(url) => state.fetched_covers.outside_cover(&url, side).await,
+            None => None,
         };
+        return picture.map_or_else(|| problem(StatusCode::NOT_FOUND), cover_reply);
     }
 
     let Some(file) = state.navidrome_song_path_resolver.resolve(&raw).await else {
         return problem(StatusCode::NOT_FOUND);
     };
-    if !std::path::Path::new(&file.absolute_path).is_file() {
-        return problem(StatusCode::NOT_FOUND);
+    match state.fetched_covers.file_cover(&file.absolute_path, side).await {
+        Some(picture) => cover_reply(picture),
+        None => {
+            debug!("No picture in or beside {}", file.absolute_path);
+            problem(StatusCode::NOT_FOUND)
+        }
     }
-    let path = file.absolute_path.clone();
-    let picture = tokio::task::spawn_blocking(move || {
-        let tags = octo_media::tags::TagFile::open(&path).ok()?;
-        octo_media::tags::front_cover(&tags).map(|picture| picture.data)
-    })
-    .await
-    .ok()
-    .flatten()
-    .filter(|bytes| !bytes.is_empty());
-    let Some(bytes) = picture else {
-        debug!("No picture in {}", file.absolute_path);
-        return problem(StatusCode::NOT_FOUND);
-    };
-    let jpeg = cover_image::to_jpeg(&cover_image::fit_within(&bytes, COVER_SIDE));
-    let mut res = Response::new(Body::from(jpeg));
-    res.headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
-    res.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=3600"),
-    );
-    res
 }

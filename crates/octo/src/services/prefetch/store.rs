@@ -7,7 +7,7 @@
 //! the folder was created or found empty. A folder with other files in it and no marker is never
 //! downloaded into, and nothing in it is ever deleted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -56,6 +56,9 @@ pub struct AheadSidecar {
     pub verification: Option<VerificationMirror>,
     /// A heart kept a copy while the song was playing: this file stays only for that play.
     pub promoted: bool,
+    /// The YouTube video it was made from, when it came from YouTube.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_id: Option<String>,
 }
 
 impl AheadSidecar {
@@ -85,6 +88,7 @@ impl AheadSidecar {
             source_file: song.source_file.clone(),
             verification: song.verification.as_deref().map(VerificationMirror::of),
             promoted: false,
+            video_id: None,
         }
     }
 }
@@ -307,6 +311,13 @@ struct Entry {
     /// When a play last got this file, since Octo started.
     served: Option<DateTime<Utc>>,
     verification: Option<Box<VerificationResult>>,
+    /// The file the source delivered, as its facts name it.
+    source_file: Option<String>,
+    /// The YouTube video it was made from, when it came from YouTube.
+    video_id: Option<String>,
+    /// Hearts and plays holding it as what they heard: no sweep removes it meanwhile. Kept in
+    /// memory; a hold takes its copies again at start.
+    holders: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -448,7 +459,7 @@ impl PrefetchStore {
         let gone: Vec<String> = state
             .entries
             .iter()
-            .filter(|(_, entry)| now - entry.last_used >= IN_USE_FOR)
+            .filter(|(_, entry)| now - entry.last_used >= IN_USE_FOR && entry.holders.is_empty())
             .map(|(key, _)| key.clone())
             .collect();
         for key in &gone {
@@ -469,16 +480,25 @@ impl PrefetchStore {
         if !state.read_from.as_deref().is_some_and(owns_folder) {
             return 0;
         }
-        let mut by_use: Vec<(String, DateTime<Utc>, u64, bool)> = state
+        let mut by_use: Vec<(String, DateTime<Utc>, u64, bool, bool)> = state
             .entries
             .iter()
-            .map(|(key, entry)| (key.clone(), entry.last_used, entry.size, entry.promoted))
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    entry.last_used,
+                    entry.size,
+                    entry.promoted,
+                    !entry.holders.is_empty(),
+                )
+            })
             .collect();
         by_use.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        let mut total: u64 = by_use.iter().map(|(_, _, size, _)| size).sum();
+        let mut total: u64 = by_use.iter().map(|(_, _, size, _, _)| size).sum();
         let mut gone = 0;
-        for (key, last_used, size, promoted) in by_use {
-            if now - last_used < IN_USE_FOR {
+        for (key, last_used, size, promoted, held) in by_use {
+            // A copy held as what someone heard stays until they let it go.
+            if now - last_used < IN_USE_FOR || held {
                 continue;
             }
             let stale = promoted || now - last_used >= Duration::days(keep_days);
@@ -501,6 +521,69 @@ impl PrefetchStore {
     pub fn over(&self, cap_bytes: u64) -> bool {
         self.sizes().1 > cap_bytes
     }
+
+    /// When the song under `key` (`provider:id`) was made ready and the file its source
+    /// delivered: what a play of it heard.
+    pub fn copy_identity(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> Option<(DateTime<Utc>, Option<String>)> {
+        let state = self.current();
+        let entry = state.entries.get(&key(provider, external_id))?;
+        Some((entry.ready_at, entry.source_file.clone()))
+    }
+
+    /// The file under `key` (`provider:id`) when it is still the copy that was heard: made ready
+    /// at `ready_at` from `source_file`. A later fetch under the same key is another copy.
+    pub fn copy_of(
+        &self,
+        key: &str,
+        ready_at: Option<DateTime<Utc>>,
+        source_file: Option<&str>,
+    ) -> Option<PathBuf> {
+        let state = self.current();
+        let entry = state.entries.get(key)?;
+        if Some(entry.ready_at) != ready_at || entry.source_file.as_deref() != source_file {
+            return None;
+        }
+        entry.path.is_file().then(|| entry.path.clone())
+    }
+
+    /// The YouTube video the copy under `key` was made from, while it is still the copy made
+    /// ready at `ready_at` from `source_file`; None for a copy from any other source.
+    pub fn copy_video(
+        &self,
+        key: &str,
+        ready_at: Option<DateTime<Utc>>,
+        source_file: Option<&str>,
+    ) -> Option<String> {
+        let state = self.current();
+        let entry = state.entries.get(key)?;
+        if Some(entry.ready_at) != ready_at || entry.source_file.as_deref() != source_file {
+            return None;
+        }
+        entry.video_id.clone()
+    }
+
+    /// Holds the copy under `key` as what `holder` heard; false when there is none.
+    pub fn hold(&self, key: &str, holder: &str) -> bool {
+        let mut state = self.current();
+        match state.entries.get_mut(key) {
+            Some(entry) => {
+                entry.holders.insert(holder.to_string());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Lets go of `holder`'s hold on the copy under `key`.
+    pub fn release(&self, key: &str, holder: &str) {
+        if let Some(entry) = self.current().entries.get_mut(key) {
+            entry.holders.remove(holder);
+        }
+    }
 }
 
 impl PrefetchedFiles for PrefetchStore {
@@ -522,7 +605,7 @@ impl PrefetchedFiles for PrefetchStore {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<AheadSidecar>(&bytes).ok())
             .unwrap_or_default();
-        if entry.served.is_some_and(|served| now - served < IN_USE_FOR) {
+        if entry.served.is_some_and(|served| now - served < IN_USE_FOR) || !entry.holders.is_empty() {
             // Playing now: the heart gets a copy of its own, since its tags are written in place,
             // and this file stays as it is for the play.
             if let Err(e) = std::fs::copy(&entry.path, into) {
@@ -682,6 +765,9 @@ fn read_entry(path: &Path) -> Option<(String, Entry)> {
             promoted: sidecar.promoted,
             served: None,
             verification: None,
+            source_file: sidecar.source_file,
+            video_id: sidecar.video_id,
+            holders: HashSet::new(),
         },
     ))
 }

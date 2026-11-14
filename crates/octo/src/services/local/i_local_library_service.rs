@@ -5,6 +5,7 @@ use octo_core::models::domain::Song;
 use octo_core::models::subsonic::ScanStatus;
 
 use super::LocalSongMapping;
+use super::local_library_service::KeptHeart;
 use super::scan_wait::ScanHold;
 use crate::services::subsonic::navidrome_version::ServerInfo;
 
@@ -26,9 +27,37 @@ pub trait ILocalLibraryService: Send + Sync {
         external_id: &str,
     ) -> Option<String>;
 
+    /// The local file of an outside song for one person: a version kept for them (their own gate
+    /// passed it, or it is the very audio they heard), else one kept for nobody in particular.
+    /// None when only other people's versions are here. With no person, the most recently landed
+    /// version. (By default, the song's one file.)
+    async fn get_local_path_for_external_song_as(
+        &self,
+        user: Option<&str>,
+        external_provider: &str,
+        external_id: &str,
+    ) -> Option<String> {
+        let _ = user;
+        self.get_local_path_for_external_song(external_provider, external_id)
+            .await
+    }
+
     /// Registers a downloaded song in the local library. `Err` when the mappings file could not
     /// be written.
     async fn register_downloaded_song(&self, song: &Song, local_path: &str) -> anyhow::Result<()>;
+
+    /// [`Self::register_downloaded_song`] for the hearts and plays whose own gate passed the file,
+    /// with what they heard, so each person finds their own version of the song. (By default, the
+    /// plain registration.)
+    async fn register_downloaded_song_as(
+        &self,
+        song: &Song,
+        local_path: &str,
+        heart: Option<KeptHeart>,
+    ) -> anyhow::Result<()> {
+        let _ = heart;
+        self.register_downloaded_song(song, local_path).await
+    }
 
     /// Gets the mapping between external ID and local ID
     async fn get_local_id_for_external_song(
@@ -65,6 +94,13 @@ pub trait ILocalLibraryService: Send + Sync {
     /// song put back can have them again. `Err` when the mappings file could not be written.
     async fn forget_mapping(&self, local_path: &str) -> anyhow::Result<Vec<LocalSongMapping>>;
 
+    /// Drops the one mapping saved under `key` (a [`LocalSongMapping::key`]), leaving every other
+    /// mapping at its path alone. Whether there was one. (A no-op by default, for the test fakes;
+    /// the real service writes it.)
+    async fn forget_mapping_keyed(&self, _key: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Puts back mappings a removal dropped, pointing at the song's path again. A song mapped
     /// anew since keeps its newer mapping. (A no-op by default, for the test fakes; the real
     /// service writes them.)
@@ -97,6 +133,17 @@ pub trait ILocalLibraryService: Send + Sync {
     async fn update_local_path(&self, old_path: &str, new_path: &str) -> anyhow::Result<usize> {
         let _ = (old_path, new_path);
         Ok(0)
+    }
+
+    /// [`Self::update_local_path`] for each `(old, new)` in order, so `a` to `b` then `b` to `c`
+    /// ends at `c`. Answers how many mappings followed, each move counted on its own. By default
+    /// one move at a time; a service that saves its mappings saves them once for the batch.
+    async fn update_local_paths(&self, moves: &[(String, String)]) -> anyhow::Result<usize> {
+        let mut moved = 0;
+        for (old_path, new_path) in moves {
+            moved += self.update_local_path(old_path, new_path).await?;
+        }
+        Ok(moved)
     }
 
     /// Starts a scan now, past any hold on Octo's own triggers: the scan the holder itself needs.

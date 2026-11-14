@@ -129,6 +129,7 @@ impl YoutubeChecker for AppYoutubeChecker {
             Err(Failure::Busy) => return Compared::Busy,
             // A lookup could not answer: not an answer, so the song is tried again.
             Err(Failure::Unreachable | Failure::Other) => return Compared::Unavailable,
+            Err(Failure::Gone | Failure::Refused) => return Compared::Unavailable,
         };
         let timeout = self
             .settings
@@ -565,7 +566,7 @@ impl LibraryYoutubeCheck {
         if !self.store.read(|s| s.running) {
             return self.hold(
                 "Idle",
-                Some("Press the button to compare every song with its YouTube preview once."),
+                Some("Press the button to compare every song with its YouTube stream once."),
                 Self::IDLE_CHECK,
             );
         }
@@ -663,7 +664,7 @@ impl LibraryYoutubeCheck {
             info!("YouTube check of the library finished");
             return self.hold(
                 "Done",
-                Some("Every song has been compared with its YouTube preview."),
+                Some("Every song has been compared with its YouTube stream."),
                 Self::IDLE_CHECK,
             );
         };

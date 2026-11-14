@@ -9,22 +9,82 @@ use axum::routing::get;
 use octo_core::common::dotnet::{self, is_blank};
 use octo_core::common::playlist_id_helper;
 use octo_core::common::{AlbumFillIn, LibraryTrack, SongIdentity};
+use octo_core::fingerprint::heart_gate::AlbumContext;
 use octo_core::models::domain::Album;
 use serde_json::Value;
 use tracing::{debug, error};
 
 use super::album_ownership::{outside_album_with_owned_songs, scope_of, settle_artist_albums};
-use super::caller_checks::{SubsonicCall, as_json, file};
+use super::caller_checks::{SubsonicCall, as_json, file, listener_name};
 use crate::app::AppState;
 use crate::http::error::{AppError, AppResult};
 use crate::http::routes::RouteSet;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
+use crate::services::metadata::Reach;
+
+/// The library album's ISRCs asked of the catalog for the album they are on.
+const FILL_IN_ISRCS: usize = 3;
+
+/// The first catalog album that holds the library album's songs.
+fn album_holding(library: &[LibraryTrack], albums: Vec<Album>) -> Option<Album> {
+    albums
+        .into_iter()
+        .find(|album| !album.songs.is_empty() && AlbumFillIn::holds(library, &album.songs))
+}
 
 pub fn routes() -> RouteSet {
     RouteSet::new()
         .subsonic("getSong", get(get_song).post(get_song))
         .subsonic("getArtist", get(get_artist).post(get_artist))
         .subsonic("getAlbum", get(get_album).post(get_album))
+}
+
+/// Records, on each outside song an album listing names, that `user` listed it from that album
+/// on `client`: the catalog's own album id (never sent to a client), the song's place on it and
+/// when. Nothing for an unnamed user or an album whose catalog id is unknown.
+pub(crate) fn remember_listed_album(
+    state: &AppState,
+    user: &str,
+    client: Option<&str>,
+    album_id: &str,
+    album: &Album,
+) {
+    let user = user.trim();
+    if user.is_empty() {
+        return;
+    }
+    let Some(catalog_album_id) = state
+        .external_id_registry
+        .lookup(album_id)
+        .and_then(|routing| routing.lock().external_album_id.clone())
+        .filter(|id| !is_blank(id))
+    else {
+        return;
+    };
+    let listed_at = chrono::Utc::now();
+    let client = client.map(str::trim).filter(|c| !c.is_empty());
+    let total = album.song_count.or(Some(album.songs.len() as i32));
+    for song in &album.songs {
+        let Some(id) = song.external_id.as_deref().filter(|id| !is_blank(id)) else {
+            continue;
+        };
+        state.external_id_registry.remember_context(
+            id,
+            AlbumContext {
+                user: user.to_string(),
+                client: client.map(str::to_string),
+                catalog_album_id: catalog_album_id.clone(),
+                album: Some(album.title.clone()).filter(|title| !is_blank(title)),
+                disc: song.disc_number,
+                track: song.track,
+                total: song.total_tracks.or(total),
+                isrc: song.isrc.clone(),
+                explicit: song.explicit_content_lyrics,
+                listed_at,
+                played_at: None,
+            },
+        );
+    }
 }
 
 /// Returns external song info if needed.
@@ -310,6 +370,14 @@ pub async fn get_album(State(state): State<AppState>, req: Request) -> AppResult
                 .create_error(&format, 70, "Album not found")
                 .into_response());
         };
+        let lister = listener_name(&state, &call).await;
+        remember_listed_album(
+            &state,
+            &lister,
+            call.param_opt("c"),
+            album_external_id.as_deref().unwrap_or_default(),
+            &album,
+        );
         let barcode = album.songs.iter().find_map(|song| song.barcode.clone());
         let animated = super::animated_art::album_field(
             &state,
@@ -401,11 +469,43 @@ pub async fn get_album(State(state): State<AppState>, req: Request) -> AppResult
     // The first catalog album by this name that holds the library's songs, known by ISRC
     // or by title and length. A name alone can belong to another record: "Nightcore" by
     // "Nightcore" (octo-player#1).
-    let search_query = format!("{artist_name} {album_name}");
-    let deezer_albums = metadata.search_albums(&search_query, 5).await;
-    let library_songs = i32::try_from(AlbumFillIn::count_songs(&library)).unwrap_or(i32::MAX);
+    //
+    // On a server Deezer does not serve, Deezer still answers a song by its ISRC, and that
+    // song's album is Deezer's with every song's ISRC: those albums are tried first. The name
+    // search, answered from Apple there, comes after.
+    let isrcs = AlbumFillIn::isrcs(&library, FILL_IN_ISRCS);
+    let closed = || {
+        state
+            .deezer_reach
+            .as_ref()
+            .is_some_and(|reach| matches!(reach.reach(), Reach::Closed { .. }))
+    };
+    let mut isrc_route_ran = false;
     let mut deezer_album: Option<Album> = None;
-    for candidate in AlbumFillIn::candidates(&deezer_albums, &artist_name, &album_name, library_songs) {
+    if !isrcs.is_empty() && closed() {
+        isrc_route_ran = true;
+        deezer_album = album_holding(&library, metadata.catalog_albums_by_isrc(&isrcs).await);
+    }
+    let search_query = format!("{artist_name} {album_name}");
+    let deezer_albums = if deezer_album.is_none() {
+        metadata.search_albums(&search_query, 5).await
+    } else {
+        Vec::new()
+    };
+    let library_songs = i32::try_from(AlbumFillIn::count_songs(&library)).unwrap_or(i32::MAX);
+    let candidates = AlbumFillIn::candidates(&deezer_albums, &artist_name, &album_name, library_songs);
+    // The name search found Deezer closed (it then answers from Apple, whether or not Apple has the
+    // album): the ISRC albums first.
+    if deezer_album.is_none() && !isrc_route_ran && !isrcs.is_empty() && closed() {
+        deezer_album = album_holding(&library, metadata.catalog_albums_by_isrc(&isrcs).await);
+    }
+    // Only when no ISRC album held the library's songs.
+    let candidates = if deezer_album.is_none() {
+        candidates
+    } else {
+        Vec::new()
+    };
+    for candidate in candidates {
         // The provider must come from the candidate. A hardcoded "deezer" never
         // matches the metadata service's provider name, so this always returned null.
         let detail = metadata
@@ -436,8 +536,9 @@ pub async fn get_album(State(state): State<AppState>, req: Request) -> AppResult
             .filter(|id| !id.is_empty())
             .map(str::to_string);
         let mut merged_songs = local_songs;
-        for deezer_song in &deezer_album.songs {
-            if !AlbumFillIn::owned(&library, deezer_song) {
+        let owned = AlbumFillIn::owned_rows(&library, &deezer_album.songs);
+        for (deezer_song, owned) in deezer_album.songs.iter().zip(owned) {
+            if !owned {
                 let mut row = builder.convert_song_to_json(deezer_song);
                 if let Some(album_id) = &album_id {
                     row.insert("albumId".into(), album_id.clone().into());
