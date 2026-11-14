@@ -92,7 +92,6 @@ struct LiveFixture {
     shim: MockServer,
     shim_live: ShimLive,
     app: App,
-    state: AppState,
 }
 
 impl LiveFixture {
@@ -118,14 +117,13 @@ impl LiveFixture {
                 ..Default::default()
             },
         );
-        let app = build_with(state.clone(), crate::controllers::subsonic::routes());
+        let app = build_with(state, crate::controllers::subsonic::routes());
         LiveFixture {
             _dir: dir,
             _navidrome: navidrome,
             shim,
             shim_live,
             app,
-            state,
         }
     }
 

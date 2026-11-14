@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use octo_core::json::dom::Node;
@@ -248,10 +248,10 @@ pub async fn live_station_stream(
 /// named nobody). Only a definite answer is cached — a relay that failed or an envelope
 /// that says the sign-in failed stays uncached, so the next attempt asks again.
 async fn live_station(state: &AppState, call: &SubsonicCall, station_id: &str) -> Option<LiveStation> {
-    if let Some((at, cached)) = STATION_CACHE.lock().get(station_id) {
-        if at.elapsed() < STATION_CACHE_TTL {
-            return cached.clone();
-        }
+    if let Some((at, cached)) = STATION_CACHE.lock().get(station_id)
+        && at.elapsed() < STATION_CACHE_TTL
+    {
+        return cached.clone();
     }
     let mut auth = auth_of(state, &call.parameters);
     auth.push(("f".to_string(), "json".to_string()));
