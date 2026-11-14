@@ -10,6 +10,7 @@ use std::sync::Arc;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use futures::StreamExt;
 use octo_core::common::{dotnet, skipped_takes};
 use octo_core::json::datetime::format_utc;
 use octo_core::json::dom::Node;
@@ -540,8 +541,10 @@ async fn native_family_detail(
 /// each entry what the REST answer serves this viewer (the `served_entries` recipe — the
 /// library song read as the caller over the request's own bearer, falling back to its
 /// outside version when Navidrome does not serve it, an outside id through the metadata
-/// core), the row in `native_song_object`'s shape. An entry neither read could serve is left
-/// out, as the REST answer leaves it.
+/// core), the row in `native_song_object`'s shape, and the entries read through the
+/// recipe's own window of parallel reads (`FAMILY_SONGS_AT_ONCE`), not one round trip
+/// waited out at a time. An entry neither read could serve is left out, as the REST answer
+/// leaves it.
 async fn native_family_tracks(
     state: &AppState,
     request: &NativeRequest<'_>,
@@ -549,22 +552,23 @@ async fn native_family_tracks(
     viewer: &FamilyCaller,
 ) -> Response {
     let shown = super::playlists::native_family_songs(state, playlist, viewer).await;
-    let mut rows: Vec<Node> = Vec::new();
-    for entry in &shown {
-        let row = match &entry.serve {
-            Serve::Library { id, outside } => match native_library_song(request, id).await {
-                Some(row) => Some(row),
-                None => match outside {
-                    Some(outside) => outside_song_native(state, outside).await,
-                    None => None,
+    let songs: Vec<Option<Value>> = futures::stream::iter(shown)
+        .map(|entry| async move {
+            match &entry.serve {
+                Serve::Library { id, outside } => match native_library_song(request, id).await {
+                    Some(row) => Some(row),
+                    None => match outside {
+                        Some(outside) => outside_song_native(state, outside).await,
+                        None => None,
+                    },
                 },
-            },
-            Serve::Outside(outside) => outside_song_native(state, outside).await,
-        };
-        if let Some(row) = row {
-            rows.push(to_node(&row));
-        }
-    }
+                Serve::Outside(outside) => outside_song_native(state, outside).await,
+            }
+        })
+        .buffered(super::playlists::FAMILY_SONGS_AT_ONCE)
+        .collect()
+        .await;
+    let rows: Vec<Node> = songs.into_iter().flatten().map(|row| to_node(&row)).collect();
     let total = rows.len();
     let start = page_number(request.parameters, "_start").unwrap_or(0).max(0);
     let end = page_number(request.parameters, "_end").unwrap_or(total as i32);

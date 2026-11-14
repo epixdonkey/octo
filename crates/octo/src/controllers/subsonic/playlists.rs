@@ -50,8 +50,9 @@ use crate::services::subsonic::SubsonicResponseBuilderExt;
 use octo_core::family::abilities::RequestQuality;
 use tracing::info;
 
-/// How many songs of a family playlist are read at once.
-const FAMILY_SONGS_AT_ONCE: usize = 8;
+/// How many songs of a family playlist are read at once — REST's `served_entries` and the
+/// native tracks read alike.
+pub(crate) const FAMILY_SONGS_AT_ONCE: usize = 8;
 
 pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Response {
     let caller = family_caller(req.extensions()).cloned();
