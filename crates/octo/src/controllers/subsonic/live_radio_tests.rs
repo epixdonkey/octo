@@ -15,7 +15,7 @@ use tower::ServiceExt;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
-use super::{you_tube_video_id, rewrite_json};
+use super::{rewrite_json, you_tube_video_id};
 use crate::app::{AppState, TestServices};
 use crate::controllers::subsonic::test_app::{Reply, send};
 use crate::http::pipeline::{App, build_with};
@@ -77,8 +77,7 @@ impl Respond for ShimLive {
         if self.refuse.load(Ordering::SeqCst) {
             return ResponseTemplate::new(503).set_body_string(r#"{"error":"busy"}"#);
         }
-        let mut answer =
-            ResponseTemplate::new(200).set_body_raw(b"live-mp3-bytes".to_vec(), "audio/mpeg");
+        let mut answer = ResponseTemplate::new(200).set_body_raw(b"live-mp3-bytes".to_vec(), "audio/mpeg");
         let delay = self.delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             answer = answer.set_delay(Duration::from_millis(delay));
@@ -165,7 +164,10 @@ fn the_parser_accepts_the_forms_a_station_can_be_saved_with() {
     for (url, id) in [
         ("https://www.youtube.com/watch?v=UYOb37KRFqk", "UYOb37KRFqk"),
         ("http://youtube.com/watch?v=dQw4w9WgXcQ&t=30", "dQw4w9WgXcQ"),
-        ("https://m.youtube.com/watch?v=dQw4w9WgXcQ&list=xyz", "dQw4w9WgXcQ"),
+        (
+            "https://m.youtube.com/watch?v=dQw4w9WgXcQ&list=xyz",
+            "dQw4w9WgXcQ",
+        ),
         ("https://music.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
         ("youtube.com/watch?v=UYOb37KRFqk", "UYOb37KRFqk"),
         ("https://youtu.be/UYOb37KRFqk", "UYOb37KRFqk"),
@@ -209,8 +211,8 @@ fn the_rewrite_leaves_every_row_but_the_you_tube_ones_alone() {
         r#"{"id":"yt1","name":"Lofi","streamUrl":"https://youtu.be/UYOb37KRFqk"},"#,
         r#"{"id":"plain","name":"Plain","streamUrl":"https://plain.example/live"}]}}}"#
     );
-    let rewritten = String::from_utf8(rewrite_json(body.as_bytes(), &live_url).expect("rewritten"))
-        .expect("utf-8");
+    let rewritten =
+        String::from_utf8(rewrite_json(body.as_bytes(), &live_url).expect("rewritten")).expect("utf-8");
     let rows: serde_json::Value = serde_json::from_str(&rewritten).expect("json");
     let row = |id: &str| {
         rows["subsonic-response"]["internetRadioStations"]["internetRadioStation"]
@@ -250,10 +252,7 @@ async fn the_station_list_rewrites_you_tube_rows_and_leaves_the_rest_alone() {
         let body = reply.text();
         for id in ["st-watch", "st-be", "st-live"] {
             let expected = format!("http://localhost/radio/live/{id}");
-            assert!(
-                body.contains(&expected),
-                "{format}: {id} not rewritten: {body}"
-            );
+            assert!(body.contains(&expected), "{format}: {id} not rewritten: {body}");
         }
         assert!(
             body.contains("https://plain.example/stream"),
@@ -275,9 +274,7 @@ async fn the_station_list_rewrites_you_tube_rows_and_leaves_the_rest_alone() {
 #[tokio::test]
 async fn the_live_station_streams_the_shims_bytes_in_the_radio_shape() {
     let fixture = LiveFixture::new().await;
-    let reply = fixture
-        .get("/radio/live/st-watch?u=alice&t=token&s=salt")
-        .await;
+    let reply = fixture.get("/radio/live/st-watch?u=alice&t=token&s=salt").await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
     assert_eq!(reply.body, b"live-mp3-bytes".as_slice());
     assert_eq!(reply.header("content-type"), Some("audio/mpeg"));
@@ -285,7 +282,11 @@ async fn the_live_station_streams_the_shims_bytes_in_the_radio_shape() {
     assert_eq!(reply.header("accept-ranges"), Some("none"));
     assert_eq!(reply.header("icy-name"), Some("Lofi Watch"));
     assert_eq!(reply.header("icy-br"), Some("192"));
-    assert!(reply.headers.get("content-length").is_none(), "{:?}", reply.headers);
+    assert!(
+        reply.headers.get("content-length").is_none(),
+        "{:?}",
+        reply.headers
+    );
     // The shim was asked for this station's video, at the radio's bitrate, under its name.
     assert_eq!(
         fixture.shim_queries().await,
@@ -300,9 +301,7 @@ async fn the_live_station_streams_the_shims_bytes_in_the_radio_shape() {
 #[tokio::test]
 async fn a_head_answers_the_headers_alone_without_touching_the_shim() {
     let fixture = LiveFixture::new().await;
-    let reply = fixture
-        .head("/radio/live/st-watch?u=alice&t=token&s=salt")
-        .await;
+    let reply = fixture.head("/radio/live/st-watch?u=alice&t=token&s=salt").await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.header("content-type"), Some("audio/mpeg"));
     assert_eq!(reply.header("icy-name"), Some("Lofi Watch"));
@@ -324,9 +323,7 @@ async fn an_unknown_station_is_an_empty_404() {
 async fn a_refusing_shim_is_a_502_with_a_short_body() {
     let fixture = LiveFixture::new().await;
     fixture.shim_live.refuse.store(true, Ordering::SeqCst);
-    let reply = fixture
-        .get("/radio/live/st-watch?u=alice&t=token&s=salt")
-        .await;
+    let reply = fixture.get("/radio/live/st-watch?u=alice&t=token&s=salt").await;
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
     assert_eq!(reply.text(), "The live radio source could not be opened");
 }
@@ -374,9 +371,7 @@ async fn the_fifth_parallel_live_stream_is_refused_and_the_cap_frees_again() {
     );
     // Once the listeners are gone the slots are theirs again.
     fixture.shim_live.delay_ms.store(0, Ordering::SeqCst);
-    let again = fixture
-        .get("/radio/live/st-watch?u=alice&t=token&s=salt")
-        .await;
+    let again = fixture.get("/radio/live/st-watch?u=alice&t=token&s=salt").await;
     assert_eq!(again.status, StatusCode::OK, "{}", again.text());
     assert_eq!(again.body, b"live-mp3-bytes".as_slice());
 }
