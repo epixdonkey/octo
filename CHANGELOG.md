@@ -1,5 +1,38 @@
 # Changelog
 
+## 2026.11.14 — Live radio dock: names beyond latin-1, a faster first byte, a log that tells the story
+
+### 1. A station named with an emoji or Polish letters plays like any other (`fix(subsonic)`, `fix(shim)`)
+
+The first production listening session found a hard defect: a station named
+"Deep Techno 24/7 🔴 Live Stream" could not play at all. The shim's gunicorn
+refuses a response header value that does not encode to latin-1 (PEP 3333),
+so every request for that station died as a 500 and the player kept
+hammering. The name in `icy-name` is decoration, and decoration must never
+cost the stream: both Octo and the shim now sanitize it — every character
+latin-1 cannot hold becomes a plain `?`, while latin-1's own letters (`é`,
+`ó`) pass untouched — and the station plays. A name with a control
+character, which used to be refused outright by Octo, plays the same way.
+
+### 2. The first byte of a live stream leaves well inside the reconnect budget (`perf(shim)`)
+
+The first read of the transcode pipe was a full 64 KiB, and a blocking read
+returns only when the whole chunk is there — at MP3 radio bitrates that is
+seconds of silence exactly where a player decides whether the stream is
+alive, and production saw reconnect loops around that budget. The first
+read of each attempt is now 16 KiB (the rest stay 64 KiB), putting the
+first byte on the wire well under a second after the transcode starts.
+
+### 3. The live path tells its story in the log (`feat(shim)`, `feat(subsonic)`)
+
+When a live station misbehaved, the logs could not say which chapter it
+died in. The shim now writes one INFO line per lifecycle event — the open
+with its video id, bitrate and time to first byte, each ffmpeg death with
+its exit code and bytes served, the wait before each restart, and the quiet
+close when the attempts run out — and Octo logs the close of its side with
+how many bytes went out. A pasted log now tells the whole story of a
+listening session, without a debug level.
+
 ## 2026.11.14 — Live radio from YouTube channels
 
 ### 1. A YouTube live channel becomes a radio station (`feat(subsonic)`)
