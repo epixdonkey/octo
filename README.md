@@ -23,11 +23,13 @@ Search any song and play it right away. Keep the ones you love as files on your 
 > works without a Last.fm key** (a video and a song are separate, labeled
 > rows — never merged), **mixed personal playlists** that hold local files and
 > YouTube streams side by side and survive a server restart, **streaming
-> favorites** for the owner when `DOWNLOAD_ON_STAR=false`, and **family
+> favorites** for the owner when `DOWNLOAD_ON_STAR=false`, **family
 > playlists you can found from any app** by naming a playlist with a
 > configurable prefix — in Subsonic mode and in Navidrome's own mode alike,
-> though players are best connected as Subsonic. Upstream's features and
-> defaults are untouched.
+> though players are best connected as Subsonic — and **24/7 YouTube
+> channels as radio stations**: save a station with the channel's URL and it
+> plays, endlessly and self-healing, in any player's radio view.
+> Upstream's features and defaults are untouched.
 > Details: [CHANGELOG.md](CHANGELOG.md).
 
 ---
