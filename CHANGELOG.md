@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026.11.14 — Live radio from YouTube channels
+
+### 1. A YouTube live channel becomes a radio station (`feat(subsonic)`)
+
+A radio station saved with a YouTube URL used to be dead weight: Octo
+listed it back verbatim and no player can stream a watch page. Save the
+station with the channel's URL as the stream URL (the Radio dialog in any
+Subsonic app, or Navidrome's own admin page — `Name` plus `Stream URL` =
+the channel's `https://www.youtube.com/watch?v=…`), and Octo now takes
+over the serving: the station list publishes the row under Octo's own
+`/radio/live/{id}` address, and that address plays an endless MP3 in any
+player's radio view — one button, no loop of buffering, for as long as the
+channel is live. Watch, `youtu.be`, `/live/` and `/embed/` forms are all
+recognized (`shorts` deliberately are not — a short is a finite video, not
+a channel); every other station row, Octo's own included, keeps exactly
+the URL it came with.
+
+The stream itself is the family radio's answer shape — `audio/mpeg`, no
+`Content-Length`, `Accept-Ranges: none`, `icy-name`, `icy-br` — with bytes
+transcoded live by the yt-dlp shim (one ffmpeg per listener, HLS to MP3
+CBR at the radio's configured bitrate). The pipe heals itself: when the
+channel's manifest expires, the shim re-resolves and restarts, and the
+listener hears at most a short gap. Loudness is never measured on a live
+channel (the measurement could only ever time out), closing the player
+kills the transcode at once, and four parallel live streams are the most
+Octo will hold — the fifth is refused with a clear 503 rather than
+starving the family radio's own slots.
+
 ## 2026.11.13 — Family playlists from any app
 
 ### 5. The native (Navidrome) API carries the family playlists too (`feat(subsonic)`)
