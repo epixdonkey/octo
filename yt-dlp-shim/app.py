@@ -1575,6 +1575,11 @@ def stream():
 # The live transcode pipe: how much ffmpeg stdout is read per yield (the /stream chunk size),
 # and the wait before each re-resolve attempt after ffmpeg died (manifest expired, 403, ...).
 # After the last wait one more restart is tried; when that dies too the answer closes quietly.
+# The FIRST read of an attempt is smaller: a blocking read returns only when the whole chunk
+# is there, and a full 64 KiB at ~230 kB/s means ~3 s of silence right where the client is
+# deciding whether the stream is alive (production saw reconnect loops around exactly that
+# budget). 16 KiB puts the first byte out in well under a second; the rest read full-size.
+_LIVE_FIRST_CHUNK_BYTES = 16 * 1024
 _LIVE_CHUNK_BYTES = 64 * 1024
 _LIVE_RETRY_BACKOFF_SEC = (2.0, 5.0, 10.0, 30.0, 60.0)
 
@@ -1591,6 +1596,16 @@ def _live_ffmpeg_args(manifest_url: str, abr: int) -> list[str]:
         "-ac", "2", "-ar", "44100", "-b:a", f"{abr}k",
         "-f", "mp3", "-",
     ]
+
+
+def _latin1_safe(text: str) -> str:
+    """The text as a header value PEP 3333 can carry: every character latin-1 cannot encode
+    (emoji, scripts beyond latin-1's 256 code points) becomes a plain '?'.
+
+    gunicorn refuses a response header whose value does not encode to latin-1 — a station
+    named "Deep Techno 24/7 🔴 Live Stream" took the whole endpoint down with a 500 per
+    request. The name is decoration in ICY; the stream must not die on it."""
+    return text.encode("latin-1", "replace").decode("latin-1")
 
 
 @app.get("/live/stream")
@@ -1619,7 +1634,7 @@ def live_stream():
         "icy-br": str(abr),
     }
     if name:
-        headers["icy-name"] = name
+        headers["icy-name"] = _latin1_safe(name)
     # Flask routes HEAD here too. Answer it with the contract's headers and no body,
     # before anything resolves or spawns: an iterated-but-unsent body would start an
     # ffmpeg nobody listens to.
@@ -1629,6 +1644,7 @@ def live_stream():
     manifest = _resolve_url(video_id)
     if not manifest:
         return jsonify(error="no_audio_url"), 502
+    t_enter = time.monotonic()
 
     @stream_with_context
     def generator():
@@ -1637,10 +1653,16 @@ def live_stream():
         # until its TTL ends.
         current = {"manifest": manifest, "proc": None}
         _count("live_streams", 1)
+        # One INFO line per lifecycle event -- opened (with the time to the first byte),
+        # each attempt's end (its exit code and byte count), and the quiet close -- so a
+        # pasted log tells the stream's whole story without a debug level.
+        served = 0
         try:
             attempts = len(_LIVE_RETRY_BACKOFF_SEC) + 1
             for attempt in range(attempts):
                 if attempt:
+                    log.info("live %s: waiting %.0fs before attempt %d/%d",
+                             video_id, _LIVE_RETRY_BACKOFF_SEC[attempt - 1], attempt + 1, attempts)
                     time.sleep(_LIVE_RETRY_BACKOFF_SEC[attempt - 1])
                     _url_cache_evict(video_id)
                     # Mid-answer there is no way to say busy (the headers are long
@@ -1660,18 +1682,29 @@ def live_stream():
                     stderr=subprocess.DEVNULL,
                 )
                 current["proc"] = proc
+                first = True
+                sent_this_attempt = 0
                 while True:
-                    chunk = proc.stdout.read(_LIVE_CHUNK_BYTES)
+                    chunk = proc.stdout.read(
+                        _LIVE_FIRST_CHUNK_BYTES if first else _LIVE_CHUNK_BYTES)
                     if not chunk:
                         break
+                    if first:
+                        log.info("live %s: opened, ttfb_ms=%.0f (attempt %d/%d, abr=%d)",
+                                 video_id, (time.monotonic() - t_enter) * 1000.0,
+                                 attempt + 1, attempts, abr)
+                        first = False
+                    sent_this_attempt += len(chunk)
                     yield chunk
                 code = proc.wait()
                 current["proc"] = None
-                if attempt + 1 < attempts:
-                    log.warning("live %s: ffmpeg died (rc=%s), restarting (attempt %d/%d)",
-                                video_id, code, attempt + 1, attempts)
+                served += sent_this_attempt
+                log.info("live %s: ffmpeg ended rc=%s after %d bytes (attempt %d/%d)",
+                         video_id, code, sent_this_attempt, attempt + 1, attempts)
             # Attempts exhausted: close quietly. The client has its bytes and the
             # connection simply ends.
+            log.info("live %s: closing quietly after %d attempts, %d bytes served",
+                     video_id, attempts, served)
         finally:
             proc = current["proc"]
             if proc is not None:
