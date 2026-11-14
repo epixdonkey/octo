@@ -201,12 +201,18 @@ pub async fn live_station_stream(
         HeaderValue::from_static("no-store, no-transform"),
     );
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
-    // A station name that cannot be sent as a header value answers 503 (the machine's rule).
-    let Ok(name) = HeaderValue::from_str(&station.name) else {
-        warn!("Live radio stream failed for station {station_id}");
-        return empty(StatusCode::SERVICE_UNAVAILABLE);
-    };
-    headers.insert("icy-name", name);
+    // The station's name, sanitized to what an ICY header value can safely hold. The shim's
+    // gunicorn refuses a header value that does not encode to latin-1 (PEP 3333): a station
+    // named "Deep Techno 24/7 🔴 Live Stream" took the shim down with a 500 per request, while
+    // this side kept answering with the emoji as raw UTF-8 header bytes (`HeaderValue` takes
+    // any byte >= 0x20, so only a control character in a name ever saw the old 503). latin-1
+    // is all an ICY name may promise a client, so every character beyond it becomes a plain
+    // '?' and the stream plays: the name is decoration, it must never cost the stream.
+    let safe_name = latin1_safe(&station.name);
+    headers.insert(
+        "icy-name",
+        HeaderValue::from_bytes(safe_name.as_bytes()).expect("a latin-1-safe name is a valid header value"),
+    );
     headers.insert("icy-br", HeaderValue::from(bitrate));
     if call.parts.method == axum::http::Method::HEAD {
         let mut response = Response::new(Body::empty());
@@ -227,6 +233,9 @@ pub async fn live_station_stream(
         Ok(upstream) => {
             let body = LiveBody {
                 audio: upstream.bytes_stream().boxed(),
+                station: station.name,
+                station_id,
+                sent: 0,
                 _slot: slot,
             };
             let mut response = Response::new(Body::from_stream(body));
@@ -241,6 +250,23 @@ pub async fn live_station_stream(
             )
         }
     }
+}
+
+/// A station name as an ICY header value can carry it: latin-1's 256 code points minus the
+/// controls, every other character (emoji, other scripts) a plain '?'. The name the shim
+/// receives over the query keeps its original form — the shim sanitizes its own header the
+/// same way, and a client that shows either sees the same cleaned name.
+fn latin1_safe(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            let code = u32::from(c);
+            if (0x20..=0x7E).contains(&code) || (0x80..=0xFF).contains(&code) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 /// The station row behind one id: the cached answer, else one relay of
@@ -328,8 +354,13 @@ fn empty(status: StatusCode) -> Response {
 
 /// The shim's bytes as a response body, holding this stream's slot: dropping the body drops
 /// the shim response (closing its connection — the shim's kill signal) and frees the slot.
+/// The drop also says goodbye on the log — with how many bytes went out — so the rhythm of
+/// opens and closes tells a reconnect story from the log alone.
 struct LiveBody {
     audio: futures::stream::BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    station: String,
+    station_id: String,
+    sent: u64,
     _slot: OwnedSemaphorePermit,
 }
 
@@ -337,7 +368,20 @@ impl Stream for LiveBody {
     type Item = std::io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.audio.poll_next_unpin(cx).map_err(std::io::Error::other)
+        let poll = self.audio.poll_next_unpin(cx);
+        if let Poll::Ready(Some(Ok(bytes))) = &poll {
+            self.sent += bytes.len() as u64;
+        }
+        poll.map_err(std::io::Error::other)
+    }
+}
+
+impl Drop for LiveBody {
+    fn drop(&mut self) {
+        info!(
+            "Live radio stream closed for {} ({}): {} bytes sent",
+            self.station, self.station_id, self.sent
+        );
     }
 }
 
