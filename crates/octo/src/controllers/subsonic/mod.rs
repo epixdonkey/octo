@@ -26,6 +26,7 @@ pub mod downloads;
 pub mod extensions;
 pub mod family;
 pub mod imports;
+pub mod live_radio;
 pub mod lyrics;
 pub mod media;
 pub mod stars;
@@ -132,6 +133,12 @@ pub fn routes() -> RouteSet {
         .route_with_head(
             "/radio/stream/{token}",
             get(internet_radio::stream_generated_radio),
+        )
+        // The live station's stream, in the radio machine's shape: an endless MP3 forwarded
+        // from the shim's /live/stream, the station row found in Navidrome by the id.
+        .route_with_head(
+            "/radio/live/{station-id}",
+            get(live_radio::live_station_stream),
         )
         .subsonic("search3", get(search::search3).post(search::search3))
         .subsonic("search2", get(search::search3).post(search::search3))

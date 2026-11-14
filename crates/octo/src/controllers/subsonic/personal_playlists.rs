@@ -56,7 +56,7 @@ pub(crate) fn comment_asks_to_download(comment: &str) -> bool {
 /// is the owner's own stand-in and a native request that named nobody still acts for the owner;
 /// with several real accounts it would lend the admin's authority to an unnamed caller (O2's
 /// sibling), and widening that is the bridge's call, not this code's guess.
-fn auth_of(state: &AppState, parameters: &Parameters) -> Vec<(String, String)> {
+pub(super) fn auth_of(state: &AppState, parameters: &Parameters) -> Vec<(String, String)> {
     let own: Vec<(String, String)> = parameters
         .iter()
         .filter(|(key, _)| AUTH_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key)))

@@ -769,6 +769,38 @@ impl YouTubeResolver {
         })
     }
 
+    /// Opens the shim's `/live/stream` for a YouTube live channel: an endless MP3 CBR body
+    /// (one shim-side ffmpeg per listener, killed when this response is dropped). Err carries
+    /// the shim's HTTP status, or 0 when it did not answer at all.
+    pub async fn open_live_stream(
+        &self,
+        video_id: &str,
+        bitrate_kbps: i32,
+        name: Option<&str>,
+    ) -> Result<reqwest::Response, u16> {
+        let mut url = format!(
+            "{}/live/stream?id={}&abr={bitrate_kbps}",
+            self.base_url,
+            escape(video_id)
+        );
+        if let Some(name) = name.filter(|name| !name.is_empty()) {
+            url.push_str(&format!("&name={}", escape(name)));
+        }
+        let resp = match self.stream_client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!("shim /live/stream failed for {video_id}: {e}");
+                return Err(0);
+            }
+        };
+        let status = resp.status().as_u16();
+        if status != 200 {
+            warn!("shim /live/stream HTTP {status} for {video_id}");
+            return Err(status);
+        }
+        Ok(resp)
+    }
+
     /// Downloads a YouTube video as MP3 to `{dest_without_ext}.mp3` via the shim's
     /// /download endpoint, passing clean artist/title so the file is tagged for
     /// the library. Returns the saved path, or None on failure. Uses the

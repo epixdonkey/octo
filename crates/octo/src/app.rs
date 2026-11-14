@@ -309,6 +309,10 @@ pub struct AppInner {
     pub soulseek_holds: Arc<SoulseekHoldStore>,
     /// `YouTubeResolver`: the yt-dlp shim client (its address captured at startup).
     pub you_tube_resolver: Arc<YouTubeResolver>,
+    /// The live radio streams' own concurrency slots (four; see
+    /// `controllers::subsonic::live_radio`). One set per state: a stream holds its slot for
+    /// as long as the listener stays connected, and the fifth stream is refused outright.
+    pub live_radio_slots: Arc<tokio::sync::Semaphore>,
     /// `ExternalIdRegistry`: short external ids, `external-ids.json` (flushed by a worker).
     pub external_id_registry: Arc<ExternalIdRegistry>,
     /// `StreamSizeWarmer`: learns the true size of outside songs listed without one; a worker.
@@ -3277,6 +3281,7 @@ impl AppState {
             download_picks: stores.download_picks,
             soulseek_holds: stores.soulseek_holds,
             you_tube_resolver: stores.you_tube_resolver,
+            live_radio_slots: crate::controllers::subsonic::live_radio::live_stream_slots(),
             external_id_registry: stores.external_id_registry,
             stream_size_warmer: stores.stream_size_warmer,
             local_cover_cache: stores.local_cover_cache,
@@ -3720,6 +3725,7 @@ impl AppState {
             download_picks: stores.download_picks,
             soulseek_holds: stores.soulseek_holds,
             you_tube_resolver: stores.you_tube_resolver,
+            live_radio_slots: crate::controllers::subsonic::live_radio::live_stream_slots(),
             external_id_registry: stores.external_id_registry,
             stream_size_warmer: stores.stream_size_warmer,
             local_cover_cache: stores.local_cover_cache,

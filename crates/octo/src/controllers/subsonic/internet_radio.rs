@@ -62,6 +62,10 @@ async fn stations_inner(state: &AppState, req: Request, aborted: &RequestAborted
     };
 
     let username = listener_name_of(state, &call.parameters, &call.proxy, &call.parts.headers).await;
+    // A Navidrome row whose streamUrl is a YouTube URL is served by this server's own live
+    // endpoint, so the list publishes that URL instead. Every other row (a plain radio URL,
+    // an Octo station's token URL further down) keeps exactly what it came with.
+    let relay = super::live_radio::rewrite_live_station_urls(relay, &call);
     bootstrap_radio_profile(state, &call.proxy, &username, &call.parameters).await;
     let stations = stream_stations(state, &username);
     info!(
