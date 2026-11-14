@@ -15,7 +15,7 @@ use tower::ServiceExt;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
-use super::{rewrite_json, you_tube_video_id};
+use super::{latin1_safe, rewrite_json, you_tube_video_id};
 use crate::app::{AppState, TestServices};
 use crate::controllers::subsonic::test_app::{Reply, send};
 use crate::http::pipeline::{App, build_with};
@@ -24,6 +24,8 @@ const STATIONS_JSON: &str = r#"{"subsonic-response":{"status":"ok","version":"1.
     {"id":"st-watch","name":"Lofi Watch","streamUrl":"https://www.youtube.com/watch?v=UYOb37KRFqk"},
     {"id":"st-be","name":"Lofi Be","streamUrl":"https://youtu.be/UYOb37KRFqk"},
     {"id":"st-live","name":"Lofi Live","streamUrl":"https://music.youtube.com/live/dQw4w9WgXcQ"},
+    {"id":"st-emoji","name":"Deep Techno 24/7 🔴 Live Stream","streamUrl":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+    {"id":"st-polski","name":"Radio ąćęłńóśźż 24/7","streamUrl":"https://www.youtube.com/watch?v=UYOb37KRFqk"},
     {"id":"st-plain","name":"Plain Radio","streamUrl":"https://plain.example/stream"},
     {"id":"st-short","name":"Shorts Only","streamUrl":"https://www.youtube.com/shorts/abcdefghijk"}
 ]}}}"#;
@@ -372,4 +374,73 @@ async fn the_fifth_parallel_live_stream_is_refused_and_the_cap_frees_again() {
     let again = fixture.get("/radio/live/st-watch?u=alice&t=token&s=salt").await;
     assert_eq!(again.status, StatusCode::OK, "{}", again.text());
     assert_eq!(again.body, b"live-mp3-bytes".as_slice());
+}
+
+// ---------------------------------------------------------------------------------------
+// The dock: a station named beyond latin-1
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn latin1_safe_keeps_latin1_and_replaces_what_it_cannot_hold() {
+    // The production defect's very name: the emoji is beyond latin-1's 256, the rest stays.
+    assert_eq!(
+        latin1_safe("Deep Techno 24/7 🔴 Live Stream"),
+        "Deep Techno 24/7 ? Live Stream"
+    );
+    // Latin-1's own letters survive (ó, é); Polish's second-generation letters do not.
+    assert_eq!(latin1_safe("Łódź Café"), "?ód? Café");
+    // The full Polish tail: ó is latin-1's own and stays; ą ć ę ł ń ś ź ż live in latin-2,
+    // one table beyond what a header value may promise, and each becomes '?' — the stream
+    // never dies on a name.
+    assert_eq!(latin1_safe("ąćęłńóśźż"), "?????ó???");
+    // A control character is no header value either.
+    assert_eq!(latin1_safe("beep\u{7f}"), "beep?");
+    assert_eq!(latin1_safe("plain ascii"), "plain ascii");
+}
+
+#[tokio::test]
+async fn an_emoji_named_station_still_streams_with_a_latin1_safe_icy_name() {
+    let fixture = LiveFixture::new().await;
+    let reply = fixture.get("/radio/live/st-emoji?u=alice&t=token&s=salt").await;
+    // The emoji used to reach the client as raw UTF-8 header bytes here (only a control
+    // character made the old path answer 503) while the shim's gunicorn 500'd on its own
+    // header; the stream must play, with the cleaned name in the header.
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.header("icy-name"), Some("Deep Techno 24/7 ? Live Stream"));
+    assert_eq!(reply.body, b"live-mp3-bytes".as_slice());
+    // The shim still receives the station's real name, URL-escaped, and cleans its own
+    // header its own way.
+    let queries = fixture.shim_queries().await;
+    assert_eq!(queries.len(), 1, "{queries:?}");
+    assert!(
+        queries[0].contains(&("name".to_string(), "Deep Techno 24/7 🔴 Live Stream".to_string())),
+        "{queries:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_polish_tailed_station_streams_with_its_latin1_letters_kept() {
+    let fixture = LiveFixture::new().await;
+    let reply = fixture.get("/radio/live/st-polski?u=alice&t=token&s=salt").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.body, b"live-mp3-bytes".as_slice());
+    // ó is latin-1's own and stays; the letters latin-2 owns (ą ć ę ł ń ś ź ż) each become
+    // '?' — never a refused stream. `HeaderValue::to_str` cannot see the accented byte, so
+    // the witness holds the header's raw bytes (UTF-8 for the kept letter).
+    let icy = reply
+        .headers
+        .get("icy-name")
+        .map(|value| value.as_bytes())
+        .expect("icy-name");
+    assert_eq!(icy, b"Radio ?????\xc3\xb3??? 24/7");
+    // The shim still receives the station's real name, URL-escaped, and cleans its own
+    // header its own way.
+    let queries = fixture.shim_queries().await;
+    assert!(
+        queries
+            .iter()
+            .flatten()
+            .any(|(key, value)| key == "name" && value == "Radio ąćęłńóśźż 24/7"),
+        "{queries:?}"
+    );
 }
