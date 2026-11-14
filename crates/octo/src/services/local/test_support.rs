@@ -16,6 +16,14 @@ use super::{ILocalLibraryService, LocalSongMapping, ParsedExternalId, ParsedSong
 pub(crate) struct FakeLocalLibrary {
     pub by_tags: Mutex<Vec<(String, String, Option<String>, LocalSongMapping)>>,
     pub scans: AtomicUsize,
+    /// Every move of the records at one path to another, in order.
+    pub moved: Mutex<Vec<(String, String)>>,
+    /// The library file of an outside song, by its id.
+    pub files: Mutex<Vec<(String, String)>>,
+    /// Every path a download was registered at, in order.
+    pub registered: Mutex<Vec<String>>,
+    /// Every path dropped mappings were put back at, in order.
+    pub restored: Mutex<Vec<String>>,
 }
 
 impl FakeLocalLibrary {
@@ -34,11 +42,16 @@ impl FakeLocalLibrary {
 
 #[async_trait]
 impl ILocalLibraryService for FakeLocalLibrary {
-    async fn get_local_path_for_external_song(&self, _: &str, _: &str) -> Option<String> {
-        None
+    async fn get_local_path_for_external_song(&self, _: &str, external_id: &str) -> Option<String> {
+        self.files
+            .lock()
+            .iter()
+            .find(|(id, _)| id == external_id)
+            .map(|(_, path)| path.clone())
     }
 
-    async fn register_downloaded_song(&self, _: &Song, _: &str) -> anyhow::Result<()> {
+    async fn register_downloaded_song(&self, _: &Song, local_path: &str) -> anyhow::Result<()> {
+        self.registered.lock().push(local_path.to_string());
         Ok(())
     }
 
@@ -73,13 +86,42 @@ impl ILocalLibraryService for FakeLocalLibrary {
             .map(|(.., m)| m.clone())
     }
 
-    async fn forget_mapping(&self, _: &str) -> anyhow::Result<Vec<crate::services::local::LocalSongMapping>> {
-        Ok(Vec::new())
+    async fn forget_mapping(
+        &self,
+        local_path: &str,
+    ) -> anyhow::Result<Vec<crate::services::local::LocalSongMapping>> {
+        let mut by_tags = self.by_tags.lock();
+        let forgotten = by_tags
+            .iter()
+            .filter(|(.., mapping)| mapping.local_path == local_path)
+            .map(|(.., mapping)| mapping.clone())
+            .collect();
+        by_tags.retain(|(.., mapping)| mapping.local_path != local_path);
+        Ok(forgotten)
+    }
+
+    async fn forget_mapping_keyed(&self, key: &str) -> anyhow::Result<bool> {
+        let mut by_tags = self.by_tags.lock();
+        let before = by_tags.len();
+        by_tags.retain(|(.., mapping)| mapping.key() != key);
+        Ok(by_tags.len() != before)
+    }
+
+    async fn restore_mappings(&self, _: &[LocalSongMapping], local_path: &str) -> anyhow::Result<()> {
+        self.restored.lock().push(local_path.to_string());
+        Ok(())
     }
 
     async fn trigger_library_scan(&self, _force: bool) -> bool {
         self.scans.fetch_add(1, Ordering::SeqCst);
         true
+    }
+
+    async fn update_local_path(&self, old_path: &str, new_path: &str) -> anyhow::Result<usize> {
+        self.moved
+            .lock()
+            .push((old_path.to_string(), new_path.to_string()));
+        Ok(1)
     }
 
     async fn get_scan_status(&self) -> Option<ScanStatus> {

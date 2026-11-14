@@ -182,10 +182,69 @@ fn candidate_paths_prefers_library_path_then_the_music_root() {
         &f.root,
     );
 
-    assert_eq!(paths.len(), 2);
+    assert!(paths.len() >= 2, "{paths:?}");
     assert!(
-        paths.iter().all(|p| p.ends_with("Artist/Album/Song.flac")),
+        paths[..2].iter().all(|p| p.ends_with("Artist/Album/Song.flac")),
         "{paths:?}"
+    );
+}
+
+/// Navidrome's library root can sit above the music root, so the path it reports carries
+/// folders the file does not have under Octo's root (`trending/octo/Artist/x.flac` for a file at
+/// `<root>/Artist/x.flac`). That holds even when Navidrome's root also exists in Octo's
+/// container, as `/music` does in both.
+#[test]
+fn a_library_root_above_the_music_root_resolves() {
+    let f = Fixture::new();
+    f.write_file("Charli xcx/party 4 u.flac", 2048);
+
+    let resolved = resolver()
+        .verify(
+            &candidate(
+                Some("trending/octo/Charli xcx/party 4 u.flac"),
+                2048,
+                "flac",
+                Some(&f.root),
+            ),
+            &f.root,
+            false,
+        )
+        .expect("resolved");
+
+    assert!(
+        resolved.absolute_path.ends_with("/Charli xcx/party 4 u.flac"),
+        "{}",
+        resolved.absolute_path
+    );
+}
+
+/// The longest tail that exists wins, a same-named file of another size is refused, and with no
+/// size reported no shorter tail is tried at all.
+#[test]
+fn a_shorter_tail_needs_the_size_to_agree() {
+    let f = Fixture::new();
+    f.write_file("octo/Artist/Song.flac", 2048);
+    f.write_file("Artist/Song.flac", 2048);
+    let reported = "trending/octo/Artist/Song.flac";
+
+    let resolved = resolver()
+        .verify(&candidate(Some(reported), 2048, "flac", None), &f.root, false)
+        .expect("resolved");
+    assert!(
+        resolved.absolute_path.ends_with("/octo/Artist/Song.flac"),
+        "{}",
+        resolved.absolute_path
+    );
+
+    assert!(
+        resolver()
+            .verify(&candidate(Some(reported), 9999, "flac", None), &f.root, false)
+            .is_none()
+    );
+    assert!(
+        resolver()
+            .verify(&candidate(Some(reported), 0, "flac", None), &f.root, false)
+            .is_none()
     );
 }
 
@@ -205,6 +264,51 @@ fn candidate_paths_absolute_path_also_tries_the_root_relative_tail() {
             .iter()
             .any(|p| p.ends_with("Artist/Album/Song.flac") && p.starts_with(&f.root)),
         "{paths:?}"
+    );
+}
+
+/// A flat library (`Artist - Title.flac` in the music folder) that Navidrome mounts somewhere
+/// else, deeper: only the shortest tail is the file, and it still resolves.
+#[test]
+fn a_flat_file_on_another_mount_resolves() {
+    let f = Fixture::new();
+    f.write_file("Massive Attack - Teardrop.flac", 4096);
+
+    let resolved = resolver()
+        .verify(
+            &candidate(
+                Some("/data/media/music/Massive Attack - Teardrop.flac"),
+                4096,
+                "flac",
+                None,
+            ),
+            &f.root,
+            false,
+        )
+        .expect("resolved");
+
+    assert!(
+        resolved
+            .absolute_path
+            .ends_with("/Massive Attack - Teardrop.flac"),
+        "{}",
+        resolved.absolute_path
+    );
+    let paths = NavidromeSongPathResolver::candidate_paths(
+        &candidate(Some("/data/media/A/B/Song.flac"), 1, "flac", None),
+        &f.root,
+    );
+    let tails: Vec<&String> = paths.iter().filter(|p| p.starts_with(&f.root)).collect();
+    assert_eq!(
+        tails,
+        [
+            &format!("{}/data/media/A/B/Song.flac", f.root),
+            &format!("{}/media/A/B/Song.flac", f.root),
+            &format!("{}/A/B/Song.flac", f.root),
+            &format!("{}/B/Song.flac", f.root),
+            &format!("{}/Song.flac", f.root),
+        ],
+        "longest first"
     );
 }
 

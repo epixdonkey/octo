@@ -879,7 +879,14 @@ input[type="number"].set-input { max-width: 160px; }
 .field-help { font-size: var(--t-meta); color: var(--text-muted); line-height: 1.6; }
 .field-help p { margin: 0 0 var(--s-s); }
 .field-help p:last-child { margin: 0; }
-.field-error { color: var(--bad); font-size: var(--t-meta); line-height: 1.5; }
+.field-error { color: #ff7b72; font-size: var(--t-meta); line-height: 1.5; max-width: 62ch; text-wrap: pretty; }
+/* An error sits close under its own field, not at the row's spacing. */
+.set-row.stack > .set-input + .field-error { margin-top: calc(var(--s-s) - var(--s-l)); }
+.set-input[aria-invalid="true"] { border-color: rgb(239 68 68 / 0.70); }
+.set-input[aria-invalid="true"]:focus {
+  border-color: rgb(239 68 68 / 0.85);
+  box-shadow: 0 0 0 1.5px rgb(239 68 68 / 0.30), inset 1px 1px 2px rgba(0, 0, 0, 0.35);
+}
 
 /* ── Save bar: the foot of a settings card ── */
 .form-actions {
@@ -1071,6 +1078,7 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .status-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  align-items: start;
   gap: var(--s-l);
   margin-bottom: var(--s-xl);
 }
@@ -1114,6 +1122,22 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .status-card.off .status-card-body { color: var(--text-muted); }
 .status-card-foot { font-size: var(--t-label); color: var(--text-muted); margin-top: auto; }
 .status-grid { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+/* Lidarr follows Octo cannot settle: a warning line each, with the admin's Put Lidarr back under it. */
+.status-card-follows { display: flex; flex-direction: column; gap: var(--s-2xl); }
+.status-card-follow { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s-s); }
+.status-card-follow-text {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-s);
+  font-size: var(--t-meta);
+  line-height: 1.5;
+  color: var(--warn);
+  word-break: break-word;
+}
+.status-card-follow-text .icon { width: 16px; height: 16px; flex: 0 0 auto; margin-top: 2px; }
+.status-card-follow-status { font-size: var(--t-label); color: var(--text-muted); }
+.status-card-follow-status.is-error { color: #ff9a8f; }
+.status-card-follow-status:empty { display: none; }
 
 .status-dot {
   width: 8px; height: 8px;
@@ -1136,6 +1160,10 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 
 /* ── Setup checklist (Status) ── */
 .setup-checklist { margin-bottom: var(--s-page); }
+/* The Status page's downloads card: one line each, its glyph beside the line's first row. */
+.download-checks .set-info-t { display: flex; align-items: flex-start; gap: var(--s-m); }
+.download-checks .set-info-t > .icon { margin-top: 1.5px; color: var(--text-secondary); }
+.download-checks .is-warning .set-info-t > .icon { color: var(--warn); }
 .setup-checklist summary {
   min-height: 48px;
   display: flex;
@@ -1232,7 +1260,7 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .explicit-row { grid-template-columns: 2fr 1fr 2fr; gap: var(--s-l); }
 .explicit-row .found-explicit { color: var(--ink-1); font-weight: 600; }
 .explicit-row .value { word-break: normal; overflow-wrap: anywhere; }
-#explicit-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-xl) var(--s-xl); }
+#explicit-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-2xl) var(--s-xl); }
 #explicit-backfill-filter { display: flex; flex-wrap: wrap; gap: var(--s-s); padding: 0 var(--s-xl) var(--s-l); }
 #explicit-backfill-filter[hidden] { display: none; }
 #explicit-backfill-filter .btn[aria-pressed="true"] { color: var(--ink); box-shadow: inset 0 0 0 1px var(--accent); }
@@ -1243,10 +1271,30 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 
 /* Genre backfill preview: the config-sources shell with four columns instead of two. */
 .genre-change-row { grid-template-columns: 2fr 1fr 1fr 1fr; gap: var(--s-l); }
-#genre-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-xl) var(--s-xl); }
+#genre-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-2xl) var(--s-xl); }
 @container (max-width: 640px) {
   .genre-change-row { grid-template-columns: 1fr 1fr; }
   .genre-change-row > span:first-child { grid-column: 1 / -1; }
+}
+
+/* Tidy preview rows: what / before / after / why / leave out. Every row shares the table's
+ * columns, so a row without Leave out lines up with the rows that have it. */
+.tidy-table { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2fr) auto; column-gap: var(--s-l); }
+.tidy-table.layout { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.8fr) auto; }
+.tidy-row { grid-column: 1 / -1; grid-template-columns: subgrid; gap: var(--s-l); }
+.tidy-row .key, .tidy-row .value { word-break: normal; overflow-wrap: break-word; }
+.tidy-row .why { font-family: var(--font); color: var(--text-secondary); line-height: 1.45; }
+.tidy-row .tidy-act .btn { font-family: var(--font); }
+#library-tidy-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-2xl) var(--s-xl); }
+.tidy-held-t { font-size: var(--t-label); font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-muted); margin-bottom: calc(var(--s-s) - var(--s-l)); }
+@container (max-width: 640px) {
+  .tidy-table { display: flex; }
+  .tidy-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); row-gap: var(--s-s); }
+  .tidy-row { align-items: start; }
+  .tidy-row > :first-child, .tidy-row > .why, .tidy-row > .tidy-act { grid-column: 1 / -1; }
+  .tidy-row.config-row-head { display: none; }
+  .tidy-row > .tidy-act:empty { display: none; }
+  .tidy-row > .value[data-label]::before { content: attr(data-label); display: block; margin-bottom: var(--s-2xs); font-family: var(--font); font-size: var(--t-label); font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-muted); }
 }
 
 /* ── Who the dashboard is signed in as, above Restart ── */
@@ -1818,8 +1866,11 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .radio-discovery-fields { display: grid; grid-template-columns: minmax(150px, .7fr) minmax(220px, 1.3fr); gap: 10px; }
 .radio-discovery-fields label { display: grid; gap: 5px; color: var(--text-muted); font-size: var(--t-label); }
 .radio-row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--s-m); }
-.radio-status { min-height: 92px; padding: var(--s-xl); border-top: 1px solid var(--hairline); }
+.radio-status { min-height: 92px; padding: var(--s-xl) var(--s-2xl); border-top: 1px solid var(--hairline); }
 .radio-state-copy { margin: 0 0 var(--s-l); color: var(--text-muted); line-height: 1.5; }
+/* The stations kept from the last refresh: a quieter line that belongs to the state above it. */
+.radio-state-copy:has(+ .radio-carried-note) { margin-bottom: var(--s-2xs); }
+.radio-carried-note { margin: 0 0 var(--s-l); color: var(--text-muted); font-size: var(--t-meta); line-height: 1.5; text-wrap: pretty; }
 .radio-station-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .radio-station-item { padding: var(--s-l); border-radius: var(--r-control); background: rgba(0, 0, 0, 0.14); box-shadow: inset 0 0 0 1px var(--hairline); }
 .radio-station-item div { display: flex; justify-content: space-between; gap: var(--s-l); }
@@ -1891,6 +1942,8 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   .radio-row-actions { grid-column: 1; grid-row: 2; justify-content: stretch; }
   .radio-row-actions .btn { flex: 1 1 calc(50% - 8px); }
   .radio-station-grid { grid-template-columns: 1fr; }
+  .radio-status { padding: var(--s-l) 14px; }
+  .radio-status-toolbar .set-ctrl:not(:has(> :not([hidden]))) { display: none; }
   .radio-status-toolbar, .radio-reset-row { align-items: stretch; flex-direction: column; }
   .radio-status-toolbar .set-ctrl { width: 100%; min-width: 0; flex-wrap: wrap; }
   .radio-status-toolbar select, .radio-status-toolbar .btn, .radio-reset-row .btn { width: 100%; min-height: 44px; }
@@ -1966,7 +2019,7 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   box-shadow: var(--glass-rim), var(--glass-drop);
 }
 .acq-card {
-  display: flex; align-items: center; gap: var(--s-l);
+  display: flex; align-items: flex-start; gap: var(--s-l);
   padding: var(--s-l);
   border-radius: 16px;
   background: var(--nest);
@@ -1988,7 +2041,11 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .acq-head { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
 .acq-head .dl-title { max-width: 100%; }
 .acq-card .dl-sub { margin-top: 6px; line-height: 1.45; overflow-wrap: anywhere; }
+.acq-card .acq-note { color: var(--ink-1); }
 .dl-badge.state { background: rgb(var(--accent-rgb) / 0.16); color: var(--accent); }
+/* A held row waits for a person: a quiet badge with the accent dot, never the busy wash. */
+.dl-badge.waiting { display: inline-flex; align-items: center; gap: 6px; background: rgba(255, 255, 255, 0.08); color: var(--ink-1); }
+.dl-badge.waiting::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 .dl-badge.failed { background: var(--bad-wash); color: #ff7b72; }
 .acq-error { font-size: var(--t-label); color: #ff9a8f; margin-top: 6px; }
 .acq-bar { height: 6px; margin-top: 10px; border-radius: var(--r-pill); background: rgba(255, 255, 255, 0.10); overflow: hidden; }
@@ -2065,6 +2122,10 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   .version-bar .health-actions { margin-left: 0; justify-content: flex-start; }
 }
 .health-foot { margin-top: var(--s-section); }
+/* The fetched-song lookup comes after the findings; its matches are a list card of their own
+ * under the search card, as on Fetched songs. */
+.health-fetched { margin-top: var(--s-section); }
+.health-fetched .dl-list { margin-top: var(--s-l); }
 /* A health run is one full-width row: the art, then what runs with its bar, then Stop. */
 .health-run-card { grid-column: 1 / -1; gap: var(--s-xl); padding: var(--s-l) var(--s-xl) var(--s-l) var(--s-l); }
 .health-run-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-s) var(--s-m); }
@@ -2146,6 +2207,17 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 /* An In progress card's actions sit under its words; an open log takes the panel's whole width. */
 .acq-actions { display: flex; flex-wrap: wrap; gap: var(--s-s); margin-top: 10px; }
 .acq-actions .btn { padding: 0 10px; }
+/* A held card's Keep anyway: a button that opens the people it can act for, under the card's
+ * other actions. */
+.acq-menu > summary { list-style: none; cursor: pointer; gap: 6px; }
+.acq-menu > summary::-webkit-details-marker { display: none; }
+.acq-menu > summary .icon { width: 14px; height: 14px; transition: transform var(--t-card) var(--ease); }
+.acq-menu { flex: 1 1 100%; }
+.acq-menu[open] > summary .icon { transform: rotate(180deg); }
+.acq-menu-body { padding: var(--s-s) 0 0 0; }
+.acq-menu-caption { font-size: var(--t-label); color: var(--text-muted); margin-bottom: 6px; padding-left: 10px; }
+.acq-menu-people { display: flex; flex-wrap: wrap; gap: var(--s-s); }
+@media (prefers-reduced-motion: reduce) { .acq-menu > summary .icon { transition: none; } }
 .acq-card.has-log { grid-column: 1 / -1; flex-wrap: wrap; align-items: flex-start; }
 .acq-log { flex: 1 1 100%; min-width: 0; padding-top: var(--s-s); border-top: 1px solid var(--hairline); }
 .dl-log > summary { list-style-position: inside; }
@@ -2828,3 +2900,181 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .test-check.warn .icon { color: var(--warn); }
 .test-check.fail { color: var(--ink); }
 .test-check.fail .icon { color: var(--bad); }
+.test-check.info .icon { color: var(--text-secondary); }
+
+/* Mornye now: a status dot, the headline and the refresh button on one 21 px line. The dot and
+ * the button center on the headline's cap height midline, which for Inter at this size is the
+ * line's own middle (10.5 px down), so they keep to the first line when the headline wraps. */
+.mornye-head {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  column-gap: var(--s-l);
+  align-items: start;
+}
+.mornye-head .status-dot { margin-top: 6.5px; }
+.mornye-title { margin: 0; font-size: var(--t-body); font-weight: 600; line-height: 21px; color: var(--ink); overflow-wrap: break-word; }
+.mornye-head > .btn-icon { margin: -6.5px 0; color: var(--text-secondary); }
+.mornye-head > .btn-icon:hover { color: var(--ink); }
+.btn-icon.busy .icon { animation: spin 0.9s linear infinite; }
+.mornye-card.off .mornye-title { font-weight: 400; color: var(--text-muted); }
+.mornye-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-m); }
+.status-card-action { align-self: flex-start; font-size: var(--t-meta); }
+
+/* The Pass panel, under the card's state. Close sits on the title's cap height midline: a 28 px
+ * button on a 21 px line. */
+.pass-panel { animation: pane-in var(--t-card) var(--ease); }
+.pass-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s-l); }
+.pass-title { margin: 0; font-size: var(--t-body); font-weight: 600; line-height: 21px; color: var(--ink); }
+.pass-title:focus { outline: none; }
+.pass-title:focus-visible { outline: 2px solid var(--focus); outline-offset: 4px; border-radius: var(--r-row); }
+.pass-head > .btn { margin: -3.5px 0; color: var(--text-secondary); }
+.pass-head > .btn:hover { color: var(--ink); }
+.pass-line {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  column-gap: var(--s-m);
+  font-size: var(--t-meta);
+  line-height: 1.5;
+  color: var(--ink-1);
+}
+.pass-line .icon { width: 16px; height: 16px; margin-top: 3px; color: var(--text-secondary); }
+.pass-line.busy .icon { animation: spin 0.9s linear infinite; }
+.pass-line.ok .icon { color: var(--good); }
+.pass-line.warn .icon { color: var(--warn); }
+.pass-note { margin: 0; font-size: var(--t-meta); line-height: 1.5; color: #ff7b72; }
+.pass-actions { display: flex; flex-wrap: wrap; gap: var(--s-m); }
+.pass-live { display: flex; flex-direction: column; gap: var(--s-l); }
+
+/* The zoom: the chosen size is filled with the accent and ticked; the others are outlined. Every
+ * button keeps room for the tick, so choosing one moves nothing. */
+.pass-zoom { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-s); }
+.pass-zoom-label { margin-right: var(--s-xs); font-size: var(--t-meta); color: var(--text-muted); }
+.pass-zoom button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  height: var(--h-s);
+  min-width: 54px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  font: inherit;
+  font-size: var(--t-meta);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  transition: background-color var(--t-hover) var(--ease), color var(--t-hover) var(--ease), box-shadow var(--t-hover) var(--ease);
+}
+.pass-zoom button .icon { width: 12px; height: 12px; display: none; }
+.pass-zoom button:hover { color: var(--ink); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32); }
+.pass-zoom button[aria-pressed="true"] { background: var(--accent-fill); color: var(--accent-ink); box-shadow: none; }
+.pass-zoom button[aria-pressed="true"] .icon { display: block; }
+/* On touch the refresh and Close buttons keep their size beside the headline, which keeps them
+ * clear of the card's edge, and their hit area reaches 44 px past them instead. A zoom choice
+ * grows to 40 px, like a segmented choice. */
+@media (pointer: coarse) {
+  .mornye-head > .btn-icon, .pass-head > .btn { position: relative; min-height: 0; }
+  .mornye-head > .btn-icon::before { content: ''; position: absolute; inset: -5px; }
+  .pass-head > .btn::before { content: ''; position: absolute; inset: -8px -4px; }
+  .pass-zoom button { min-height: 40px; }
+}
+
+/* Mornye's check browser, drawn at its own shape. At 2x to 4x the picture is wider than the box
+ * and the box scrolls. A finger on the picture is the person's pointer in Mornye's browser, so
+ * the page does not scroll under it. */
+.pass-box {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1279 / 756;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-radius: var(--r-control);
+  background: var(--inset);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.pass-box[data-zoom="1"] { overflow: hidden; }
+.pass-box img {
+  display: block;
+  width: calc(var(--pass-zoom, 1) * 100%);
+  max-width: none;
+  height: auto;
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+  -webkit-touch-callout: none;
+}
+.pass-wait {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--s-l);
+  text-align: center;
+  font-size: var(--t-meta);
+  color: var(--text-muted);
+}
+@media (prefers-reduced-motion: reduce) {
+  .pass-panel { animation: none; }
+  .pass-zoom button { transition: none; }
+}
+
+/* File layout: the server's own example paths, the template fields and the names to add. A path
+ * wraps, at a folder break when it can, rather than being cut off. */
+.layout-examples {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: var(--s-xl);
+  row-gap: var(--s-m);
+  min-height: 19.5px;
+}
+/* Each example shares the list's two columns, so every path starts at one edge. */
+.layout-example {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: baseline;
+  font-size: var(--t-meta);
+  line-height: 1.5;
+}
+.layout-examples > .set-info-d { grid-column: 1 / -1; }
+.layout-example-k { color: var(--text-muted); }
+.layout-example-p { font-family: var(--mono); font-size: var(--t-meta); color: var(--ink-1); overflow-wrap: anywhere; background: none; padding: 0; }
+.layout-example-wait { color: var(--text-muted); }
+.layout-example-all { grid-column: 1 / -1; font-size: var(--t-meta); line-height: 1.5; }
+.set-input.layout-template { font-family: var(--mono); font-size: var(--t-meta); }
+/* A template is one line that grows to show all of itself instead of scrolling sideways. */
+textarea.set-input.layout-template {
+  min-height: var(--h-field);
+  resize: none;
+  overflow: hidden;
+  field-sizing: content;
+  overflow-wrap: anywhere;
+}
+.layout-names { display: flex; flex-wrap: wrap; gap: var(--s-s); }
+.layout-name {
+  font-family: var(--mono);
+  font-size: var(--t-label);
+  line-height: 1;
+  padding: 8px 12px;
+  border-radius: var(--r-pill);
+  border: 0;
+  box-shadow: var(--nest-rim);
+  background: var(--nest);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color var(--t-hover) var(--ease), color var(--t-hover) var(--ease), transform var(--t-press) var(--ease);
+}
+.layout-name:hover { color: var(--ink); background: var(--hover); }
+.layout-name:active { transform: scale(0.97); }
+.layout-name:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+@media (pointer: coarse) { .layout-name { min-height: var(--h-m); } }
+@container (max-width: 480px) {
+  .layout-examples { grid-template-columns: 1fr; row-gap: var(--s-l); }
+  .layout-example { grid-template-columns: 1fr; row-gap: 0; }
+}

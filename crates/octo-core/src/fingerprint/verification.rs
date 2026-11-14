@@ -1,11 +1,15 @@
-//! The data half of download verification: the verdict, why it was inconclusive, and the
-//! result a download carries. The service (fingerprinting, the AcoustID and MusicBrainz calls,
-//! the decision and its helpers) is `octo::services::fingerprint::download_verification_service`.
+//! The data half of download verification: the verdict, why it was inconclusive, the result a
+//! download carries, and the reading of AcoustID's whole answer against the recording a person
+//! heard ([`read_answer`]). The service (fingerprinting, the AcoustID and MusicBrainz calls, the
+//! decision and its helpers) is `octo::services::fingerprint::download_verification_service`.
 
 use std::fmt;
 
 use crate::common::song_identity::SongIdentity;
-use crate::fingerprint::acoust_id_client::{AcoustIdLookup, AcoustIdRecording, AcoustIdResult};
+use crate::fingerprint::acoust_id_client::{
+    AcoustIdAnswer, AcoustIdLookup, AcoustIdRecording, AcoustIdResult, AnswerArtist,
+};
+use crate::fingerprint::heart_gate::HeardRecording;
 use crate::models::domain::song::Song;
 use crate::models::download::acquisition_event::AcquisitionHeard;
 
@@ -170,10 +174,18 @@ pub struct VerificationResult {
     /// The score an AcoustID answer had to reach to count, in 0..1, as the decision used it.
     /// 0 when no answer was weighed.
     pub threshold: f64,
+
+    /// What the sound proved about which recording the file is, which decides whether its
+    /// recording-level tags are written.
+    pub proof: RecordingProof,
 }
 
 /// How many of the other recordings AcoustID heard a check line keeps.
 pub const MAX_HEARD: usize = 3;
+
+/// A link this many submissions or more stand behind, summed over the recordings that agree,
+/// confirms a file on its own; fewer is one person's word.
+pub const MIN_SOURCES_TO_CONFIRM: i32 = 2;
 
 /// A score in 0..1 as a whole percent, rounded down so it never reads as more than it was.
 pub fn whole_percent(fraction: f64) -> i32 {
@@ -441,8 +453,12 @@ impl VerificationResult {
     /// The name overwrite is unconditional where the Deezer fill is conditional. That one fills
     /// only what is missing, because a peer's own tags beat nothing. A confirmed fingerprint
     /// match beats the peer, which is the entire point of the setting.
+    ///
+    /// A file the sound did not prove as a catalog recording (kept as heard, confirmed only by a
+    /// shipped check its sound could not settle, kept by the person) takes no recording-level
+    /// tags and no name from the match: no tag claims a version the sound did not prove.
     pub fn apply_tags_to(&self, song: &mut Song) {
-        if self.verdict != VerificationVerdict::Confirmed {
+        if self.verdict != VerificationVerdict::Confirmed || !self.proof.allows_recording_tags() {
             return;
         }
 
@@ -505,15 +521,427 @@ impl VerificationResult {
     }
 }
 
+/// How one AcoustID answer reads against R, the recording a person heard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Reading {
+    /// The dominant recording is R's, no recording of the same song outside R carries an ISRC of
+    /// its own, those without one hold under 1% together, and R's recordings carry at least
+    /// [`MIN_SOURCES_TO_CONFIRM`] submissions: the file is R by its sound alone.
+    Clear,
+    /// The same song, but AcoustID cannot tell which version the file is.
+    Ambiguous,
+    /// The dominant recording is another song, or R holds under 1% while the dominant recording is
+    /// not R's.
+    Another,
+    /// No result reaches the match score.
+    Empty,
+    /// No result at the match score links a recording, or a fingerprint AcoustID has not linked
+    /// scores above every linked one.
+    Unknown,
+}
+
+/// One recording an answer links, with its submissions summed over the results that reach the
+/// match score.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WeighedRecording {
+    pub id: String,
+    pub title: String,
+    pub artists: Vec<AnswerArtist>,
+    pub isrcs: Vec<String>,
+    /// The recording's length in seconds, as AcoustID lists it.
+    pub duration_seconds: Option<f64>,
+    /// Submissions tying the matched fingerprints to this recording, a negative count read as 0.
+    pub weight: i64,
+}
+
+impl WeighedRecording {
+    /// The recording's song name, as two songs are compared.
+    pub fn song(&self) -> SongName {
+        SongName {
+            title: self.title.clone(),
+            artists: self.artists.iter().map(|a| a.name.clone()).collect(),
+            artist_ids: self.artists.iter().filter_map(|a| a.id.clone()).collect(),
+        }
+    }
+}
+
+/// A song's name as two songs are compared: the title, and the artists by name and by
+/// MusicBrainz id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SongName {
+    pub title: String,
+    pub artists: Vec<String>,
+    pub artist_ids: Vec<String>,
+}
+
+/// One AcoustID answer read against R.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnswerReading {
+    pub reading: Reading,
+    /// Every recording the qualifying results link, each once, in the order the answer first lists
+    /// it.
+    pub recordings: Vec<WeighedRecording>,
+    /// The share of the total weight R's recordings hold, 0 to 1.
+    pub r_share: f64,
+}
+
+impl AnswerReading {
+    /// Every recording's weight together.
+    pub fn total_weight(&self) -> i64 {
+        self.recordings.iter().map(|r| r.weight).sum()
+    }
+
+    /// The dominant recording: the one with the most weight, the one listed first on a tie.
+    pub fn dominant(&self) -> Option<&WeighedRecording> {
+        let mut best: Option<&WeighedRecording> = None;
+        for recording in &self.recordings {
+            if best.is_none_or(|b| recording.weight > b.weight) {
+                best = Some(recording);
+            }
+        }
+        best
+    }
+}
+
+/// What the sound proved about which recording a file is, which decides whether its
+/// recording-level tags (MusicBrainz recording id, ISRC, disambiguation) are written.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum RecordingProof {
+    /// The shipped checks alone decided.
+    #[default]
+    Shipped,
+    /// A clear reading proved the recording.
+    Proven,
+    /// Kept as heard: the very audio or the very master that played, with no clear reading of
+    /// which catalog recording it is. Names come from the routing, marked unconfirmed.
+    AsHeard {
+        /// The video it played from, when it was a direct stream.
+        video_id: Option<String>,
+    },
+    /// A shipped check confirmed it, but its sound could not settle the version.
+    NotProven,
+    /// The person kept it anyway.
+    KeptByYou,
+}
+
+impl RecordingProof {
+    /// Whether a file of this proof may carry a MusicBrainz recording id, an ISRC and the names a
+    /// match gives: only when the sound proved the recording, or the shipped checks alone decided
+    /// as they always have.
+    pub fn allows_recording_tags(&self) -> bool {
+        matches!(self, Self::Shipped | Self::Proven)
+    }
+
+    /// The words an import row carries for a file of this proof, when there are any: "version not
+    /// proven", "as heard", "as heard on YouTube".
+    pub fn row_mark(&self) -> Option<&'static str> {
+        match self {
+            Self::Shipped | Self::Proven => None,
+            Self::AsHeard { video_id: Some(_) } => Some("as heard on YouTube"),
+            Self::AsHeard { video_id: None } => Some("as heard"),
+            Self::NotProven => Some("version not proven"),
+            Self::KeptByYou => Some("kept by you, version not proven"),
+        }
+    }
+}
+
+/// One percent of an answer's weight. While the dominant recording is not R's, R's recordings
+/// holding less read as another recording; recordings of R's song outside R with no ISRC of their
+/// own, holding less together, leave a reading clear.
+pub const MIN_SHARE: f64 = 0.01;
+
+/// A title's core, as two songs are compared: the title up to its first bracketed or " - " tail
+/// ("Help! (Remastered 2009)" and "Help! - 2009 Mix" are both "Help!"), folded by
+/// [`SongIdentity::key`] (case, accents and punctuation aside, "&" read as "and").
+pub fn core_title(title: &str) -> String {
+    let bracket = title
+        .char_indices()
+        .zip(title.chars().skip(1))
+        .find(|((_, ch), next)| ch.is_whitespace() && matches!(next, '(' | '['))
+        .map(|((at, _), _)| at);
+    let end = [bracket, title.find(" - ")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(title.len());
+    SongIdentity::key(&title[..end])
+}
+
+/// Whether two lengths, in seconds, can be one recording's: at most max(7 s, 4% of `b_seconds`)
+/// apart.
+pub fn length_fits(a_seconds: f64, b_seconds: f64) -> bool {
+    (a_seconds - b_seconds).abs() <= (0.04 * b_seconds).max(7.0)
+}
+
+/// Whether two song names are one song: their core titles are equal, and they share an artist,
+/// by MusicBrainz id when both carry ids (so two spellings of one artist agree), else by name
+/// ([`SongIdentity::same_artist_name`]). A title with nothing left of its core names no song.
+pub fn is_same_song(a: &SongName, b: &SongName) -> bool {
+    let core = core_title(&a.title);
+    if core.is_empty() || core != core_title(&b.title) {
+        return false;
+    }
+    if !a.artist_ids.is_empty() && !b.artist_ids.is_empty() {
+        return a
+            .artist_ids
+            .iter()
+            .any(|id| b.artist_ids.iter().any(|other| id.eq_ignore_ascii_case(other)));
+    }
+    a.artists.iter().any(|name| {
+        b.artists
+            .iter()
+            .any(|other| SongIdentity::same_artist_name(name, other))
+    })
+}
+
+/// R's song as an answer shows it: from R's recordings in the answer (the first one's title, and
+/// every one's artists and artist ids), else from the routing (`r.title`, `r.artist` and
+/// `r.artist_ids`). None when neither gives a title.
+pub fn r_song(reading: &AnswerReading, r: &HeardRecording) -> Option<SongName> {
+    let in_r: Vec<&WeighedRecording> = reading
+        .recordings
+        .iter()
+        .filter(|recording| r.holds(&recording.id))
+        .collect();
+    if let Some(first) = in_r.first().filter(|first| !first.title.is_empty()) {
+        let mut song = SongName {
+            title: first.title.clone(),
+            ..Default::default()
+        };
+        for artist in in_r.iter().flat_map(|recording| &recording.artists) {
+            if !artist.name.is_empty() && !song.artists.contains(&artist.name) {
+                song.artists.push(artist.name.clone());
+            }
+            if let Some(id) = &artist.id
+                && !song.artist_ids.contains(id)
+            {
+                song.artist_ids.push(id.clone());
+            }
+        }
+        return Some(song);
+    }
+    if r.title.is_empty() {
+        return None;
+    }
+    Some(SongName {
+        title: r.title.clone(),
+        artists: if r.artist.is_empty() {
+            Vec::new()
+        } else {
+            vec![r.artist.clone()]
+        },
+        artist_ids: r.artist_ids.clone(),
+    })
+}
+
+/// Whether a recording of the answer is R's song ([`is_same_song`] against [`r_song`]).
+pub fn same_song(reading: &AnswerReading, r: &HeardRecording, recording: &WeighedRecording) -> bool {
+    r_song(reading, r).is_some_and(|song| is_same_song(&recording.song(), &song))
+}
+
+/// Whether a recording of the answer is a song other than R's that the answer believes the audio
+/// is: not R's song, holding at least half the weight and at least [`MIN_SOURCES_TO_CONFIRM`]
+/// submissions, and either its core title differs from R's or both sides carry MusicBrainz artist
+/// ids. A title R shares, told apart by artist names alone, is never believed another song: one
+/// artist spelled two ways must not refuse the right audio.
+pub fn believed_other_song(
+    reading: &AnswerReading,
+    r: &HeardRecording,
+    recording: &WeighedRecording,
+) -> bool {
+    let Some(song) = r_song(reading, r) else {
+        return false;
+    };
+    let other = recording.song();
+    if is_same_song(&other, &song) {
+        return false;
+    }
+    let total = reading.total_weight().max(1);
+    if 2 * recording.weight < total || recording.weight < i64::from(MIN_SOURCES_TO_CONFIRM) {
+        return false;
+    }
+    core_title(&other.title) != core_title(&song.title)
+        || (!song.artist_ids.is_empty() && !other.artist_ids.is_empty())
+}
+
+/// Reads AcoustID's whole answer against R. Results scoring at least `min_score` (0 to 1)
+/// qualify. With none the reading is [`Reading::Empty`]; with none that links a recording, or one
+/// that links none scoring above every one that does (a fingerprint AcoustID holds but has not
+/// linked may be the real match), it is [`Reading::Unknown`], and either way no recording is
+/// weighed. Otherwise each linked recording is weighed by its submissions summed over the
+/// qualifying results (a negative count as 0), each once, in the order the answer first lists it.
+/// R's recordings are R's ids alone: an ISRC one of them shares never makes another recording
+/// R's, since MusicBrainz files one code under more than one mix. An id MusicBrainz has merged
+/// into one of R's is not followed here; the caller asks for it. The reading is then:
+///
+/// - [`Reading::Another`]: R has no song name, the dominant recording is not R's song, or R holds
+///   under [`MIN_SHARE`] while the dominant recording is not R's (never when R names no recording:
+///   a dominant recording of R's song then reads [`Reading::Ambiguous`]);
+/// - [`Reading::Clear`]: the dominant recording is R's, no recording of R's song outside R carries
+///   an ISRC of its own, those of R's song outside R without one hold under [`MIN_SHARE`] together,
+///   and R's recordings carry at least [`MIN_SOURCES_TO_CONFIRM`] submissions together (a lone
+///   submission is one person's word);
+/// - [`Reading::Ambiguous`]: anything else.
+pub fn read_answer(answer: &AcoustIdAnswer, r: &HeardRecording, min_score: f64) -> AnswerReading {
+    let unweighed = |reading| AnswerReading {
+        reading,
+        recordings: Vec::new(),
+        r_share: 0.0,
+    };
+    let qualifying = || answer.results.iter().filter(|result| result.score >= min_score);
+    let best_linked = qualifying()
+        .filter(|result| !result.recordings.is_empty())
+        .map(|result| result.score)
+        .reduce(f64::max);
+    let Some(best_linked) = best_linked else {
+        return unweighed(if qualifying().next().is_some() {
+            Reading::Unknown
+        } else {
+            Reading::Empty
+        });
+    };
+    if qualifying().any(|result| result.recordings.is_empty() && result.score > best_linked) {
+        return unweighed(Reading::Unknown);
+    }
+
+    let mut recordings: Vec<WeighedRecording> = Vec::new();
+    for linked in qualifying().flat_map(|result| &result.recordings) {
+        let weight = linked.sources.max(0);
+        match recordings.iter_mut().find(|known| known.id == linked.id) {
+            Some(known) => known.weight += weight,
+            None => recordings.push(WeighedRecording {
+                id: linked.id.clone(),
+                title: linked.title.clone(),
+                artists: linked.artists.clone(),
+                isrcs: linked.isrcs.clone(),
+                duration_seconds: linked.duration_seconds,
+                weight,
+            }),
+        }
+    }
+    let total = recordings
+        .iter()
+        .map(|recording| recording.weight)
+        .sum::<i64>()
+        .max(1);
+    let r_weight: i64 = recordings
+        .iter()
+        .filter(|recording| r.holds(&recording.id))
+        .map(|recording| recording.weight)
+        .sum();
+    let mut reading = AnswerReading {
+        reading: Reading::Ambiguous,
+        recordings,
+        r_share: r_weight as f64 / total as f64,
+    };
+    reading.reading = weigh(&reading, r, r_weight, total);
+    reading
+}
+
+/// The reading of a weighed answer whose dominant recording exists; `r_weight` is what R's
+/// recordings hold of `total`.
+fn weigh(reading: &AnswerReading, r: &HeardRecording, r_weight: i64, total: i64) -> Reading {
+    let (Some(song), Some(dominant)) = (r_song(reading, r), reading.dominant()) else {
+        return Reading::Another;
+    };
+    let is_song = |recording: &WeighedRecording| is_same_song(&recording.song(), &song);
+    let dominant_in_r = r.holds(&dominant.id);
+    if !is_song(dominant) {
+        return Reading::Another;
+    }
+    // An R that names no recording cannot tell one recording of its song from another.
+    if r.ids.is_empty() {
+        return Reading::Ambiguous;
+    }
+    if !dominant_in_r && reading.r_share < MIN_SHARE {
+        return Reading::Another;
+    }
+    let outside: Vec<&WeighedRecording> = reading
+        .recordings
+        .iter()
+        .filter(|recording| !r.holds(&recording.id) && is_song(recording))
+        .collect();
+    let another_with_isrc = outside.iter().any(|recording| !recording.isrcs.is_empty());
+    let without_isrc: i64 = outside
+        .iter()
+        .filter(|recording| recording.isrcs.is_empty())
+        .map(|recording| recording.weight)
+        .sum();
+    let lone = r_weight < i64::from(MIN_SOURCES_TO_CONFIRM);
+    if dominant_in_r && !another_with_isrc && (without_isrc as f64 / total as f64) < MIN_SHARE && !lone {
+        Reading::Clear
+    } else {
+        Reading::Ambiguous
+    }
+}
+
+/// The one recording an answer gives for R, before its same-ISRC duplicates are added: the
+/// dominant recording, when it holds at least half the weight and is R's song. None otherwise.
+pub fn one_recording<'a>(reading: &'a AnswerReading, r: &HeardRecording) -> Option<&'a WeighedRecording> {
+    let dominant = reading.dominant()?;
+    (2 * dominant.weight >= reading.total_weight() && same_song(reading, r, dominant)).then_some(dominant)
+}
+
 /// An artist and title compared the way song names are: case, accents and punctuation aside.
 fn heard_key(artist: &str, title: &str) -> String {
     format!("{}|{}", SongIdentity::key(artist), SongIdentity::key(title))
 }
 
 #[cfg(test)]
+#[path = "verification_reading_tests.rs"]
+mod reading_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::fingerprint::acoust_id_client::{AcoustIdCredit, AcoustIdRelease};
+
+    /// No tag claims a version the sound did not prove: a confirmed file kept as heard, one whose
+    /// sound could not settle the version, and one kept by the person take no recording id and no
+    /// name from the match, and carry their import row's mark; a proven one and the shipped
+    /// checks' own are tagged as before.
+    #[test]
+    fn only_a_proven_or_shipped_confirmation_writes_recording_tags() {
+        let confirmed = |proof: RecordingProof| VerificationResult {
+            verdict: VerificationVerdict::Confirmed,
+            recording_id: Some("rec".into()),
+            matched_title: Some("Help!".into()),
+            tags_authoritative: true,
+            proof,
+            ..Default::default()
+        };
+        for (proof, writes, mark) in [
+            (RecordingProof::Shipped, true, None),
+            (RecordingProof::Proven, true, None),
+            (
+                RecordingProof::AsHeard {
+                    video_id: Some("vid".into()),
+                },
+                false,
+                Some("as heard on YouTube"),
+            ),
+            (
+                RecordingProof::AsHeard { video_id: None },
+                false,
+                Some("as heard"),
+            ),
+            (RecordingProof::NotProven, false, Some("version not proven")),
+            (
+                RecordingProof::KeptByYou,
+                false,
+                Some("kept by you, version not proven"),
+            ),
+        ] {
+            let mut song = Song {
+                title: "Help".into(),
+                ..Default::default()
+            };
+            confirmed(proof.clone()).apply_tags_to(&mut song);
+            assert_eq!(song.music_brainz_recording_id.is_some(), writes, "{proof:?}");
+            assert_eq!(song.title == "Help!", writes, "{proof:?}");
+            assert_eq!(proof.row_mark(), mark);
+        }
+    }
 
     #[test]
     fn needs_review_only_for_questions_a_person_can_settle() {
@@ -636,6 +1064,39 @@ mod tests {
         .apply_tags_to(&mut song);
         assert_eq!(song.title, "peer title");
         assert_eq!(song.music_brainz_recording_id, None);
+    }
+
+    #[test]
+    fn the_dominant_recording_is_the_first_with_the_most_weight() {
+        let weighed = |id: &str, weight: i64| WeighedRecording {
+            id: id.into(),
+            weight,
+            ..Default::default()
+        };
+        let reading = AnswerReading {
+            reading: Reading::Ambiguous,
+            recordings: vec![weighed("a", 3), weighed("b", 5), weighed("c", 5)],
+            r_share: 0.0,
+        };
+        assert_eq!(reading.total_weight(), 13);
+        assert_eq!(reading.dominant().map(|r| r.id.as_str()), Some("b"));
+        let empty = AnswerReading {
+            reading: Reading::Empty,
+            recordings: Vec::new(),
+            r_share: 0.0,
+        };
+        assert_eq!(empty.dominant(), None);
+        let song = WeighedRecording {
+            title: "Help!".into(),
+            artists: vec![AnswerArtist {
+                id: Some("b10bbbfc".into()),
+                name: "The Beatles".into(),
+            }],
+            ..Default::default()
+        }
+        .song();
+        assert_eq!(song.artists, ["The Beatles"]);
+        assert_eq!(song.artist_ids, ["b10bbbfc"]);
     }
 
     #[test]

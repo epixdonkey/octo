@@ -11,7 +11,7 @@ use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRoutin
 use octo_subsonic::xml::XElement;
 use regex::Regex;
 use serde_json::{Value, json};
-use wiremock::matchers::any;
+use wiremock::matchers::{any, path_regex};
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
 use super::test_app::*;
@@ -489,7 +489,10 @@ async fn get_open_subsonic_extensions_adds_octo_acquisitions_to_navidromes_list(
     assert_eq!(envelope["status"], "ok");
     assert_eq!(envelope["openSubsonic"], true);
     let extensions = extensions_of(&envelope);
-    assert_eq!(extension(&extensions, "octoAcquisitions"), Some(&vec![1, 2, 3]));
+    assert_eq!(
+        extension(&extensions, "octoAcquisitions"),
+        Some(&vec![1, 2, 3, 4])
+    );
     assert!(extension(&extensions, "formPost").is_some());
     assert!(extension(&extensions, "songLyrics").is_some());
 }
@@ -513,7 +516,7 @@ async fn get_open_subsonic_extensions_adds_it_in_xml_too() {
         .filter(|e| e.name == "versions")
         .map(XElement::value)
         .collect();
-    assert_eq!(versions, ["1", "2", "3"]);
+    assert_eq!(versions, ["1", "2", "3", "4"]);
 }
 
 // ---- Version 2: the downloads drawer --------------------------------------------------------
@@ -1612,11 +1615,15 @@ async fn a_bad_api_key_is_refused_and_never_asks_token_info() {
 
 // octoLibraryActions v2: upgrade and getUpgrades
 
-/// Better quality searches Soulseek, so it is offered only where slskd is set up.
+/// Better quality searches Soulseek, so it is offered only where slskd is in use: switched on
+/// with an address, as the heart chain uses it.
 fn better_quality_on(settings: &mut AppSettings, dry_run: bool, slskd: bool) {
     let login = |value: &str| Some(if slskd { value.to_string() } else { String::new() });
     settings.soulseek.username = login("slskd-user");
     settings.soulseek.password = login("slskd-pass");
+    if !slskd {
+        settings.soulseek.base_url = None;
+    }
     settings.library_actions.actions.push(LibraryActionDefinition {
         action: LibraryAction::BetterQuality,
         enabled: true,
@@ -1658,19 +1665,26 @@ async fn get_library_actions_lists_upgrade_only_while_better_quality_is_on() {
 #[tokio::test]
 async fn upgrade_is_queued_at_once_and_listed_for_the_caller_first() {
     let t = LibraryApp::new(|s| better_quality_on(s, false, true)).await;
+    // An upgrade's work starts by looking the song up, and here a lookup answers only after a
+    // minute: an answer that waits on the work runs into the bound below, while one that only
+    // queues the job comes back at once.
+    Mock::given(path_regex("^/api/song/|/rest/getSong$"))
+        .respond_with(ResponseTemplate::new(404).set_delay(std::time::Duration::from_secs(60)))
+        .with_priority(1)
+        .mount(&t.navidrome)
+        .await;
 
-    let started = std::time::Instant::now();
-    let doc = t.get_json(&upgrade_url("alice")).await;
-    let elapsed = started.elapsed();
+    let doc = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        t.get_json(&upgrade_url("alice")),
+    )
+    .await
+    .expect("the answer waited on the upgrade's work");
 
     let action = action(&doc);
     assert_eq!(action["id"], "nd-1");
     assert_eq!(action["action"], "upgrade");
     assert_eq!(action["state"], "queued", "{doc}");
-    assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "answered after {elapsed:?}"
-    );
     let jobs = t.state.upgrade_queue.snapshot();
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].requested_by, "alice");

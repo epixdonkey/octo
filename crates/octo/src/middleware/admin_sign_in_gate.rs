@@ -51,6 +51,7 @@ pub const OPEN_ENDPOINTS: &[(Method, &str)] = &[
 /// themselves.
 pub const APP_CALL_ENDPOINTS: &[(Method, &str, bool)] = &[
     (Method::GET, "/api/admin/downloads", true),
+    (Method::GET, "/api/admin/downloads/cover", true),
     (Method::GET, "/api/admin/lastfm/radio", false),
     (Method::POST, "/api/admin/lastfm/radio/refresh", false),
     (Method::GET, "/api/admin/listening", false),
@@ -99,8 +100,13 @@ pub const LIBRARY_FILE_ROUTES: &[(&str, bool, &str)] = &[
         true,
         "Sign in with your Navidrome account first.",
     ),
-    // Downloads: a song's log, Find songs and its picks, the trash and Put back.
+    // Downloads: a song's log, a held download's people, Keep anyway (which lands files), Find
+    // songs and its picks, the trash and Put back.
     ("/api/admin/downloads/log", false, SIGN_IN_FIRST),
+    ("/api/admin/acquisitions/holders", false, SIGN_IN_FIRST),
+    ("/api/admin/acquisitions/keep", false, SIGN_IN_FIRST),
+    // Put Lidarr back (places held copies, deletes Octo's own files and adds from Lidarr).
+    ("/api/admin/lidarr/put-back", false, SIGN_IN_FIRST),
     ("/api/admin/find", true, SIGN_IN_FIRST),
     ("/api/admin/trash", true, SIGN_IN_FIRST),
     // Library health and its fixes (tags written in place, songs removed).
@@ -388,7 +394,7 @@ mod tests {
 
     #[test]
     fn library_file_routes_match_exactly_or_below_a_prefix() {
-        let cases: [(&str, Option<&str>); 12] = [
+        let cases: [(&str, Option<&str>); 17] = [
             ("/api/admin/browse", Some("Browse session required.")),
             ("/api/admin/browse/session", None),
             ("/api/admin/browse/signout", None),
@@ -399,7 +405,12 @@ mod tests {
                 Some("Sign in with your Navidrome account first."),
             ),
             ("/api/admin/downloads", None),
+            ("/api/admin/downloads/cover", None),
             ("/api/admin/downloads/log", Some(SIGN_IN_FIRST)),
+            ("/api/admin/acquisitions", None),
+            ("/api/admin/acquisitions/keep", Some(SIGN_IN_FIRST)),
+            ("/api/admin/lidarr/put-back", Some(SIGN_IN_FIRST)),
+            ("/api/admin/lidarr/test", None),
             ("/api/admin/genre/presets", None),
             ("/api/admin/genre/backfill/undo", Some(SIGN_IN_FIRST)),
             ("/api/admin/lyricsx", None),
@@ -418,6 +429,7 @@ mod tests {
         assert!(!is_open(&Method::GET, "/api/admin/browse/auth"));
         assert_eq!(app_call(&Method::GET, "/api/admin/lastfm/radio"), Some(false));
         assert_eq!(app_call(&Method::GET, "/api/admin/downloads"), Some(true));
+        assert_eq!(app_call(&Method::GET, "/api/admin/downloads/cover"), Some(true));
         assert_eq!(app_call(&Method::GET, "/api/admin/settings"), None);
     }
 }

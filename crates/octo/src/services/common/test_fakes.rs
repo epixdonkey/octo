@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
+use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeartGate};
 use octo_core::models::domain::{Album, Artist, Song};
 use octo_core::models::download::DownloadInfo;
 use octo_core::models::search::SearchResult;
@@ -156,6 +157,12 @@ pub(crate) struct FakeLidarr {
     album: Mutex<LidarrAnswer>,
     pub track_calls: Mutex<Vec<LidarrCall>>,
     pub album_calls: Mutex<Vec<LidarrCall>>,
+    /// Why each call ran and how many gates it carried, track and album calls in order.
+    pub origins: Mutex<Vec<(AcquisitionOrigin, usize)>>,
+    /// Every song's artist already has music in Lidarr, which is left alone.
+    pub left_alone: Mutex<bool>,
+    /// What the next track call waits on when Lidarr is last, read once.
+    pub waits: Mutex<Option<crate::services::lidarr::LidarrWaits>>,
 }
 
 impl Default for FakeLidarr {
@@ -165,6 +172,9 @@ impl Default for FakeLidarr {
             album: Mutex::new(Box::new(|_, _, _| Ok(false))),
             track_calls: Mutex::new(Vec::new()),
             album_calls: Mutex::new(Vec::new()),
+            origins: Mutex::new(Vec::new()),
+            left_alone: Mutex::new(false),
+            waits: Mutex::new(None),
         }
     }
 }
@@ -216,7 +226,10 @@ impl ILidarrHeartAcquisitionService for FakeLidarr {
         external_id: &str,
         notify_failure: bool,
         requested_by: Option<&str>,
+        origin: AcquisitionOrigin,
+        gates: &[HeartGate],
     ) -> anyhow::Result<bool> {
+        self.origins.lock().push((origin, gates.len()));
         self.track_calls.lock().push((
             provider.into(),
             external_id.into(),
@@ -232,7 +245,10 @@ impl ILidarrHeartAcquisitionService for FakeLidarr {
         external_id: &str,
         notify_failure: bool,
         requested_by: Option<&str>,
+        origin: AcquisitionOrigin,
+        gates: &[HeartGate],
     ) -> anyhow::Result<bool> {
+        self.origins.lock().push((origin, gates.len()));
         self.album_calls.lock().push((
             provider.into(),
             external_id.into(),
@@ -240,6 +256,14 @@ impl ILidarrHeartAcquisitionService for FakeLidarr {
             requested_by.map(str::to_string),
         ));
         (self.album.lock())(provider, external_id, notify_failure)
+    }
+
+    fn left_alone(&self, _: &str, _: &str) -> bool {
+        *self.left_alone.lock()
+    }
+
+    fn waits_on(&self, _: &str, _: &str) -> Option<crate::services::lidarr::LidarrWaits> {
+        self.waits.lock().take()
     }
 }
 
@@ -261,6 +285,8 @@ pub(crate) struct FakeMetadata {
     pub album_searches: Mutex<usize>,
     /// What the catalog's own track search answers; None is "could not answer".
     pub catalog_tracks: Mutex<Option<Vec<(String, String)>>>,
+    /// How long an album listing takes to answer.
+    pub album_wait: Mutex<Option<std::time::Duration>>,
 }
 
 #[async_trait]
@@ -333,6 +359,10 @@ impl IMusicMetadataService for FakeMetadata {
     }
 
     async fn get_album(&self, provider: &str, id: &str) -> Option<Album> {
+        let wait = *self.album_wait.lock();
+        if let Some(wait) = wait {
+            tokio::time::sleep(wait).await;
+        }
         self.albums
             .lock()
             .get(&(provider.to_string(), id.to_string()))
@@ -385,6 +415,33 @@ impl ISoulseekLink for OfflineLink {
     async fn wait_for_login(&self, _deadline_utc: DateTime<Utc>) -> bool {
         std::future::pending::<()>().await;
         false
+    }
+}
+
+/// slskd is logged in.
+pub(crate) struct LoggedInLink;
+
+#[async_trait]
+impl ISoulseekLink for LoggedInLink {
+    async fn read(&self, _fresh: bool) -> Option<SoulseekServerReading> {
+        Some(SoulseekServerReading::new(
+            SoulseekLinkState::LoggedIn,
+            None,
+            None,
+            None,
+        ))
+    }
+
+    fn hold_limit(&self) -> TimeDelta {
+        TimeDelta::hours(6)
+    }
+
+    fn utc_now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    async fn wait_for_login(&self, _deadline_utc: DateTime<Utc>) -> bool {
+        true
     }
 }
 

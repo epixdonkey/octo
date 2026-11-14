@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026.11.14 — Sync with upstream 2026.11.13: AcoustID hearts, Apple albums, Mornye, imports to playlists
+
+### 1. Everything upstream 2026.11.13, on top of this fork's stations (`chore`)
+
+This fork now carries the whole of upstream release 2026.11.13: AcoustID
+hearts (#120 — a heart's download is verified by its fingerprint, with
+fresh `/stream?fresh=1` facts from the shim), albums through Apple Music
+(#130 — Apple answers the catalog's searches when Deezer cannot be
+reached), stations that survive a Last.fm outage (#122), Subsonic imports
+into playlists (#141), the new file layout (#135) and Mornye, the SpotiFLAC
+successor, as a download source (#113/#126). Nothing of the fork gave way:
+the YouTube search with discovery labels and the SOAK-1a row order, the
+registry ids whose `suggested_by` label never enters the id, personal
+mixed playlists and `#family` in both protocols, live radio from YouTube
+channels with emoji-safe names, and streaming hearts all kept their exact
+semantics; the merged search build simply runs upstream's stand-in catalog
+search beside the fork's YouTube half, and the resolver carries both
+`open_live_stream` and the new `open_stream_fresh`.
+
 ## 2026.11.14 — Live radio dock: names beyond latin-1, a faster first byte, a log that tells the story
 
 ### 1. A station named with an emoji or Polish letters plays like any other (`fix(subsonic)`, `fix(shim)`)

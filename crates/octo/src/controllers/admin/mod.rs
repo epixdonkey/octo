@@ -26,6 +26,7 @@ pub mod health_versions;
 pub mod imports;
 pub mod json_body;
 pub mod lastfm;
+pub mod layout;
 pub mod library_actions;
 pub mod listening;
 pub mod lyrics_admin;
@@ -94,6 +95,7 @@ pub fn admin_controller_routes() -> RouteSet {
         .route("/api/admin/browse/session", get(browse::browse_session))
         .route("/api/admin/browse/signout", post(browse::browse_sign_out))
         .route("/api/admin/downloads", get(system::downloads))
+        .route("/api/admin/downloads/cover", get(system::download_cover))
         .route("/api/admin/tags/preview", post(browse::preview_tags))
         .route("/api/admin/acquisitions", get(system::acquisitions))
         // Settings and configuration.
@@ -116,6 +118,12 @@ pub fn admin_controller_routes() -> RouteSet {
         .route("/api/admin/lidarr/options", get(system::get_lidarr_options))
         .route("/api/admin/lidarr/test", post(system::test_lidarr_connection))
         .route("/api/admin/spotiflac/test", post(spotiflac::test_spotiflac))
+        .route("/api/admin/spotiflac/status", get(spotiflac::spotiflac_status))
+        .route("/api/admin/spotiflac/assist", get(spotiflac::assist_state))
+        .route("/api/admin/spotiflac/assist/start", post(spotiflac::assist_start))
+        .route("/api/admin/spotiflac/assist/stop", post(spotiflac::assist_stop))
+        .route("/api/admin/spotiflac/assist/frame", get(spotiflac::assist_frame))
+        .route("/api/admin/spotiflac/assist/input", post(spotiflac::assist_input))
         .route("/api/admin/restart", post(system::restart))
         .route(
             "/api/admin/soulseek/rejected-peers/clear",
@@ -133,6 +141,7 @@ pub fn routes() -> RouteSet {
         .merge(library_and_job_routes())
         .merge(imports::routes())
         .merge(activity_routes())
+        .merge(layout::routes())
 }
 
 /// The library and job routes: the library actions, questions and checks, Recently removed,
@@ -198,3 +207,15 @@ mod admin_secret_tests;
 #[cfg(test)]
 #[path = "admin_downloads_tests.rs"]
 mod admin_downloads_tests;
+
+#[cfg(test)]
+#[path = "admin_covers_tests.rs"]
+mod admin_covers_tests;
+
+#[cfg(test)]
+#[path = "download_checks_tests.rs"]
+mod download_checks_tests;
+
+#[cfg(test)]
+#[path = "held_downloads_tests.rs"]
+mod held_downloads_tests;

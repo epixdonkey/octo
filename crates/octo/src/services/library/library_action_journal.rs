@@ -130,6 +130,10 @@ pub struct LibraryActionEntry {
     pub denied_source: Option<DeniedSource>,
 }
 
+/// What the file fingerprint in a Find songs pick's key ends with, so a pick that replaces a song
+/// as Wrong version does is an action of its own.
+pub const PICK_SUFFIX: &str = ":pick";
+
 /// One Soulseek user's file, as the rejected peer registry keys it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -378,22 +382,31 @@ impl LibraryActionJournal {
     /// Follow a folder the library tidy moved: an action's source and revealed paths name
     /// where the file is now. Answers how many entries followed.
     pub fn move_paths(&self, from: &str, to: &str) -> usize {
+        self.move_paths_batch(&[(from.to_string(), to.to_string())])
+    }
+
+    /// [`Self::move_paths`] for each `(from, to)` in order, so `a` to `b` then `b` to `c` ends at
+    /// `c`, with the journal marked for saving once. Answers how many entries followed, each move
+    /// counted on its own.
+    pub fn move_paths_batch(&self, moves: &[(String, String)]) -> usize {
         let mut moved = 0;
         {
             let mut entries = self.entries.lock();
-            for entry in entries.by_key.values_mut() {
-                let mut changed = false;
-                for path in [&mut entry.source_path, &mut entry.revealed_path] {
-                    if let Some(now) = path
-                        .as_deref()
-                        .and_then(|old| octo_core::common::PathHelper::moved_path(old, from, to))
-                    {
-                        *path = Some(now);
-                        changed = true;
+            for (from, to) in moves {
+                for entry in entries.by_key.values_mut() {
+                    let mut changed = false;
+                    for path in [&mut entry.source_path, &mut entry.revealed_path] {
+                        if let Some(now) = path
+                            .as_deref()
+                            .and_then(|old| octo_core::common::PathHelper::moved_path(old, from, to))
+                        {
+                            *path = Some(now);
+                            changed = true;
+                        }
                     }
-                }
-                if changed {
-                    moved += 1;
+                    if changed {
+                        moved += 1;
+                    }
                 }
             }
         }
@@ -454,6 +467,24 @@ impl LibraryActionJournal {
         });
     }
 
+    /// Whether the song `navidrome_id` carries the "wrong version asked" mark: its latest action,
+    /// leaving out picks of a copy that did not replace the file, is a Wrong version that Octo
+    /// answered with `asked` (the words that send the person to Find songs). Any other action on
+    /// the song, or a pick that replaced its file, ends the mark.
+    pub fn wrong_version_asked(&self, navidrome_id: &str, asked: &str) -> bool {
+        let entries = self.entries.lock();
+        entries
+            .ordered()
+            .filter(|entry| entry.navidrome_id == navidrome_id && !entry.dry_run)
+            .filter(|entry| !(entry.key.ends_with(PICK_SUFFIX) && entry.state != LibraryActionState::Applied))
+            .max_by_key(|entry| entry.at_utc)
+            .is_some_and(|latest| {
+                latest.action == LibraryAction::WrongVersion
+                    && latest.state == LibraryActionState::Skipped
+                    && latest.detail.as_deref() == Some(asked)
+            })
+    }
+
     /// Has the user said they do not want this track back?
     ///
     /// A Delete means exactly that, so a later re-acquire of the same artist and title is
@@ -480,21 +511,39 @@ impl LibraryActionJournal {
     /// once more. Every removal of the same song is lifted, since any one of them would still
     /// refuse it. Answers how many were; 0 when the entry blocks nothing.
     pub fn allow_downloads(&self, key: &str) -> usize {
-        let lifted: Vec<LibraryActionEntry> = {
+        let song = {
             let entries = self.entries.lock();
             let Some(chosen) = entries.by_key.get(key).filter(|entry| entry.blocks_downloads()) else {
                 return 0;
             };
-            let song = SongIdentity::match_key(&chosen.artist, &chosen.title);
-            entries
-                .by_key
-                .values()
-                .filter(|entry| {
-                    entry.blocks_downloads() && SongIdentity::match_key(&entry.artist, &entry.title) == song
-                })
-                .cloned()
-                .collect()
+            SongIdentity::match_key(&chosen.artist, &chosen.title)
         };
+        self.lift(&song)
+    }
+
+    /// A heart on a song a Delete keeps from downloading: the person asks for it again, so every
+    /// removal of it is lifted, as Allow downloading again does. Answers how many were; 0 for a
+    /// blank artist or title.
+    pub fn allow_song(&self, artist: &str, title: &str) -> usize {
+        if dotnet::is_blank(artist) || dotnet::is_blank(title) {
+            return 0;
+        }
+        self.lift(&SongIdentity::match_key(artist, title))
+    }
+
+    /// Lifts every removal of `song`, a [`SongIdentity::match_key`], that keeps it from
+    /// downloading. Answers how many were.
+    fn lift(&self, song: &str) -> usize {
+        let lifted: Vec<LibraryActionEntry> = self
+            .entries
+            .lock()
+            .by_key
+            .values()
+            .filter(|entry| {
+                entry.blocks_downloads() && SongIdentity::match_key(&entry.artist, &entry.title) == song
+            })
+            .cloned()
+            .collect();
         let count = lifted.len();
         for entry in lifted {
             self.record(LibraryActionEntry {

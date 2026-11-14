@@ -169,6 +169,7 @@ function activateTab(name, { focus = false } = {}) {
   if (name === 'soulseek' && typeof loadSharing === 'function') loadSharing();
   if (name === 'family' && typeof loadFamily === 'function') loadFamily();
   if (name === 'downloads' && typeof loadPrefetch === 'function') loadPrefetch();
+  if (name === 'spotiflac' && typeof loadMornyeNow === 'function') loadMornyeNow();
   if (typeof showListening === 'function') showListening(name === 'listening');
   if (focus) {
     window.scrollTo({ top: 0 });
@@ -503,8 +504,10 @@ async function refreshStatus() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
 
-    setStatusCard('octo', data.octo);
-    Object.entries(data.services || {}).forEach(([k, v]) => setStatusCard(k, v));
+    statusCards(data).forEach(([k, v]) => setStatusCard(k, v));
+    renderLidarrFollows(data.services?.lidarr?.follows);
+    renderDownloadChecks(data.downloads);
+    renderAcoustIdKeyHelp(data.acoustIdBuiltInKey);
 
     // Update sidebar badge with bad count, if any. An optional service nobody set up reports
     // ok, so it never counts here.
@@ -526,6 +529,7 @@ async function refreshStatus() {
       const body = card.querySelector('.status-card-body');
       if (dot) dot.className = 'status-dot bad';
       if (body) body.textContent = `Octo did not answer: ${e.message}`;
+      card.querySelectorAll('[data-status-action]').forEach(action => { action.hidden = true; });
     });
     setStatusBadge('!', 'Octo did not answer the status check');
   }
@@ -550,13 +554,138 @@ function setStatusCard(svc, probe) {
   const body = card.querySelector('.status-card-body');
   if (dot)  dot.className  = `status-dot ${state}`;
   if (body) body.textContent = probe.detail || (probe.ok ? 'online' : 'unreachable');
+  // Mornye's card leads to its page when a person can pass its check there.
+  const action = card.querySelector('[data-status-action]');
+  if (action) action.hidden = probe.action !== 'pass';
 }
+
+document.querySelectorAll('[data-status-action]').forEach(button => {
+  button.addEventListener('click', () => openTab(button.dataset.statusAction));
+});
+
+// What a blank AcoustID key means on this server: Octo's own key when this build carries one
+// (the published images do), else AcoustID off until a key is added. Unknown (an older server)
+// leaves the page's own words.
+const ACOUSTID_KEY_HELP = {
+  builtIn: 'Left blank, Octo uses its own key; your own key takes its place. Type off to turn AcoustID off; the length check and its memory of rejected files still work.',
+  none: 'This server has no key of Octo\'s own, so AcoustID is off until you add one: a free key of your own turns it on. Type off to keep it off; the length check and its memory of rejected files still work.',
+};
+function renderAcoustIdKeyHelp(builtIn) {
+  const help = document.getElementById('acoustid-key-help');
+  if (!help || typeof builtIn !== 'boolean') return;
+  help.textContent = builtIn ? ACOUSTID_KEY_HELP.builtIn : ACOUSTID_KEY_HELP.none;
+}
+
+// The downloads card: what Octo's checks of downloads by their sound cannot do right now, one
+// line each, from the status read. A line that names a setting (imported downloads going
+// unchecked) carries a switch that saves it on, as the Verify downloads card's switch does.
+function renderDownloadChecks(lines) {
+  const wrap = document.getElementById('download-checks');
+  const list = document.getElementById('download-checks-list');
+  if (!wrap || !list) return;
+  const shown = Array.isArray(lines) ? lines.filter(line => line?.text) : [];
+  const markup = shown.map(line => `<div class="set-row${line.warning ? ' is-warning' : ''}" data-check="${escapeHtml(line.id || '')}">
+      <div class="set-info"><div class="set-info-t">${icon(line.warning ? 'i-warning-circle' : 'i-info')}<span>${escapeHtml(line.text)}</span></div></div>
+      ${line.turnOn ? `<label class="switch"><input type="checkbox" data-turn-on="${escapeHtml(line.turnOn)}" aria-label="${escapeHtml(line.text)}" /><span class="sw-track"></span><span class="sw-thumb"></span></label>` : ''}
+    </div>`).join('');
+  // Only when something changed, so a refresh does not undo a switch being turned.
+  if (list.dataset.rendered !== markup) {
+    list.innerHTML = markup;
+    list.dataset.rendered = markup;
+  }
+  wrap.hidden = shown.length === 0;
+}
+
+// The switch on a line: saves its setting on, then reads the status again, which drops the line.
+async function turnOnDownloadCheck(input) {
+  const [section, key] = String(input.dataset.turnOn || '').split('.');
+  if (!section || !key) return;
+  input.disabled = true;
+  let error = null;
+  try {
+    const r = await api('/api/admin/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [section]: { [key]: true } }),
+    });
+    const result = await r.json().catch(() => ({}));
+    if (!r.ok) error = result.error || `HTTP ${r.status}`;
+  } catch (e) {
+    error = e?.message || 'no answer';
+  }
+  if (error) {
+    input.checked = false;
+    input.disabled = false;
+    note(input.closest('.set-row') || input, `Not saved: ${error}`, 'error');
+    return;
+  }
+  if (currentSettings) currentSettings[section] = { ...(currentSettings[section] || {}), [key]: true };
+  // The settings page's own switch for it says the same.
+  document.querySelectorAll(`[name="${section}.${key}"]`).forEach(box => { box.checked = true; });
+  await refreshStatus();
+}
+document.getElementById('download-checks-list')?.addEventListener('change', event => {
+  const input = event.target.closest?.('[data-turn-on]');
+  if (input?.checked) turnOnDownloadCheck(input);
+});
 
 document.getElementById('status-refresh')?.addEventListener('click', refreshStatus);
 ready.then(refreshStatus);
 // No point probing every service while nobody is looking; catch up when the tab returns.
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 30_000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshStatus(); });
+
+// Lidarr's card: each follow Octo cannot settle (a download of Octo's left Lidarr's queue while its
+// client lists nothing else, so nothing proves it gone) has its line and the admin's Put Lidarr
+// back, which counts that download gone, ends the follow and puts back what Octo changed in
+// Lidarr. Drawn again only when the list changed, so words shown under a button stay.
+function renderLidarrFollows(follows) {
+  const holder = document.getElementById('lidarr-follows');
+  if (!holder) return;
+  const shown = Array.isArray(follows) ? follows.filter(follow => follow?.follow && follow.text) : [];
+  const markup = shown.map(follow => {
+    const album = [follow.artist, follow.album].filter(Boolean).join(' · ');
+    return `<div class="status-card-follow" data-follow="${escapeHtml(follow.follow)}">
+      <div class="status-card-follow-text">${icon('i-warning-circle')}<span>${escapeHtml(follow.text)}${album ? `: ${escapeHtml(album)}` : ''}</span></div>
+      <button type="button" class="btn btn-ghost btn-sm" data-put-back="${escapeHtml(follow.follow)}">Put Lidarr back</button>
+      <span class="status-card-follow-status" role="status"></span>
+    </div>`;
+  }).join('');
+  if (holder.dataset.rendered !== markup) {
+    holder.innerHTML = markup;
+    holder.dataset.rendered = markup;
+  }
+  holder.hidden = shown.length === 0;
+  // A follow that asks the admin to act is a warning on the card's dot, never "all fine".
+  const dot = holder.closest('.status-card')?.querySelector('.status-dot');
+  if (shown.length && dot?.classList.contains('ok')) dot.className = 'status-dot warn';
+}
+
+// Put Lidarr back for one follow, as a Navidrome admin's own sign-in (asked for when missing),
+// then the status read again: a follow put back leaves the card. A refusal says why under the
+// button, which can be pressed again.
+async function putLidarrBack(button) {
+  const follow = button.dataset.putBack;
+  if (!follow || button.disabled) return;
+  const status = button.parentElement?.querySelector('.status-card-follow-status') || button;
+  button.disabled = true;
+  status.textContent = '';
+  status.classList?.remove('is-error');
+  try {
+    const response = await parityFetch('/api/admin/lidarr/put-back', parityJson({ follow }), status);
+    if (!response.ok) throw new Error(await parityError(response));
+  } catch (error) {
+    status.textContent = error.message;
+    status.classList?.add('is-error');
+    button.disabled = false;
+    return;
+  }
+  await refreshStatus();
+}
+document.getElementById('lidarr-follows')?.addEventListener('click', event => {
+  const button = event.target.closest?.('[data-put-back]');
+  if (button) putLidarrBack(button);
+});
 
 // ────────────────────────────────────────────────────────────────
 // Settings: load -> populate forms -> save on submit
@@ -609,6 +738,7 @@ async function loadSettings() {
   });
 
   syncPlaybackSourceControl();
+  syncMornyeNotifyRow();
   updateStreamSettings();
   updateRadioPublicationSettings();
   renderHeartSourceOrder(currentSettings?.Subsonic?.HeartDownloadSources);
@@ -637,6 +767,7 @@ async function loadSettings() {
   loadLastFmScrobbling();
   // Only when it is the tab on screen; opening the tab later checks then.
   if (document.querySelector('[data-pane="lastfm"].active')) loadLastFmAccount();
+  if (document.querySelector('[data-pane="spotiflac"].active')) loadMornyeNow();
 
   // Meta references
   const cfgPath = document.getElementById('meta-config-path');
@@ -653,6 +784,9 @@ async function loadSettings() {
   updateDiscoveryBanner();
   buildSegments();
   syncSegments(false);
+  renderLayoutRows();
+  showLayoutCapsProblem(currentSettings?._meta?.LayoutCapsProblem);
+  loadLayoutPreview(true);
   if (currentSettings?.Lidarr?.BaseUrl && currentSettings?.Lidarr?.ApiKey) {
     loadLidarrOptions();
   }
@@ -996,12 +1130,19 @@ document.querySelectorAll('form[data-section]').forEach(form => {
       if (form.dataset.section?.startsWith('lastfm')) setTimeout(loadLastFmScrobbling, 700);
       if (form.dataset.section === 'animated-art') setTimeout(loadAnimatedArt, 700);
       if (form.dataset.section === 'prefetch') setTimeout(loadPrefetch, 700);
-      // The heart priority's Soulseek row says whether SpotiFLAC rides with it.
-      if (form.dataset.section?.startsWith('spotiflac')) renderHeartSourceOrder();
+      // The heart priority's Soulseek row says whether SpotiFLAC rides with it, and the Mornye
+      // now card asks again once the running settings have caught up with the file.
+      if (form.dataset.section?.startsWith('spotiflac')) {
+        renderHeartSourceOrder();
+        syncMornyeNotifyRow();
+        setTimeout(loadMornyeNow, 700);
+      }
       // The re-check offer on the Verify card follows the saved match score.
       if (form.dataset.section === 'soulseek-verify' || form.dataset.section?.startsWith('library-actions')) {
         setTimeout(loadReviewSweep, 700);
       }
+      // The Status page's downloads card follows the Verify card's switch and key.
+      if (form.dataset.section === 'soulseek-verify') refreshStatus();
       form.querySelector('.form-actions')?.classList.remove('dirty');
       // A saved admin password is only ever shown as the placeholder; the typed value should
       // not stay in the page after it has been saved.
@@ -1926,12 +2067,191 @@ document.getElementById('genre-backfill-undo')?.addEventListener('click', async 
   await loadGenreBackfill();
 });
 
-// ---- Tidy artists -----------------------------------------------------------------
-// Preview (writes nothing), then apply what the preview showed: tags, a Navidrome scan, then
-// whole album folders. Renames that lose stars only run when ticked. Every call needs the
-// browse sign-in, like the genre re-tag.
+// ---- Tidy the library -------------------------------------------------------------
+// Two tasks, Artists and File layout. Preview (writes nothing), then apply what the preview
+// showed: for Artists tags, a Navidrome scan, then whole album folders, with renames that lose
+// stars only when ticked; for File layout folders, then songs one folder at a time. Every call
+// needs the browse sign-in, like the genre re-tag.
 
 let libraryTidyPoll = null;
+// ---- File layout ----------------------------------------------------------------------
+// The examples come from the server's own layout engine, so the page shows the path a download
+// gets. Typing asks again after a short pause, and only the newest answer is drawn.
+
+let layoutSeq = 0;
+// The newest request made with the saved settings (on load, and after a save): the saved-layout
+// notice is drawn from its answer, whatever typing has asked since.
+let layoutSavedSeq = 0;
+let layoutTimer = null;
+let layoutLastField = null;
+let layoutTypedAt = 0;
+const LAYOUT_TYPING_PAUSE_MS = 800;
+
+const layoutFields = {
+  FolderTemplate: 'f-folder-template',
+  FolderTemplateSingles: 'f-folder-template-singles',
+  FolderTemplateCompilations: 'f-folder-template-compilations',
+};
+
+// Each template field's name on the card, and what Octo files by while a saved one is broken.
+const layoutFieldWords = {
+  FolderTemplate: { name: 'Albums', fallback: 'new songs are filed as Organized' },
+  FolderTemplateSingles: { name: 'Singles', fallback: 'singles are filed like album tracks' },
+  FolderTemplateCompilations: { name: 'Compilations', fallback: 'compilation tracks are filed like album tracks' },
+};
+
+function renderLayoutRows() {
+  const custom = document.getElementById('f-folder-structure')?.value === 'Custom';
+  document.querySelectorAll('[data-layout-custom]').forEach(row => { row.hidden = !custom; });
+  document.querySelectorAll('.layout-template').forEach(fitLayoutTemplate);
+}
+
+function showLayoutProblems(problems) {
+  for (const [field, id] of Object.entries(layoutFields)) {
+    const holder = document.getElementById(`${id}-error`);
+    const input = document.getElementById(id);
+    if (!holder || !input) continue;
+    const problem = problems.find(p => p.field === field);
+    holder.hidden = !problem;
+    // A name in braces never breaks across two lines.
+    holder.textContent = problem ? problem.message.replace(/\{[^}]*\}/g, name => name.replace(/ /g, ' ')) : '';
+    if (problem) input.setAttribute('aria-invalid', 'true'); else input.removeAttribute('aria-invalid');
+  }
+}
+
+// An example whose template has a problem says which field to fix rather than showing the path
+// of the layout Octo would fall back to.
+function showLayoutExamples(examples, failure, problems = []) {
+  const holder = document.getElementById('layout-examples');
+  if (!holder) return;
+  const broken = new Set(problems.map(p => p.field));
+  const waiting = examples.filter(example => example.field && broken.has(example.field));
+  // Every example waiting on a fix is said once, not once per song.
+  if (!failure && examples.length > 0 && waiting.length === examples.length) {
+    const names = [...new Set(waiting.map(example => layoutFieldWords[example.field]?.name ?? 'layout'))];
+    const which = names.length === 1 ? `the ${names[0]} layout is` : `the ${names.join(' and ')} layouts are`;
+    holder.innerHTML = `<div class="layout-example-wait layout-example-all">Shown once ${esc(which)} fixed.</div>`;
+    return;
+  }
+  holder.innerHTML = failure
+    ? `<div class="set-info-d">${esc(failure)}</div>`
+    : examples.map(example => {
+      const blocked = example.field && broken.has(example.field);
+      const path = blocked
+        ? `<span class="layout-example-wait">Shown once the ${esc(layoutFieldWords[example.field]?.name ?? 'layout')} layout is fixed.</span>`
+        : `<code class="layout-example-p">${esc(example.path).replaceAll('/', '/<wbr>')}</code>`;
+      return `
+      <div class="layout-example">
+        <span class="layout-example-k">${esc(example.label)}</span>
+        ${path}
+      </div>`;
+    }).join('');
+}
+
+// A saved template can only be broken through .env or the config file (the card refuses to save
+// one), and then Octo files by the fallback: the card says so until a saved layout is whole.
+function showLayoutFallback(problems) {
+  const holder = document.getElementById('layout-fallback');
+  if (!holder) return;
+  const lines = problems
+    .map(p => layoutFieldWords[p.field])
+    .filter(Boolean)
+    .map(words => `The saved <strong>${esc(words.name)}</strong> layout has a problem, so ${esc(words.fallback)} until it is fixed.`);
+  holder.hidden = lines.length === 0;
+  holder.innerHTML = lines.join(' ');
+}
+
+// The server's line when it could not save what it remembers of older layouts' folder names
+// (the settings answer's LayoutCapsProblem); hidden while there is none.
+function showLayoutCapsProblem(line) {
+  const holder = document.getElementById('layout-caps-problem');
+  if (!holder) return;
+  holder.hidden = !line;
+  holder.textContent = line || '';
+}
+
+async function loadLayoutPreview(saved = false) {
+  const seq = ++layoutSeq;
+  if (saved) layoutSavedSeq = seq;
+  const value = id => document.getElementById(id)?.value ?? '';
+  const body = {
+    seq,
+    folderStructure: value('f-folder-structure') || 'Flat',
+    folderTemplate: value('f-folder-template'),
+    folderTemplateSingles: value('f-folder-template-singles'),
+    folderTemplateCompilations: value('f-folder-template-compilations'),
+  };
+  let answer;
+  try {
+    const response = await api('/api/admin/layout/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    answer = await response.json();
+  } catch {
+    if (seq === layoutSeq) showLayoutExamples([], 'The example could not be shown right now. Saving still works.');
+    return;
+  }
+  const problems = answer.problems ?? [];
+  if (saved && seq === layoutSavedSeq) showLayoutFallback(problems);
+  // An answer to an older request is never drawn over a newer one.
+  if (answer.seq !== layoutSeq) return;
+  // A half-typed name is a mistake for a moment: a new one in the field being typed shows after a
+  // pause or when the field is left. A fix shows at once.
+  const typing = document.activeElement?.classList?.contains('layout-template') ? document.activeElement.id : null;
+  const fresh = problems.some(p => layoutFields[p.field] === typing && document.getElementById(`${typing}-error`)?.hidden);
+  const idle = Date.now() - layoutTypedAt;
+  if (!saved && fresh && idle < LAYOUT_TYPING_PAUSE_MS) {
+    clearTimeout(layoutTimer);
+    layoutTimer = setTimeout(loadLayoutPreview, LAYOUT_TYPING_PAUSE_MS - idle);
+    return;
+  }
+  showLayoutProblems(problems);
+  showLayoutExamples(answer.examples ?? [], null, problems);
+}
+
+function scheduleLayoutPreview() {
+  clearTimeout(layoutTimer);
+  layoutTimer = setTimeout(loadLayoutPreview, 250);
+}
+
+// A template is one line that grows to show all of itself (where the browser cannot size a field
+// to its text), and Enter never starts a second line.
+function fitLayoutTemplate(input) {
+  if (!input.offsetParent) return;
+  input.style.height = 'auto';
+  input.style.height = `${input.scrollHeight + 2}px`;
+}
+
+document.getElementById('f-folder-structure')?.addEventListener('change', () => {
+  renderLayoutRows();
+  loadLayoutPreview();
+});
+document.querySelectorAll('.layout-template').forEach(input => {
+  input.addEventListener('input', () => {
+    layoutTypedAt = Date.now();
+    if (input.value.includes('\n')) input.value = input.value.replace(/\r?\n/g, '');
+    fitLayoutTemplate(input);
+    scheduleLayoutPreview();
+  });
+  input.addEventListener('keydown', event => { if (event.key === 'Enter') event.preventDefault(); });
+  input.addEventListener('focus', () => { layoutLastField = input; });
+  input.addEventListener('blur', () => { layoutTypedAt = 0; loadLayoutPreview(); });
+});
+document.getElementById('layout-names')?.addEventListener('click', event => {
+  const button = event.target.closest('[data-layout-name]');
+  if (!button) return;
+  const input = layoutLastField ?? document.getElementById('f-folder-template');
+  if (!input) return;
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? start;
+  input.setRangeText(button.dataset.layoutName, start, end, 'end');
+  input.focus();
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+});
+
 let lastTidyRun = null;
 let tidyScopeInitialised = false;
 let tidyOffset = 0;
@@ -1943,8 +2263,117 @@ const tidyKindLabels = {
   Respell: 'Spelling',
   Rename: 'Rename',
   Guest: 'Guests',
+  Layout: 'Into the layout',
   Skip: 'Left alone',
 };
+
+// What the card says for each task.
+const TIDY_WORDS = {
+  Artists: {
+    desc: 'New downloads are filed under their first artist, with one spelling per artist and guests listed in their own tag. This brings music already in your library in line. Nothing is written until you have seen a preview.',
+    scope: 'Every file is read either way, because the spelling most of your library uses is the one that wins. Only downloads Octo made are changed, or the whole library, your own rips and purchases included.',
+    notice: '<strong>Back up your music folder first.</strong> Apply rewrites artist tags, waits for Navidrome to finish a scan that saw them, and only then moves whole album folders, so each song keeps its stars, plays and playlist entries. That needs Navidrome 0.55 or newer. A rename marked with a warning changes which artist Navidrome files the songs under, and stars and ratings on the old artist are lost for every user, so those rows only run when you tick them. Undo moves folders back and restores the artist tags.',
+    preview: 'Reads every file and lists what would change and what is left alone, with the reason. Writes nothing. Folders whose songs say nothing are looked up on MusicBrainz, about one a second, so a large library may need a second preview to finish asking.',
+    applyTitle: 'Tidy these artists?',
+    applyMessage: 'Re-tags files first, waits for Navidrome to scan them, then moves whole album folders. This can take a while.',
+    applyConfirm: 'Tidy',
+    applying: 'Tidying. Tags first, then a Navidrome scan, then the folders.',
+    undoMessage: 'Moves its album folders back and restores the artist tags. A folder whose old place is taken, or a song changed since, stays as it is.',
+    wholeLibrary: 'This re-tags and moves files anywhere under:',
+  },
+  FileLayout: {
+    desc: "New downloads follow the File layout. This moves and renames songs already in your library into it, family members' folders included. Songs Lidarr keeps stay as Lidarr names them. Nothing is moved until you have seen a preview.",
+    scope: 'Only downloads Octo made are moved, or the whole library, your own rips and purchases included.',
+    notice: '<strong>Back up your music folder first.</strong> Apply renames folders, then moves songs one folder at a time, each only while Navidrome is not scanning and the song is as its last scan saw it, so each song keeps its stars, plays and playlist entries. That needs Navidrome 0.55 or newer. An album only moves whole, and lyrics move with their song. Undo puts the songs and folders back.',
+    preview: 'Reads every file and lists which folders and songs would move into the File layout, and what is left alone, with the reason. Writes nothing.',
+    applyTitle: 'Move these songs into the File layout?',
+    applyMessage: 'Renames folders, then moves songs one folder at a time, waiting whenever Navidrome scans. This can take a while.',
+    applyConfirm: 'Move',
+    applying: 'Moving songs into the File layout, one folder at a time.',
+    undoMessage: 'Moves its songs and folders back where they were. A song whose old place is taken, or that changed since, stays as it is.',
+    wholeLibrary: 'This moves and renames files anywhere under:',
+  },
+};
+
+function tidyWords(task) {
+  return TIDY_WORDS[task] ?? TIDY_WORDS.Artists;
+}
+
+function tidyTask() {
+  return document.getElementById('library-tidy-task')?.value || 'Artists';
+}
+
+// The card's words for the task chosen, and the kinds its filter offers.
+function showTidyTask(task) {
+  const words = tidyWords(task);
+  for (const [id, html] of [
+    ['library-tidy-desc', words.desc],
+    ['library-tidy-scope-desc', words.scope],
+    ['library-tidy-notice', words.notice],
+    ['library-tidy-preview-note', words.preview],
+  ]) {
+    const holder = document.getElementById(id);
+    if (holder) holder.innerHTML = html;
+  }
+  const kind = document.getElementById('library-tidy-kind');
+  if (kind?.options) {
+    for (const option of Array.from(kind.options)) {
+      option.hidden = Boolean(option.dataset?.task) && option.dataset.task !== task;
+    }
+    if (Array.from(kind.options).some(option => option.value === kind.value && option.hidden)) kind.value = 'Changes';
+  }
+}
+
+// Picks a task as the switch does.
+function chooseTidyTask(task) {
+  const select = document.getElementById('library-tidy-task');
+  if (!select) return;
+  select.value = task;
+  document.querySelectorAll('.seg[data-seg-for="library-tidy-task"]').forEach(seg => syncSegment(seg, false));
+  showTidyTask(task);
+  if (lastTidyRun) renderLibraryTidy(lastTidyRun);
+}
+
+// A link that names a task (the File layout card's) opens this card with that task chosen.
+function wireTidyTaskLinks(scope) {
+  scope.querySelectorAll('[data-tidy-task]').forEach(link => link.addEventListener('click', event => {
+    event.preventDefault();
+    chooseTidyTask(link.dataset.tidyTask);
+    if (typeof openTab === 'function') openTab('tags');
+    const card = document.getElementById('library-tidy');
+    requestAnimationFrame(() => {
+      const calm = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+      card?.scrollIntoView({ block: 'start', behavior: calm ? 'auto' : 'smooth' });
+      card?.querySelector('.seg button.active')?.focus({ preventScroll: true });
+    });
+  }));
+}
+
+// What a run did or plans, in folders and files for the File layout task.
+function tidyCounts(run) {
+  const layout = run.task === 'FileLayout';
+  const n = (count, one, many) => `${count} ${count === 1 ? one : many}`;
+  let counts;
+  if (run.mode === 'Preview') {
+    counts = layout
+      ? [n(run.files, 'file read', 'files read'), n(run.plannedMoves, 'folder to move', 'folders to move'), n(run.plannedFileMoves, 'song to move', 'songs to move')]
+      : [n(run.files, 'file read', 'files read'), `${run.plannedRetags} to re-tag`, n(run.plannedMoves, 'album folder to move', 'album folders to move')];
+    if (run.rows?.Skip) counts.push(`${run.rows.Skip} left alone`);
+  } else {
+    if (run.mode === 'Undo') {
+      counts = layout
+        ? [n(run.moved, 'folder moved back', 'folders moved back'), n(run.movedFiles, 'song moved back', 'songs moved back')]
+        : [n(run.moved, 'folder moved back', 'folders moved back'), n(run.retagged, 'tag restored', 'tags restored')];
+    } else {
+      counts = layout
+        ? [n(run.moved, 'folder moved', 'folders moved'), n(run.movedFiles, 'song moved', 'songs moved')]
+        : [`${run.retagged} re-tagged`, n(run.moved, 'album folder moved', 'album folders moved')];
+    }
+    if (run.held) counts.push(`${run.held} held back`);
+    if (run.failed) counts.push(`${run.failed} failed`);
+  }
+  return counts.join(' · ');
+}
 
 async function libraryTidyFetch(url, options = {}, retry = true) {
   const response = await api(url, options);
@@ -1974,21 +2403,30 @@ function renderLibraryTidy(run) {
   const scopeSelect = document.getElementById('library-tidy-scope');
   const scopeChanged = previewed && scopeSelect && scopeSelect.value !== run.scope;
   document.getElementById('library-tidy-scope-hint').hidden = !scopeChanged;
+  const taskChanged = previewed && tidyTask() !== (run.task ?? 'Artists');
+  const taskHint = document.getElementById('library-tidy-task-hint');
+  if (taskHint) taskHint.hidden = !taskChanged;
+  const layoutRefused = previewed && run.task === 'FileLayout' && run.layoutRefusal;
 
   const changes = Object.entries(run.rows ?? {})
     .filter(([kind]) => kind !== 'Skip').reduce((sum, [, count]) => sum + count, 0);
   const applyNote = document.getElementById('library-tidy-apply-note');
-  applyNote.textContent = previewed && !run.applyAllowed && run.applyBlockedReason
-    ? run.applyBlockedReason
-    : run.otherJob
-      ? `${run.otherJob} is changing the music folder right now. Apply is available once it is done.`
-      : 'Once a preview has finished, for the same files it previewed.';
+  applyNote.textContent = running
+    ? 'Cancel stops it after the current file.'
+    : layoutRefused
+    ? run.layoutRefusal
+    : previewed && !run.applyAllowed && run.applyBlockedReason
+      ? run.applyBlockedReason
+      : run.otherJob
+        ? `${run.otherJob} is changing the music folder right now. Apply is available once it is done.`
+        : 'Once a preview has finished, for the same files it previewed.';
 
   document.getElementById('library-tidy-cancel').hidden = !running;
-  document.getElementById('library-tidy-apply').hidden =
-    !previewed || changes === 0 || scopeChanged || !run.applyAllowed || Boolean(run.otherJob);
+  document.getElementById('library-tidy-apply').hidden = !previewed || changes === 0 || scopeChanged
+    || taskChanged || Boolean(layoutRefused) || !run.applyAllowed || Boolean(run.otherJob);
   document.getElementById('library-tidy-resume').hidden = !run.canResume || running;
-  document.getElementById('library-tidy-undo').hidden = !run.canUndo || running;
+  const undo = document.getElementById('library-tidy-undo');
+  undo.hidden = !run.canUndo || running;
   document.getElementById('library-tidy-preview').disabled = running;
   document.getElementById('library-tidy-filter').hidden = !previewed && !run.rows?.Skip;
 
@@ -2004,24 +2442,12 @@ function renderLibraryTidy(run) {
         Interrupted: 'Interrupted',
         Failed: 'Stopped',
       }[run.status] ?? run.status;
-  const counts = (run.mode === 'Preview'
-    ? [
-        `${run.files} files read`,
-        `${run.plannedRetags} to re-tag`,
-        `${run.plannedMoves} album folders to move`,
-        run.rows?.Skip ? `${run.rows.Skip} left alone` : null,
-      ]
-    : [
-        run.mode === 'Undo' ? `${run.moved} folders moved back` : `${run.retagged} re-tagged`,
-        run.mode === 'Undo' ? `${run.retagged} tags restored` : `${run.moved} album folders moved`,
-        run.held ? `${run.held} held back` : null,
-        run.failed ? `${run.failed} failed` : null,
-      ]).filter(Boolean).join(' · ');
+  const counts = tidyCounts(run);
   const unasked = run.lookupsNotAsked
-    ? `<div class="set-info-d">MusicBrainz was not asked about ${run.lookupsNotAsked} name(s) yet. Preview again to ask about the next batch.</div>`
+    ? `<div class="set-info-d">MusicBrainz was not asked about ${run.lookupsNotAsked === 1 ? '1 name' : `${run.lookupsNotAsked} names`} yet. Preview again to ask about the next batch.</div>`
     : '';
   const held = run.heldRows?.length ? `
-    <div class="set-info-t">Held back</div>
+    <div class="tidy-held-t">Held back</div>
     ${tidyTable(run.heldRows, false)}` : '';
   const errors = run.errors?.length
     ? `<div class="field-error" role="alert">${esc(run.errors[run.errors.length - 1])}</div>` : '';
@@ -2034,21 +2460,46 @@ function renderLibraryTidy(run) {
     ${held}${errors}`;
 }
 
+// A Layout row is one folder's songs: Leave out takes that whole folder, where an artist row's
+// takes its artist folder.
+function tidyLeaveOut(row) {
+  return row.kind === 'Layout' ? row.path : row.path.split('/')[0];
+}
+
+// A row of the family pool's songs keeps `pool:` in its path for Leave out; it reads as
+// members' songs.
+function tidyShownPath(path) {
+  return path.startsWith('pool:') ? `Members' songs, ${path.slice('pool:'.length)}` : path;
+}
+
+// A path breaks after its slashes before it breaks inside a name.
+function tidyPath(text) { return esc(text).replaceAll('/', '/<wbr>'); }
+
+// The What column: the kind, then the path the row is about.
+function tidyWhat(row) {
+  const kind = esc(tidyKindLabels[row.kind] ?? row.kind);
+  if (row.kind === 'Layout') return row.path.startsWith('pool:') ? `${kind}, members' songs` : kind;
+  return row.path ? `${kind}: ${tidyPath(tidyShownPath(row.path))}` : kind;
+}
+
 function tidyTable(rows, withTicks) {
+  const classes = 'config-row genre-change-row tidy-row';
+  const table = `config-table tidy-table${rows.some(row => row.kind === 'Layout') ? ' layout' : ''}`;
   const body = rows.map(row => `
-    <div class="config-row genre-change-row">
+    <div class="${classes}">
       <span class="key">${withTicks && row.optIn
-        ? `<label><input type="checkbox" data-tidy-tick="${esc(row.id)}"${tidyTicked.has(row.id) ? ' checked' : ''}> ${esc(tidyKindLabels[row.kind] ?? row.kind)}</label>`
-        : esc(tidyKindLabels[row.kind] ?? row.kind)}${row.path ? `: ${esc(row.path)}` : ''}</span>
-      <span class="value">${esc(row.before || '')}</span>
-      <span class="value">${esc(row.after || '')}</span>
-      <span class="value">${esc(row.evidence || '')}${withTicks && row.path
-        ? ` <button class="btn btn-ghost" type="button" data-tidy-exclude="${esc(row.path.split('/')[0])}">Leave out</button>` : ''}</span>
+        ? `<label><input type="checkbox" data-tidy-tick="${esc(row.id)}"${tidyTicked.has(row.id) ? ' checked' : ''}> ${tidyWhat(row)}</label>`
+        : tidyWhat(row)}</span>
+      <span class="value" data-label="Before">${tidyPath(row.before || (row.kind === 'Layout' ? 'The music folder' : ''))}</span>
+      <span class="value" data-label="After">${tidyPath(row.after || (row.kind === 'Layout' ? 'The music folder' : ''))}</span>
+      <span class="value why">${tidyPath(row.evidence || '')}</span>
+      <span class="tidy-act">${withTicks && row.path
+        ? `<button class="btn btn-ghost btn-sm" type="button" data-tidy-exclude="${esc(tidyLeaveOut(row))}">Leave out</button>` : ''}</span>
     </div>`).join('');
   return `
-    <div class="config-table">
-      <div class="config-row config-row-head genre-change-row">
-        <span>What</span><span>Before</span><span>After</span><span>Why</span>
+    <div class="${table}">
+      <div class="${classes} config-row-head">
+        <span>What</span><span>Before</span><span>After</span><span>Why</span><span></span>
       </div>
       ${body}
     </div>`;
@@ -2089,6 +2540,9 @@ async function loadTidy(retry = false) {
   if (!tidyScopeInitialised && scopeSelect && run.previewed && run.scope) scopeSelect.value = run.scope;
   const excluded = document.getElementById('library-tidy-excluded');
   if (!tidyScopeInitialised && excluded && run.excluded?.length) excluded.value = run.excluded.join('\n');
+  const shownTask = run.status !== 'Idle' ? run.task : run.undoTask;
+  if (!tidyScopeInitialised && shownTask) chooseTidyTask(shownTask);
+  else if (!tidyScopeInitialised) showTidyTask(tidyTask());
   tidyScopeInitialised = true;
   renderLibraryTidy(run);
   if (previous?.status === 'Running' && run.status !== 'Running') {
@@ -2130,7 +2584,7 @@ async function confirmTidyPath(run, action) {
   if (run.scope !== 'WholeLibrary') return '';
   return askDialog({
     title: `${action} in your whole library?`,
-    message: `This re-tags and moves files anywhere under:\n${run.musicPath}\nincluding music Octo never downloaded. Type that path exactly to continue.`,
+    message: `${tidyWords(run.task).wholeLibrary}\n${run.musicPath}\nincluding music Octo never downloaded. Type that path exactly to continue.`,
     confirm: action, danger: true,
     input: { label: 'Music folder', placeholder: run.musicPath, mustEqual: run.musicPath },
   });
@@ -2139,13 +2593,18 @@ async function confirmTidyPath(run, action) {
 document.getElementById('library-tidy-preview')?.addEventListener('click', async () => {
   const scope = document.getElementById('library-tidy-scope')?.value ?? 'OctoDownloads';
   tidyTicked.clear();
-  if (await postTidy('/api/admin/tidy/preview', { scope, excluded: tidyExcluded() })) {
+  if (await postTidy('/api/admin/tidy/preview', { scope, task: tidyTask(), excluded: tidyExcluded() })) {
     tidyNote('Previewing. Nothing is being written.', 'info');
   }
 });
 document.getElementById('library-tidy-scope')?.addEventListener('change', () => {
   if (lastTidyRun) renderLibraryTidy(lastTidyRun);
 });
+document.getElementById('library-tidy-task')?.addEventListener('change', () => {
+  showTidyTask(tidyTask());
+  if (lastTidyRun) renderLibraryTidy(lastTidyRun);
+});
+wireTidyTaskLinks(document);
 document.getElementById('library-tidy-kind')?.addEventListener('change', () => {
   tidyOffset = 0;
   loadTidyRows();
@@ -2174,17 +2633,17 @@ document.getElementById('library-tidy-results')?.addEventListener('click', event
 document.getElementById('library-tidy-apply')?.addEventListener('click', async () => {
   const run = await loadTidy();
   if (!run || !run.applyAllowed) return;
+  const words = tidyWords(run.task);
   const ticked = [...tidyTicked];
   const renames = ticked.length
-    ? ` ${ticked.length} rename(s) you ticked will lose the stars and ratings on the old artist for every user.`
+    ? ` ${ticked.length === 1 ? '1 rename you ticked will' : `${ticked.length} renames you ticked will`} lose the stars and ratings on the old artist for every user.`
     : '';
-  if (!(await askConfirm('Tidy these artists?',
-    `Re-tags files first, waits for Navidrome to scan them, then moves whole album folders. This can take a while.${renames}`,
-    'Tidy', ticked.length > 0))) return;
-  const confirm = await confirmTidyPath(run, 'Tidy');
+  if (!(await askConfirm(words.applyTitle, `${words.applyMessage}${renames}`,
+    words.applyConfirm, ticked.length > 0))) return;
+  const confirm = await confirmTidyPath(run, words.applyConfirm);
   if (confirm === null) return;
-  if (await postTidy('/api/admin/tidy/apply', { scope: run.scope, ticked, confirm })) {
-    tidyNote('Tidying. Tags first, then a Navidrome scan, then the folders.', 'info');
+  if (await postTidy('/api/admin/tidy/apply', { scope: run.scope, task: run.task ?? 'Artists', ticked, confirm })) {
+    tidyNote(words.applying, 'info');
   }
 });
 document.getElementById('library-tidy-resume')?.addEventListener('click', async () => {
@@ -2205,10 +2664,11 @@ document.getElementById('library-tidy-cancel')?.addEventListener('click', async 
   await loadTidy();
 });
 document.getElementById('library-tidy-undo')?.addEventListener('click', async () => {
-  if (!(await askConfirm('Undo the last tidy?',
-    'Moves its album folders back and restores the artist tags. A folder whose old place is taken, or a song changed since, stays as it is.',
-    'Undo the tidy'))) return;
-  if (await postTidy('/api/admin/tidy/undo', {})) tidyNote('Undoing the tidy.', 'info');
+  if (!(await askConfirm('Undo the last tidy?', tidyWords(lastTidyRun?.undoTask).undoMessage, 'Undo the tidy'))) return;
+  // The run this page showed, so an apply from another page since puts nothing back.
+  if (await postTidy('/api/admin/tidy/undo', { run: lastTidyRun?.undoRun ?? null })) {
+    tidyNote('Undoing the tidy.', 'info');
+  }
 });
 
 // ---- Mark explicit songs ----------------------------------------------------------
@@ -3007,9 +3467,9 @@ async function loadYoutubeCheck() {
       parts.push(`Looked at ${s.position} of ${s.total} songs: AcoustID vouches for ${s.known}, ${s.asked} asked about, ${s.open} waiting for an answer.`);
       if (s.keeper) parts.push(`Asking ${s.keeper}.`);
     } else if (s.finishedUtc) {
-      parts.push(`Done: looked at ${s.done} songs. AcoustID vouches for ${s.known}; of the rest, ${s.asked} asked about, ${s.unsure} left alone as unclear, ${s.noCopy} with no preview to compare.`);
+      parts.push(`Done: looked at ${s.done} songs. AcoustID vouches for ${s.known}; of the rest, ${s.asked} asked about, ${s.unsure} left alone as unclear, ${s.noCopy} with no YouTube stream to compare.`);
     } else {
-      parts.push('Compares the songs AcoustID cannot vouch for with their YouTube preview, once.');
+      parts.push('Compares the songs AcoustID cannot vouch for with their YouTube stream, once.');
     }
     if (s.running && s.reason && s.state !== 'Running') parts.push(s.reason);
     status.textContent = parts.join(' ');
@@ -3042,7 +3502,7 @@ async function youtubeCheckPost(button, path, message) {
 
 document.getElementById('youtube-check-start')?.addEventListener('click', async (event) => {
   const button = event.currentTarget;
-  if (!(await askConfirm('Compare every song with YouTube?', 'Songs AcoustID cannot vouch for are compared with their YouTube preview, a few an hour. A song that sounds nothing like it becomes a question in Review. Nothing is changed or removed. Earlier answers are forgotten.', 'Check'))) return;
+  if (!(await askConfirm('Compare every song with YouTube?', 'Songs AcoustID cannot vouch for are compared with their YouTube stream, a few an hour. A song that sounds nothing like it becomes a question in Review. Nothing is changed or removed. Earlier answers are forgotten.', 'Check'))) return;
   youtubeCheckPost(button, '/api/admin/youtube-check/start', 'Checking.');
 });
 document.getElementById('youtube-check-pause')?.addEventListener('click', (event) => {
@@ -3123,6 +3583,21 @@ setInterval(() => { if (document.visibilityState === 'visible' && !gatePromise) 
 // octo-sonic's analysis of every song (how it sounds, and its transition profile), on the radio page.
 const sonicStates = { Off: 'Off', Paused: 'Paused', Waiting: 'Waiting', Running: 'Analyzing', Done: 'Up to date' };
 
+// The analysis's status line. While songs are read again for a newer revision of their transition
+// profiles, the state stays as Sounds alike has it and a line says how far the update is.
+function sonicStatusText(s) {
+  const parts = [`${sonicStates[s.state] || s.state}.`];
+  if (s.total > 0 && s.readsSound === false) parts.push(`${s.profiled} of ${s.total} songs have a transition profile (pass ${s.pass}).`);
+  else if (s.total > 0) parts.push(`${s.analysed} of ${s.total} songs analyzed (pass ${s.pass}).`);
+  if (s.readsSound !== false && s.profiled > 0) parts.push(`${s.profiled} have a transition profile.`);
+  const updating = s.updatingProfiles;
+  if (updating) parts.push(`Updating song profiles, ${updating.done} of ${updating.total}.`);
+  if (s.failed > 0) parts.push(`${s.failed} could not be read.`);
+  if (s.skipped > 0) parts.push(`${s.skipped} left out: Octo cannot find the file, or the song has no length or runs over 45 minutes.`);
+  if (s.reason) parts.push(s.reason);
+  return parts.join(' ');
+}
+
 async function loadSonic() {
   const status = document.getElementById('sonic-status');
   if (!status) return;
@@ -3130,14 +3605,7 @@ async function loadSonic() {
     const response = await api('/api/admin/sonic');
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const s = await response.json();
-    const parts = [`${sonicStates[s.state] || s.state}.`];
-    if (s.total > 0 && s.readsSound === false) parts.push(`${s.profiled} of ${s.total} songs have a transition profile (pass ${s.pass}).`);
-    else if (s.total > 0) parts.push(`${s.analysed} of ${s.total} songs analyzed (pass ${s.pass}).`);
-    if (s.readsSound !== false && s.profiled > 0) parts.push(`${s.profiled} have a transition profile.`);
-    if (s.failed > 0) parts.push(`${s.failed} could not be read.`);
-    if (s.skipped > 0) parts.push(`${s.skipped} left out: Octo cannot find the file, or the song has no length or runs over 45 minutes.`);
-    if (s.reason) parts.push(s.reason);
-    status.textContent = parts.join(' ');
+    status.textContent = sonicStatusText(s);
     const toggle = document.getElementById('sonic-toggle');
     toggle.dataset.paused = s.paused ? 'true' : 'false';
     toggle.querySelector('span').textContent = s.paused ? 'Start' : 'Pause';
@@ -3313,6 +3781,677 @@ function renderSpotiflacTest(checks) {
   }).join('');
   row.hidden = checks.length === 0;
 }
+
+// ────────────────────────────────────────────────────────────────
+// Mornye now, and Pass Mornye's check
+// ────────────────────────────────────────────────────────────────
+// From mornyeWhen to passInputQueue the rules read only their arguments (and esc and icon), so
+// tests/mornye_pass.test.mjs runs them outside the page.
+
+// A moment in this browser's own time: the time alone today, with the date on another day and
+// with the year in another year. roundUp gives a wait's end the next whole minute, so a "next
+// try" is never earlier than the real one. A time never wraps between its hour and its AM or PM.
+function mornyeWhen(iso, now = new Date(), roundUp = false, locale = undefined) {
+  let ms = new Date(iso ?? '').getTime();
+  if (!Number.isFinite(ms)) return '';
+  if (roundUp) ms = Math.ceil(ms / 60000) * 60000;
+  const at = new Date(ms);
+  const time = at.toLocaleTimeString(locale, { hour: 'numeric', minute: '2-digit' }).replace(/\s/g, ' ');
+  if (at.toDateString() === now.toDateString()) return time;
+  const day = { month: 'short', day: 'numeric' };
+  if (at.getFullYear() !== now.getFullYear()) day.year = 'numeric';
+  return `${at.toLocaleDateString(locale, day)}, ${time}`;
+}
+
+// Mornye's own words end as a sentence, whether or not Mornye ended them.
+const mornyeSentence = text => (/[.!?]$/.test(text) ? text : `${text}.`);
+
+// The status card for a Mornye the status does not list: switched off, as the server words it.
+const MORNYE_OFF_PROBE = { ok: true, configured: false, warning: false, detail: 'Off. Optional.' };
+
+// The status cards one status answer draws: Octo, each service it lists, and Mornye's card off
+// when the status lists no Mornye (it lists one only while Mornye is switched on).
+function statusCards(data) {
+  const cards = [['octo', data?.octo], ...Object.entries(data?.services || {})];
+  if (!data?.services?.mornye) cards.push(['mornye', MORNYE_OFF_PROBE]);
+  return cards;
+}
+
+// Whether the Notifications page shows the switch for Mornye's check: only while Mornye is
+// switched on in the saved settings.
+function mornyeNotifyShown(settings) {
+  return !!settings?.Spotiflac?.Enabled;
+}
+
+// Shows or hides `row`, the Notifications switch for Mornye's check, by the saved `settings`.
+function applyMornyeNotifyRow(row, settings) {
+  if (row) row.hidden = !mornyeNotifyShown(settings);
+}
+
+// What the Mornye now card says for one answer of GET /api/admin/spotiflac/status: a tone, a
+// headline, one line per finding (plain words, escaped where drawn), the address of Mornye's
+// own page, and whether Pass Mornye's check can start.
+function mornyeCard(status, now = new Date()) {
+  if (status?.on === false && status.enabled) {
+    return { tone: 'warn', title: 'Mornye is switched on but has no address. Set it under Connection.', lines: [], canPass: false, webUrl: null };
+  }
+  if (!status || status.on === false) {
+    return { tone: 'off', title: 'Mornye is off. Switch on Download with Mornye under Connection to use it.', lines: [], canPass: false, webUrl: null };
+  }
+  const lines = [];
+  const add = (state, text) => { if (text) lines.push({ state, text: mornyeSentence(String(text)) }); };
+  const webUrl = status.webUrl || null;
+  if (!status.reachable) {
+    add('fail', status.problem || 'Mornye did not answer at its address. Test the connection below.');
+    return { tone: 'bad', title: 'Octo cannot reach Mornye.', lines, canPass: false, webUrl };
+  }
+  const name = [status.name || 'Mornye', status.version].filter(Boolean).join(' ');
+  add('warn', status.problem);
+  if (status.utilitiesMissing) {
+    add('fail', 'Mornye needs its utilities extension, which your registry does not list.');
+    return { tone: 'bad', title: `${name} answers but cannot download.`, lines, canPass: false, webUrl };
+  }
+
+  const checks = Array.isArray(status.checks) ? status.checks : [];
+  const paused = checks.filter(check => check.pausedUntilUtc);
+  const unpassed = checks.filter(check => !check.pausedUntilUtc && check.since);
+  for (const check of checks) {
+    const label = check.label || 'an extension';
+    if (!check.pausedUntilUtc) {
+      if (check.since) add('warn', `Mornye has not passed its check for ${label} since ${mornyeWhen(check.since, now)}; the next song lets it try again`);
+      continue;
+    }
+    const opening = check.since
+      ? `Mornye has not passed its check for ${label} since ${mornyeWhen(check.since, now)}`
+      : `Mornye's check for ${label} is paused`;
+    const until = mornyeWhen(check.pausedUntilUtc, now, true);
+    add('warn', check.gatewayAsked ? `${opening}; the gateway asked it to wait until ${until}` : `${opening}; next try ${until}`);
+  }
+  const failing = (Array.isArray(status.extensions) ? status.extensions : []).filter(ext => ext.state === 'failing');
+  failing.forEach(ext => add('warn', ext.lastError ? `${ext.name} failed its last try: ${ext.lastError}` : `${ext.name} failed its last try`));
+  if (status.reportsCheck === false) add('info', 'This Mornye does not report its check');
+
+  const checkSongs = Number(status.checkSongs) || 0;
+  if (status.helper === 'no token') add('info', 'Set a web token for Mornye (SPOTIFLAC_WEB_TOKEN) to pass its check from Octo');
+  if (status.helper === 'refused') add('info', "Octo's helper beside Mornye refused the web token. Octo and Mornye must share SPOTIFLAC_WEB_TOKEN");
+  if (paused.length && status.helper === 'absent') add('info', "Passing the check from here needs the spotiflac service in Octo's compose file");
+  if (paused.length && status.helper === 'ok' && checkSongs === 0) {
+    add('info', 'No song has asked Mornye since its check paused. Once one has, you can pass the check here');
+  }
+
+  const title = paused.length ? `${name} answers, but its check is paused.`
+    : unpassed.length ? `${name} answers, but has not passed its check.`
+    : failing.length === 1 ? `${name} answers, but an extension failed its last try.`
+    : failing.length ? `${name} answers, but ${failing.length} extensions failed their last try.`
+    : status.problem ? `${name} answers.`
+    : `${name} is ready.`;
+  const tone = paused.length || unpassed.length || failing.length || status.problem ? 'warn' : 'ok';
+  // The server decides when Pass can help (a pause Mornye made, the helper answering, a song to
+  // ask with), the same rule the status grid's link follows.
+  return { tone, title, lines, canPass: status.passable === true, webUrl };
+}
+
+// The card's findings as list items, each Mornye word escaped.
+function mornyeLinesHtml(lines) {
+  const glyph = { ok: 'i-check-circle-fill', warn: 'i-warning-circle-fill', fail: 'i-x-circle-fill', info: 'i-info-fill' };
+  const words = { ok: 'Passed', warn: 'Warning', fail: 'Problem', info: 'Note' };
+  return lines.map(line => {
+    const state = glyph[line.state] ? line.state : 'info';
+    return `<li class="test-check ${state}">${icon(glyph[state])}<span class="visually-hidden">${words[state]}: </span><span>${esc(line.text)}</span></li>`;
+  }).join('');
+}
+
+// The Pass panel's zoom: a phone's narrow screen starts close enough to press the check's box.
+const PASS_ZOOMS = [1, 2, 3, 4];
+const passZoomDefault = viewportWidth => (viewportWidth < 600 ? 3 : 1);
+
+// Where a pointer at (clientX, clientY) falls in the frame, in the frame's CSS pixels. rect is the
+// drawn image's own box, which already holds the zoom and the scroll; the point is kept inside
+// the frame.
+function passPoint(clientX, clientY, rect, frameWidth, frameHeight) {
+  const inside = (value, size) => Math.min(Math.max(value, 0), Math.max(size - 1, 0));
+  return {
+    x: Math.round(inside(((clientX - rect.left) / rect.width) * frameWidth, frameWidth)),
+    y: Math.round(inside(((clientY - rect.top) / rect.height) * frameHeight, frameHeight)),
+  };
+}
+
+// What the Pass panel shows for one answer of GET /api/admin/spotiflac/assist: its words, their
+// tone, whether the live picture shows, whether to keep asking, the button that starts again,
+// and the gateway's own waits.
+function passView(assist, now = new Date()) {
+  const state = assist?.state || 'idle';
+  const waits = [...new Set((Array.isArray(assist?.gatewayAsked) ? assist.gatewayAsked : [])
+    .map(row => mornyeWhen(row.until, now, true)).filter(Boolean))]
+    .map(until => `The gateway asked Mornye to wait until ${until}.`);
+  const another = Number(assist?.checkSongs) > 0;
+  const views = {
+    opening: { text: "Opening Mornye's check…", busy: true, polls: true },
+    live: { text: "Mornye's check, live. Click or tap its box here; Octo passes on only your own pointer.", live: true, polls: true },
+    passed: { text: 'Passed. Songs ask Mornye again from now on; ones it could not get during the pause need a heart again.', tone: 'ok' },
+    closed: { text: 'The check closed before it was passed.', tone: 'warn', retry: 'Try again' },
+    'no-check': another
+      ? { text: "That song did not reach Mornye's check.", tone: 'warn', retry: 'Try another song' }
+      : { text: "That song did not reach Mornye's check. No other song is waiting to try.", tone: 'warn' },
+    unavailable: { text: assist?.why || "Octo cannot open Mornye's check now.", tone: 'warn' },
+  };
+  const view = views[state] || { text: assist?.why || "Mornye's check is not open.", tone: 'warn', retry: 'Try again' };
+  return { state, tone: 'info', busy: false, live: false, polls: false, retry: null, ...view, notes: waits };
+}
+
+// One line of pointer events into Mornye's check browser. Each post waits for the one before, so
+// the browser gets them in the order they happened. Moves waiting their turn merge (the latest
+// point wins), at most one goes every `gap` ms, and presses and releases are never merged or
+// dropped. A release that fails is sent once more, so the check's box is never left held down.
+function passInputQueue(send, { now = () => Date.now(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), gap = 50, failed = () => {} } = {}) {
+  const waiting = [];
+  let lastMove = -Infinity;
+  let running = null;
+  async function run() {
+    while (waiting.length) {
+      const head = waiting[0];
+      if (head.type === 'mouseMoved') {
+        const rest = lastMove + gap - now();
+        if (rest > 0) { await sleep(rest); continue; }
+        lastMove = now();
+      }
+      waiting.shift();
+      for (let tries = head.type === 'mouseReleased' ? 2 : 1; tries > 0; tries--) {
+        try { await send(head); break; } catch (error) { if (tries === 1) failed(head, error); }
+      }
+    }
+    running = null;
+  }
+  return {
+    push(event) {
+      const last = waiting[waiting.length - 1];
+      if (event.type === 'mouseMoved' && last?.type === 'mouseMoved') waiting[waiting.length - 1] = event;
+      else waiting.push(event);
+      if (!running) running = run();
+      return running;
+    },
+    idle: () => running || Promise.resolve(),
+    clear() { waiting.length = 0; },
+  };
+}
+
+const PASS_TAB_KEY = 'octo.passTab';
+const PASS_TAB_OPEN_KEY = 'octo.passTabOpen';
+
+// Which tab and page this load is, as Octo counts the pages on a Pass run. A reload (`reload`)
+// keeps the tab kept in sessionStorage, so it takes its old seat back; any other load (a new
+// visit, Back or Forward, a copied tab) takes a tab of its own, since another tab may carry the
+// same stored name. The page is new on every load, so a stop sent by the page before never gives
+// up the seat of the page after it. While a page of the tab is open its mark is set, and leaving
+// clears it: a reload that finds the mark set was copied from an open tab (Duplicate tab copies
+// sessionStorage) and takes a tab of its own too.
+function passViewer(store, makeId, reload = false) {
+  const page = makeId();
+  let tab = null;
+  try {
+    const kept = store.getItem(PASS_TAB_KEY);
+    tab = reload && kept && store.getItem(PASS_TAB_OPEN_KEY) !== kept ? kept : makeId();
+    store.setItem(PASS_TAB_KEY, tab);
+    store.setItem(PASS_TAB_OPEN_KEY, tab);
+  } catch {
+    tab = tab || page;
+  }
+  return { tab, page };
+}
+
+// The tab's mark while one of its pages is open: cleared as the page leaves, set again when the
+// browser brings the same page back.
+function passViewerShown(store, viewer, shown) {
+  try {
+    if (shown) store.setItem(PASS_TAB_OPEN_KEY, viewer.tab);
+    else store.removeItem(PASS_TAB_OPEN_KEY);
+  } catch { /* a blocked store marks nothing */ }
+}
+
+// What the page does as it leaves and comes back. Leaving: its tab's open mark goes (so a reload
+// finds the same tab), and an open panel, or a start that still owes its stop, closes with the
+// stop sent by the leaving sender. Brought back from the browser's page cache: its seat went as it
+// left and a copy of this tab may hold the old name, so it takes a tab of its own and marks it
+// open.
+function passLifecycle(target, { store, viewer, makeId, isOpen, owesStop, close }) {
+  target.addEventListener('pagehide', () => {
+    passViewerShown(store, viewer, false);
+    if (isOpen() || owesStop()) close();
+  });
+  target.addEventListener('pageshow', event => {
+    if (!event.persisted) return;
+    viewer.tab = makeId();
+    try { store.setItem(PASS_TAB_KEY, viewer.tab); } catch { /* a blocked store keeps nothing */ }
+    passViewerShown(store, viewer, true);
+  });
+}
+
+// The Pass panel's starts and stops, in order. A start waits for the stop sent before it, so a
+// Pass right after a Close opens a new check instead of joining the one being stopped, and a
+// Close while it waits ends it before it is sent. Each stop names the run its page was on (null
+// while the start had not answered, or when its answer never came) and the page itself.
+// `send(call, body)` posts to .../assist/<call> and answers the parsed reply; a stop may go by
+// another sender (the page's leaving one).
+function passCalls(send, viewer) {
+  let run = null;
+  let turn = 0;
+  let stopping = null;
+  let owed = false;
+  return {
+    async start() {
+      // Owed from the moment it is asked, so a Close while it waits stops it.
+      owed = true;
+      const entered = turn;
+      const before = stopping;
+      stopping = null;
+      if (before) await before;
+      if (turn !== entered) return { started: false, stopped: true };
+      const asked = ++turn;
+      let answer;
+      try {
+        answer = await send('start', { tab: viewer.tab, page: viewer.page });
+      } catch (error) {
+        if (asked === turn) run = null;
+        throw error;
+      }
+      if (asked === turn) run = typeof answer?.run === 'string' ? answer.run : null;
+      return answer;
+    },
+    // Whether a start went out since the last stop: Octo may hold its seat even when the
+    // start's answer never came.
+    owesStop: () => owed,
+    stop(by = send) {
+      turn += 1;
+      owed = false;
+      const body = { run, tab: viewer.tab, page: viewer.page };
+      run = null;
+      // Sent before this returns, so a page that is leaving still gets it out.
+      let sent;
+      try { sent = Promise.resolve(by('stop', body)); } catch (error) { sent = Promise.reject(error); }
+      stopping = sent.then(() => {}, () => {});
+      return stopping;
+    },
+    run: () => run,
+  };
+}
+
+let mornyeNowLoad = null;
+let mornyeNowView = null;
+
+// The Notifications switch for Mornye's check, shown only while Mornye is switched on.
+function syncMornyeNotifyRow() {
+  applyMornyeNotifyRow(document.getElementById('f-notify-mornye-check')?.closest('.set-row'), currentSettings);
+}
+
+// The Mornye now card: asked when the page opens, after a Mornye setting is saved, after a pass,
+// and from its refresh button. With Mornye switched off in the saved settings it is one quiet line.
+function loadMornyeNow() {
+  if (!document.getElementById('mornye-card')) return Promise.resolve();
+  if (currentSettings && !currentSettings.Spotiflac?.Enabled) {
+    drawMornyeNow(mornyeCard({ on: false }));
+    return Promise.resolve();
+  }
+  if (mornyeNowLoad) return mornyeNowLoad;
+  const refresh = document.getElementById('mornye-refresh');
+  refresh?.classList.add('busy');
+  mornyeNowLoad = (async () => {
+    try {
+      const r = await api('/api/admin/spotiflac/status', { cache: 'no-store' });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+      drawMornyeNow(mornyeCard(body));
+    } catch (error) {
+      drawMornyeNow({ tone: 'bad', title: "Octo could not read Mornye's state.", lines: [{ state: 'fail', text: mornyeSentence(error.message || 'No answer') }], canPass: false, webUrl: null });
+    } finally {
+      refresh?.classList.remove('busy');
+      mornyeNowLoad = null;
+    }
+  })();
+  return mornyeNowLoad;
+}
+
+function drawMornyeNow(view) {
+  mornyeNowView = view;
+  const card = document.getElementById('mornye-card');
+  const dot = document.getElementById('mornye-dot');
+  const title = document.getElementById('mornye-title');
+  const findings = document.getElementById('mornye-findings');
+  const actions = document.getElementById('mornye-actions');
+  const open = document.getElementById('mornye-open');
+  const passButton = document.getElementById('mornye-pass-open');
+  const refresh = document.getElementById('mornye-refresh');
+  if (!card || !title) return;
+  card.classList.toggle('off', view.tone === 'off');
+  if (dot) dot.className = `status-dot ${view.tone}`;
+  title.textContent = view.title;
+  if (findings) {
+    findings.innerHTML = mornyeLinesHtml(view.lines);
+    findings.hidden = view.lines.length === 0;
+  }
+  const url = safeHttpUrl(view.webUrl);
+  if (open) {
+    open.hidden = !url;
+    if (url) open.href = url;
+  }
+  if (passButton) passButton.hidden = !view.canPass || passState.open;
+  if (actions) actions.hidden = !url && !view.canPass;
+  if (refresh) refresh.hidden = view.tone === 'off';
+}
+
+document.getElementById('mornye-refresh')?.addEventListener('click', () => loadMornyeNow());
+
+// ── The Pass panel ──
+// Opens Mornye's check through POST .../assist/start, then asks .../assist each second. While the
+// check is live it draws Mornye's check browser from .../assist/frame about five times a second
+// and sends the person's own pointer, and only that, to .../assist/input.
+const passState = {
+  open: false,
+  run: 0,             // which opening of the panel the timers and loops belong to
+  view: null,
+  browser: null,
+  seq: 0,
+  frameWidth: 0,
+  frameHeight: 0,
+  zoom: 1,
+  pointer: null,      // the pointer held down on the picture, if any
+  frameUrl: null,
+  pollTimer: null,
+  queue: null,
+};
+
+const passEl = id => document.getElementById(id);
+
+let passStore = null;
+try { passStore = window.sessionStorage; } catch { /* a blocked store: each load is its own tab */ }
+const passId = () => Array.from(crypto.getRandomValues(new Uint8Array(12)), b => b.toString(16).padStart(2, '0')).join('');
+// How this page was loaded, from the browser's own navigation entry.
+const passReloaded = (() => {
+  try {
+    const entry = performance.getEntriesByType?.('navigation')?.[0];
+    return entry ? entry.type === 'reload' : performance.navigation?.type === 1;
+  } catch {
+    return false;
+  }
+})();
+const passPage = passViewer(passStore, passId, passReloaded);
+
+async function passSend(call, body) {
+  const r = await api(`/api/admin/spotiflac/assist/${call}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const answer = await r.json().catch(() => ({}));
+  if (!r.ok && !answer.state) return { started: false, why: answer.error || `Octo answered HTTP ${r.status}.` };
+  return answer;
+}
+
+// A stop sent as the page leaves: the browser still delivers it once the page has gone.
+const passLeaveSend = (call, body) => fetch(`/api/admin/spotiflac/assist/${call}`, {
+  method: 'POST',
+  keepalive: true,
+  credentials: 'same-origin',
+  headers: { 'Content-Type': 'application/json', 'X-Octo-Admin': '1' },
+  body: JSON.stringify(body),
+});
+
+const passLine = passCalls(passSend, passPage);
+
+passLifecycle(window, {
+  store: passStore,
+  viewer: passPage,
+  makeId: passId,
+  isOpen: () => passState.open,
+  owesStop: () => passLine.owesStop(),
+  close: () => closePass(passLeaveSend),
+});
+
+function passQueue() {
+  if (passState.queue) return passState.queue;
+  passState.queue = passInputQueue(async event => {
+    const r = await api('/api/admin/spotiflac/assist/input', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(event),
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.error || `HTTP ${r.status}`);
+    }
+    if (event.type !== 'mouseMoved') passNote('');
+  }, {
+    failed: (event, error) => {
+      if (event.type !== 'mouseMoved') passNote(`Octo could not pass that on to Mornye's browser: ${mornyeSentence(error.message)}`);
+    },
+  });
+  return passState.queue;
+}
+
+function passNote(message) {
+  const note = passEl('mornye-pass-note');
+  if (!note) return;
+  note.textContent = message;
+  note.hidden = !message;
+}
+
+function openPass() {
+  const panel = passEl('mornye-pass');
+  if (!panel) return;
+  passState.open = true;
+  panel.hidden = false;
+  passEl('mornye-pass-open').hidden = true;
+  setPassZoom(passZoomDefault(window.innerWidth), false);
+  const heading = passEl('mornye-pass-title');
+  heading?.focus({ preventScroll: true });
+  panel.scrollIntoView({ block: 'nearest', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  startPass();
+}
+
+// `by` sends the stop another way (the leaving page's).
+function closePass(by = undefined) {
+  // The run this page started or joined is left on the server too (stopped once no other page
+  // is on it, its song's job cancelled), whatever the panel shows; a Pass right after waits for
+  // that first.
+  if (passLine.owesStop()) passLine.stop(by);
+  passState.open = false;
+  passState.run += 1;
+  clearTimeout(passState.pollTimer);
+  passState.queue?.clear();
+  passState.pointer = null;
+  passEl('mornye-pass').hidden = true;
+  showPassFrame(null);
+  passState.browser = null;
+  const button = passEl('mornye-pass-open');
+  if (button) {
+    button.hidden = !mornyeNowView?.canPass;
+    if (!button.hidden) button.focus();
+  }
+}
+
+async function startPass() {
+  const run = ++passState.run;
+  clearTimeout(passState.pollTimer);
+  passNote('');
+  drawPass(passView({ state: 'opening' }));
+  let answer = null;
+  try {
+    // A Close just before has left the old run first, so this one is new.
+    answer = await passLine.start();
+  } catch (error) {
+    answer = { started: false, why: `Octo did not answer: ${error.message}` };
+  }
+  if (run !== passState.run) return;
+  // A start that did not open a check shows why, unless a check this one joined is already open.
+  const joined = answer.state === 'opening' || answer.state === 'live';
+  if (answer.started === false && !joined) {
+    drawPass(passView({ ...answer, state: 'unavailable', why: answer.why || answer.error }));
+    return;
+  }
+  if (answer.state) drawPass(passView(answer), answer);
+  if (!answer.state || passState.view?.polls) passState.pollTimer = setTimeout(() => pollPass(run), 1000);
+}
+
+async function pollPass(run) {
+  if (run !== passState.run || !passState.open) return;
+  let assist = null;
+  try {
+    const r = await api('/api/admin/spotiflac/assist', { cache: 'no-store' });
+    if (r.ok) assist = await r.json();
+  } catch { /* asked again below */ }
+  if (run !== passState.run || !passState.open) return;
+  if (assist) drawPass(passView(assist), assist);
+  if (!assist || passState.view?.polls) passState.pollTimer = setTimeout(() => pollPass(run), 1000);
+}
+
+function drawPass(view, assist = null) {
+  const before = passState.view?.state;
+  passState.view = view;
+  const line = passEl('mornye-pass-line');
+  if (line) {
+    const glyph = view.busy ? 'i-circle-notch' : view.tone === 'ok' ? 'i-check-circle-fill'
+      : view.tone === 'warn' ? 'i-warning-circle-fill' : 'i-info-fill';
+    line.className = `pass-line ${view.busy ? 'busy' : view.tone}`;
+    line.innerHTML = `${icon(glyph)}<span>${esc(view.text)}</span>`;
+  }
+  const notes = passEl('mornye-pass-notes');
+  if (notes) {
+    notes.innerHTML = mornyeLinesHtml(view.notes.map(text => ({ state: 'warn', text })));
+    notes.hidden = view.notes.length === 0;
+  }
+  const retry = passEl('mornye-pass-retry');
+  if (retry) {
+    retry.hidden = !view.retry;
+    retry.querySelector('span').textContent = view.retry || '';
+  }
+  passEl('mornye-pass-actions').hidden = !view.retry;
+  passEl('mornye-pass-live').hidden = !view.live;
+
+  const browser = view.live ? assist?.browser ?? null : null;
+  if (browser?.id && String(browser.id) !== passState.browser) {
+    passState.browser = String(browser.id);
+    passState.seq = 0;
+    showPassFrame(null);
+    setPassFrameSize(Number(browser.width) || 0, Number(browser.height) || 0);
+    passFrames(passState.run, passState.browser);
+  } else if (!view.live && passState.browser) {
+    passState.browser = null;
+    showPassFrame(null);
+  }
+  if (view.state === 'passed' && before !== 'passed') {
+    loadMornyeNow();
+    refreshStatus();
+  }
+}
+
+function setPassFrameSize(width, height) {
+  if (!(width > 0 && height > 0)) return;
+  passState.frameWidth = width;
+  passState.frameHeight = height;
+  passEl('mornye-pass-box')?.style.setProperty('aspect-ratio', `${width} / ${height}`);
+}
+
+function showPassFrame(blob) {
+  const img = passEl('mornye-pass-frame');
+  const wait = passEl('mornye-pass-wait');
+  if (!img) return;
+  if (!blob) {
+    img.hidden = true;
+    img.removeAttribute('src');
+    if (passState.frameUrl) URL.revokeObjectURL(passState.frameUrl);
+    passState.frameUrl = null;
+    if (wait) wait.hidden = false;
+    return;
+  }
+  const old = passState.frameUrl;
+  const url = URL.createObjectURL(blob);
+  passState.frameUrl = url;
+  img.onload = img.onerror = () => { if (old) URL.revokeObjectURL(old); };
+  img.src = url;
+  img.hidden = false;
+  if (wait) wait.hidden = true;
+}
+
+// Frames, while the panel is open on this browser, the page is on screen and the check is live.
+async function passFrames(run, browser) {
+  const current = () => run === passState.run && passState.open && passState.browser === browser && passState.view?.live;
+  while (current()) {
+    const onScreen = !document.hidden && document.querySelector('section[data-pane="spotiflac"].active');
+    if (onScreen) {
+      try {
+        const r = await api(`/api/admin/spotiflac/assist/frame?browser=${encodeURIComponent(browser)}&after=${passState.seq}`, { cache: 'no-store' });
+        if (r.status === 200 && current()) {
+          const seq = Number(r.headers.get('X-Frame-Seq'));
+          const blob = await r.blob();
+          if (current()) {
+            if (Number.isFinite(seq)) passState.seq = seq;
+            setPassFrameSize(Number(r.headers.get('X-Frame-Width')), Number(r.headers.get('X-Frame-Height')));
+            showPassFrame(blob);
+          }
+        }
+      } catch { /* the state, asked each second, says what happened */ }
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+}
+
+// A new zoom keeps the spot of the frame at the view's top left corner where it was. Mornye's
+// check sits at the top left of its page, so zooming in from the whole frame keeps it in view.
+function setPassZoom(zoom, keepView = true) {
+  const box = passEl('mornye-pass-box');
+  if (!box) return;
+  const scale = zoom / (passState.zoom || 1);
+  const [left, top] = keepView ? [box.scrollLeft * scale, box.scrollTop * scale] : [0, 0];
+  passState.zoom = zoom;
+  box.dataset.zoom = String(zoom);
+  box.style.setProperty('--pass-zoom', String(zoom));
+  document.querySelectorAll('#mornye-pass-zoom button').forEach(button => {
+    button.setAttribute('aria-pressed', String(Number(button.dataset.zoom) === zoom));
+  });
+  box.scrollLeft = left;
+  box.scrollTop = top;
+}
+
+function relayPointer(type, event) {
+  const img = passEl('mornye-pass-frame');
+  if (!img || img.hidden || !passState.browser || !passState.frameWidth) return;
+  const point = passPoint(event.clientX, event.clientY, img.getBoundingClientRect(), passState.frameWidth, passState.frameHeight);
+  passQueue().push({ browser: passState.browser, type, x: point.x, y: point.y });
+}
+
+(() => {
+  const img = passEl('mornye-pass-frame');
+  if (!img) return;
+  img.addEventListener('pointerdown', event => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    if (passState.pointer !== null) return;
+    event.preventDefault();
+    passState.pointer = event.pointerId;
+    img.setPointerCapture?.(event.pointerId);
+    relayPointer('mousePressed', event);
+  });
+  img.addEventListener('pointermove', event => {
+    // A mouse moving over the picture is passed on too; a finger only while it is down.
+    if (passState.pointer === null ? event.pointerType !== 'mouse' : event.pointerId !== passState.pointer) return;
+    relayPointer('mouseMoved', event);
+  });
+  const lift = event => {
+    if (event.pointerId !== passState.pointer) return;
+    passState.pointer = null;
+    relayPointer('mouseReleased', event);
+  };
+  img.addEventListener('pointerup', lift);
+  img.addEventListener('pointercancel', lift);
+  img.addEventListener('contextmenu', event => event.preventDefault());
+  img.addEventListener('dragstart', event => event.preventDefault());
+})();
+
+passEl('mornye-pass-open')?.addEventListener('click', openPass);
+passEl('mornye-pass-close')?.addEventListener('click', () => closePass());
+passEl('mornye-pass-retry')?.addEventListener('click', startPass);
+passEl('mornye-pass-zoom')?.addEventListener('click', event => {
+  const button = event.target.closest('button[data-zoom]');
+  if (button) setPassZoom(Number(button.dataset.zoom));
+});
 
 function isFieldDirty(el) {
   if (!currentSettings || !el.name?.includes('.')) return false;
@@ -3669,13 +4808,20 @@ async function loadRadioStatus() {
     const resetButton = document.getElementById('radio-reset');
     if (resetButton) resetButton.disabled = users.length === 0;
     const learning = data.learning;
+    // Stations the last refresh kept as they were get a line of their own, never "failed".
+    const carried = learning?.carriedNote || '';
+    const failure = learning?.lastRefreshError && learning.lastRefreshError !== carried ? learning.lastRefreshError : '';
     const stateMessage = !data.enabled ? 'Radio is disabled. Existing history and snapshots are preserved.'
       : !data.hasApiKey ? 'Last.fm key missing. Starter/local fallback remains available; recommendation refresh is degraded.'
       : !learning ? 'Waiting for the first authenticated completed scrobble.'
       : learning.needed > 0 ? `${learning.plays} completed plays learned · ${learning.needed} more before Your Radio.`
       : learning.refreshing ? 'Refreshing now. The last good snapshots remain playable.'
-      : learning.lastRefreshError ? `Last refresh failed: ${learning.lastRefreshError}` : `${learning.plays} completed plays learned.`;
-    output.innerHTML = `<p class="radio-state-copy">${escapeHtml(stateMessage)}</p>` + ((data.stations || []).length
+      : failure ? `Last refresh failed: ${failure}` : `${learning.plays} completed plays learned.`;
+    // A no-break space keeps the number and its unit on one line.
+    const carriedLine = carried
+      ? `<p class="radio-carried-note">${escapeHtml(`${carried}. Octo tries again every ${learning.carriedRetryMinutes} minutes.`)}</p>`
+      : '';
+    output.innerHTML = `<p class="radio-state-copy">${escapeHtml(stateMessage)}</p>` + carriedLine + ((data.stations || []).length
       ? `<div class="radio-station-grid">${data.stations.map(station => `<article class="radio-station-item"><div><strong>${escapeHtml(station.name)}</strong><span>${escapeHtml(station.kind)} · ${station.trackCount} tracks</span></div><p>${(station.preview || []).map(track => `${escapeHtml(track.title)} by ${escapeHtml(track.artist)}`).join(' · ') || 'Snapshot has no preview yet.'}</p></article>`).join('')}</div>`
       : '<div class="radio-empty">No ready snapshots yet. Stations are offered automatically as listening signals arrive.</div>');
   } catch (error) { output.textContent = `Radio status unavailable: ${error.message}`; }
@@ -4425,7 +5571,8 @@ async function loadAcquisitions() {
   let rows = [];
   try {
     const r = await api('/api/admin/acquisitions', { cache: 'no-store' });
-    if (r.ok) rows = ((await r.json()).acquisitions || []).filter(a => a.state !== 'done');
+    // A done row whose kept copy still waits for Lidarr is still waiting, so it stays.
+    if (r.ok) rows = ((await r.json()).acquisitions || []).filter(a => a.state !== 'done' || a.waitsAside);
   } catch { /* the log below still loads */ }
 
   const moving = new Set(rows.filter(a => a.state !== 'failed').map(a => a.id));
@@ -4438,11 +5585,17 @@ async function loadAcquisitions() {
   list.innerHTML = rows.map(a => {
     const pct = typeof a.progress === 'number' ? Math.round(a.progress * 100) : null;
     const failed = a.state === 'failed';
-    const label = a.state === 'downloading' && pct !== null
-      ? `Downloading ${pct}%`
-      : a.state === 'queued' && a.ahead > 0
-        ? `Queued, ${a.ahead} ahead`
-        : (ACQ_LABELS[a.state] || a.state);
+    // A row that offers its holder menu has stopped and waits for a person, whatever its state.
+    const held = !failed && acqOffersKeep(a);
+    const label = held
+      ? 'Waiting'
+      : a.waitsAside
+        ? 'Kept'
+        : a.state === 'downloading' && pct !== null
+          ? `Downloading ${pct}%`
+          : a.state === 'queued' && a.ahead > 0
+            ? `Queued, ${a.ahead} ahead`
+            : (ACQ_LABELS[a.state] || a.state);
     const askers = Array.isArray(a.requestedBy) ? a.requestedBy.filter(Boolean) : [];
     const size = fmtSize(a.bytesTotal);
     const sub = [
@@ -4457,7 +5610,7 @@ async function loadAcquisitions() {
       : pct !== null && a.state === 'downloading'
         ? `<div class="acq-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><span style="width:${pct}%"></span></div>`
         : a.note
-          ? `<div class="dl-sub">${escapeHtml(a.note)}</div>`
+          ? `<div class="dl-sub acq-note">${escapeHtml(a.note)}</div>`
           : '';
     // No cover yet for a song still on its way: its state's glyph on a tile instead.
     const glyph = failed ? 'i-warning' : a.state === 'queued' ? 'i-clock' : 'i-tray-arrow-down';
@@ -4466,7 +5619,7 @@ async function loadAcquisitions() {
       <div class="dl-main">
         <div class="acq-head">
           <div class="dl-title">${escapeHtml(a.title || '?')}</div>
-          <span class="dl-badge ${failed ? 'failed' : 'state'}">${escapeHtml(label)}</span>
+          <span class="dl-badge ${failed ? 'failed' : held ? 'waiting' : 'state'}">${escapeHtml(label)}</span>
         </div>
         <div class="dl-sub">${sub}</div>
         ${detail}
@@ -4482,6 +5635,36 @@ async function loadAcquisitions() {
   if (landed) loadFetched({ withAcquisitions: false });
 }
 
+// One Fetched songs row: the file, where it came from, how it was tagged and its saved log. Also
+// what a Library health lookup lists.
+function fetchedRow(d) {
+  const fmt = (d.format || '?').toUpperCase();
+  const badgeClass = fmt === 'FLAC' ? 'flac' : 'mp3';
+  // Octo serves the cover (from the song's file, else the address saved with it); the page never
+  // loads one from Deezer itself.
+  const art = findArt(d.cover);
+  const size = fmtSize(d.sizeBytes);
+  // Absent on entries written before attribution existed, and whenever the setting
+  // is off, so the row has to read the same with and without it.
+  const askers = Array.isArray(d.requestedBy) ? d.requestedBy.filter(Boolean) : [];
+  const who = askers.length
+    ? `<span class="dl-asker">${escapeHtml(askers.join(', '))}</span>`
+    : '';
+  const by = [d.artist, d.album].filter(Boolean).map(escapeHtml).join(' <span class="dl-dash">·</span> ');
+  return `<div class="dl-item">
+    ${art}
+    <div class="dl-main">
+      <div class="dl-title">${escapeHtml(d.title)}</div>
+      <div class="dl-by">${by}</div>
+      <div class="dl-path" title="${escapeHtml(d.path)}"><bdi>${escapeHtml(d.path)}</bdi></div>
+    </div>
+    <div class="dl-side">
+      <div class="dl-tags"><span class="dl-badge ${badgeClass}">${escapeHtml(fmt)}</span><span class="dl-source">${escapeHtml(d.source)}</span>${fetchedFindButton(d)}</div>
+      <div class="dl-sub">${escapeHtml(relTime(d.downloadedAt))}${size ? ' · ' + size : ''}${who ? ' · ' + who : ''}</div>
+    </div>
+  </div>${d.tagging ? `<details class="dl-tagging"><summary>How it was tagged</summary>${renderTagReport(d.tagging)}</details>` : ''}${fetchedLog(d)}`;
+}
+
 async function loadFetched({ withAcquisitions = true } = {}) {
   if (withAcquisitions) loadAcquisitions();
   const list = document.getElementById('fetched-list');
@@ -4495,33 +5678,7 @@ async function loadFetched({ withAcquisitions = true } = {}) {
       list.innerHTML = stateBlock('empty', 'Nothing fetched yet. Heart a song Octo found for you in your music app, and it shows up here once it is in your library.');
       return;
     }
-    list.innerHTML = items.map(d => {
-      const fmt = (d.format || '?').toUpperCase();
-      const badgeClass = fmt === 'FLAC' ? 'flac' : 'mp3';
-      const art = d.coverArtUrl
-        ? `<img class="dl-art" src="${escapeHtml(d.coverArtUrl)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'dl-art dl-art-ph'}))">`
-        : `<div class="dl-art dl-art-ph"></div>`;
-      const size = fmtSize(d.sizeBytes);
-      // Absent on entries written before attribution existed, and whenever the setting
-      // is off, so the row has to read the same with and without it.
-      const askers = Array.isArray(d.requestedBy) ? d.requestedBy.filter(Boolean) : [];
-      const who = askers.length
-        ? `<span class="dl-asker">${escapeHtml(askers.join(', '))}</span>`
-        : '';
-      const by = [d.artist, d.album].filter(Boolean).map(escapeHtml).join(' <span class="dl-dash">·</span> ');
-      return `<div class="dl-item">
-        ${art}
-        <div class="dl-main">
-          <div class="dl-title">${escapeHtml(d.title)}</div>
-          <div class="dl-by">${by}</div>
-          <div class="dl-path" title="${escapeHtml(d.path)}"><bdi>${escapeHtml(d.path)}</bdi></div>
-        </div>
-        <div class="dl-side">
-          <div class="dl-tags"><span class="dl-badge ${badgeClass}">${escapeHtml(fmt)}</span><span class="dl-source">${escapeHtml(d.source)}</span>${fetchedFindButton(d)}</div>
-          <div class="dl-sub">${escapeHtml(relTime(d.downloadedAt))}${size ? ' · ' + size : ''}${who ? ' · ' + who : ''}</div>
-        </div>
-      </div>${d.tagging ? `<details class="dl-tagging"><summary>How it was tagged</summary>${renderTagReport(d.tagging)}</details>` : ''}${fetchedLog(d)}`;
-    }).join('');
+    list.innerHTML = items.map(fetchedRow).join('');
   } catch (e) {
     list.innerHTML = stateBlock('error', `Couldn't load the log: ${e.message || 'error'}`);
   }
@@ -4546,6 +5703,8 @@ function ambientStoreSet(key, value) {
 }
 const ambientHex = v => typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v);
 const ambientKey = s => `${s.downloadedAt}|${s.artist}|${s.title}`;
+// A clear pixel: the Latest fetched tile of a song with no picture shows only its own background.
+const NO_ART = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 function applyAmbient(colors, accent) {
   const style = document.documentElement.style;
@@ -4593,15 +5752,12 @@ function renderLatestFetched(lights = false) {
   card.hidden = !song;
   if (!song) return;
 
+  // A song with no picture keeps the tile, filled with the page's own light, so the card's text
+  // stays where it is from song to song.
   const art = document.getElementById('latest-art');
-  if (song.coverArtUrl) {
-    art.hidden = false;
-    art.src = song.coverArtUrl;
-    art.onerror = () => { art.hidden = true; };
-  } else {
-    art.hidden = true;
-    art.removeAttribute('src');
-  }
+  art.hidden = false;
+  art.onerror = () => { art.onerror = null; art.src = NO_ART; };
+  art.src = song.cover ? `${song.cover}&size=504` : NO_ART;
   document.getElementById('latest-kicker').textContent = song === ambientSongs[0] ? 'Latest fetched' : 'Lighting the page';
   document.getElementById('latest-title').textContent = song.title;
   document.getElementById('latest-sub').textContent = [song.artist, song.album].filter(Boolean).join(' · ');
@@ -4617,8 +5773,8 @@ function renderLatestFetched(lights = false) {
   covers.innerHTML = ambientSongs.map((s, i) => {
     const on = s === song;
     const label = `Light the page with ${s.title} by ${s.artist}${s.colors ? '' : ' (no color in this cover)'}`;
-    const img = s.coverArtUrl
-      ? `<img src="${escapeHtml(s.coverArtUrl)}" alt="" loading="lazy" onerror="this.remove()">`
+    const img = s.cover
+      ? `<img src="${escapeHtml(s.cover)}" alt="" loading="lazy" onerror="this.remove()">`
       : '';
     return `<button type="button" class="now-cover" data-ambient="${i}" aria-pressed="${on}" aria-label="${escapeHtml(label)}" title="${escapeHtml(s.artist + ' · ' + s.title)}">${img}</button>`;
   }).join('');
@@ -4698,7 +5854,7 @@ function showListening(on) {
         loadAmbient();
       }
     },
-    cover: item => (item.songId ? `/api/admin/find/cover?id=${encodeURIComponent(item.songId)}` : ''),
+    cover: (item, size) => (item.songId ? `/api/admin/find/cover?id=${encodeURIComponent(item.songId)}&size=${size || ''}` : ''),
     fetch: async (days, user) => {
       const query = `range=${days}${user ? `&user=${encodeURIComponent(user)}` : ''}`;
       const r = await api(`/api/admin/listening?${query}`, { cache: 'no-store' });
@@ -4915,13 +6071,17 @@ async function dlogLoad(cacheKey, key, at, holder) {
   });
 }
 
-// In progress: Log and Find songs under each card, and the log across the panel when open.
+// In progress: Log and Find songs under each card (an album's row is no one song, so it has no
+// Find songs), a held one's Keep anyway, and the log across the panel when open.
 function acqActions(a) {
   if (!a.key) return '';
   const open = dlogIsOpen(a.key);
+  const album = a.kind === 'album' || a.heldTracks != null;
+  const find = album ? '' : `
+    <button type="button" class="btn btn-ghost btn-sm" data-find-id="${escapeHtml(a.key)}" data-find-title="${escapeHtml(a.title || '')}" data-find-artist="${escapeHtml(a.artist || '')}" data-focus-id="find:${escapeHtml(a.key)}">${icon('i-magnifying-glass')}<span>Find songs</span></button>`;
   return `<div class="acq-actions">
-    <button type="button" class="btn btn-ghost btn-sm" data-dlog-toggle="${escapeHtml(a.key)}" aria-expanded="${open}" data-focus-id="log:${escapeHtml(a.key)}">${icon(open ? 'i-caret-down' : 'i-caret-right')}<span>Log${a.logLines ? ` (${a.logLines})` : ''}</span></button>
-    <button type="button" class="btn btn-ghost btn-sm" data-find-id="${escapeHtml(a.key)}" data-find-title="${escapeHtml(a.title || '')}" data-find-artist="${escapeHtml(a.artist || '')}" data-focus-id="find:${escapeHtml(a.key)}">${icon('i-magnifying-glass')}<span>Find songs</span></button>
+    <button type="button" class="btn btn-ghost btn-sm" data-dlog-toggle="${escapeHtml(a.key)}" aria-expanded="${open}" data-focus-id="log:${escapeHtml(a.key)}">${icon(open ? 'i-caret-down' : 'i-caret-right')}<span>Log${a.logLines ? ` (${a.logLines})` : ''}</span></button>${find}
+    ${acqHeldMenus(a)}
   </div>`;
 }
 function acqLog(a) {
@@ -4958,6 +6118,129 @@ document.getElementById('acq-list')?.addEventListener('click', event => {
   toggle.querySelector('use')?.setAttribute('href', `#${open ? 'i-caret-down' : 'i-caret-right'}`);
 });
 
+// ── A held download: Keep anyway ────────────────────────────────────────────
+// A held card offers Keep anyway (Keep these anyway on an album holding two or more tracks). It
+// acts for one person: its menu lists who may, read when it opens (only to a Navidrome admin's own
+// sign-in), each with the label the server gives (their name while Record who asked is on, else
+// "Listener 1" and so on) and an opaque token that names them back. A person picked runs the
+// action the apps' keepAcquisitionAnyway runs, for that token. What the menu shows is kept here,
+// so the list's redraw every few seconds leaves an open menu as it was.
+const ACQ_MENUS = {
+  keep: { people: 'keepers', path: '/api/admin/acquisitions/keep', caption: 'Whose copy to keep', none: 'Nothing is waiting to be kept' },
+};
+const acqMenu = { open: new Set(), people: new Map(), error: new Map(), busy: new Set() };
+const acqMenuId = (kind, key) => `${kind}|${key}`;
+
+function acqKeepLabel(a) {
+  return a.heldTracks >= 2 ? 'Keep these anyway' : 'Keep anyway';
+}
+
+// Whether a row draws its holder menu (Keep anyway): someone waiting in its holds may keep it. The
+// row's Waiting badge reads the same, so the two never disagree.
+function acqOffersKeep(a) {
+  return Boolean(a.key && a.keepAnyway);
+}
+function acqHeldMenus(a) {
+  return acqOffersKeep(a) ? acqMenuMarkup(a.key, 'keep', acqKeepLabel(a)) : '';
+}
+
+function acqMenuMarkup(key, kind, label) {
+  const id = acqMenuId(kind, key);
+  const open = acqMenu.open.has(id);
+  return `<details class="acq-menu" data-acq-menu="${kind}" data-acq-key="${escapeHtml(key)}"${open ? ' open' : ''}>
+    <summary class="btn btn-ghost btn-sm" data-focus-id="${escapeHtml(id)}"><span>${escapeHtml(label)}</span>${icon('i-caret-down')}</summary>
+    <div class="acq-menu-body" data-acq-menu-body="${kind}" data-acq-key="${escapeHtml(key)}">${open ? acqMenuBody(key, kind) : ''}</div>
+  </details>`;
+}
+
+function acqMenuBody(key, kind) {
+  const menu = ACQ_MENUS[kind];
+  const id = acqMenuId(kind, key);
+  const people = acqMenu.people.get(key);
+  if (!people) return stateBlock('loading', 'Reading who is waiting…');
+  if (people.error) return stateBlock('error', people.error);
+  const holders = (Array.isArray(people[menu.people]) ? people[menu.people] : [])
+    .filter(holder => holder && holder.token);
+  const error = acqMenu.error.get(id);
+  const busy = acqMenu.busy.has(id);
+  const list = holders.length
+    ? `<div class="acq-menu-caption">${escapeHtml(menu.caption)}</div>
+      <div class="acq-menu-people">${holders.map(holder => `<button type="button" class="btn btn-ghost btn-sm" data-acq-act="${kind}" data-acq-key="${escapeHtml(key)}" data-acq-token="${escapeHtml(holder.token)}" data-focus-id="${escapeHtml(`${id}|${holder.token}`)}"${busy ? ' disabled' : ''}>${escapeHtml(holder.label || '')}</button>`).join('')}</div>`
+    : stateBlock('empty', menu.none);
+  return `${list}${error ? `<div class="acq-error" role="alert">${escapeHtml(error)}</div>` : ''}`;
+}
+
+// Every open body of the row's menus drawn again from what is kept.
+function acqMenuFill(key) {
+  document.querySelectorAll('[data-acq-menu-body]').forEach(body => {
+    const kind = body.dataset.acqMenuBody;
+    if (body.dataset.acqKey === key && acqMenu.open.has(acqMenuId(kind, key))) body.innerHTML = acqMenuBody(key, kind);
+  });
+}
+
+// Who may keep the row, read fresh.
+async function acqMenuLoad(key, holder) {
+  acqMenu.people.delete(key);
+  acqMenuFill(key);
+  let people;
+  try {
+    const response = await parityFetch(`/api/admin/acquisitions/holders?key=${encodeURIComponent(key)}`, {}, holder);
+    people = response.ok ? await response.json() : { error: await parityError(response) };
+  } catch (error) {
+    people = { error: `Could not read who is waiting: ${error.message}` };
+  }
+  acqMenu.people.set(key, people);
+  acqMenuFill(key);
+}
+
+// A menu opened or closed by hand. A redraw of an open menu opens it again too, which reads
+// nothing new.
+function acqMenuToggled(details) {
+  const kind = details.dataset.acqMenu;
+  const key = details.dataset.acqKey;
+  const id = acqMenuId(kind, key);
+  if (!details.open) {
+    acqMenu.open.delete(id);
+    acqMenu.error.delete(id);
+    return;
+  }
+  if (acqMenu.open.has(id)) return;
+  acqMenu.open.add(id);
+  acqMenuLoad(key, details.querySelector('[data-acq-menu-body]') || details);
+}
+
+// A person picked: their copy is kept. The card is drawn again either way: a done row offers it
+// no more, and a refusal shows its words in the menu.
+async function acqMenuAct(button) {
+  const kind = button.dataset.acqAct;
+  const key = button.dataset.acqKey;
+  const token = button.dataset.acqToken;
+  const id = acqMenuId(kind, key);
+  if (!ACQ_MENUS[kind] || acqMenu.busy.has(id)) return;
+  acqMenu.busy.add(id);
+  acqMenu.error.delete(id);
+  acqMenuFill(key);
+  try {
+    const response = await parityFetch(ACQ_MENUS[kind].path, parityJson({ key, token }), button.closest('[data-acq-menu-body]') || button);
+    if (!response.ok) throw new Error(await parityError(response));
+    acqMenu.open.delete(id);
+    acqMenu.people.delete(key);
+  } catch (error) {
+    acqMenu.error.set(id, error.message);
+  } finally {
+    acqMenu.busy.delete(id);
+  }
+  await loadAcquisitions();
+}
+
+document.getElementById('acq-list')?.addEventListener('toggle', event => {
+  if (event.target.matches?.('details.acq-menu')) acqMenuToggled(event.target);
+}, true);
+document.getElementById('acq-list')?.addEventListener('click', event => {
+  const button = event.target.closest?.('[data-acq-act]');
+  if (button && !button.disabled) acqMenuAct(button);
+});
+
 // Fetched songs: the log folds under the row, read when it is first opened.
 function fetchedLog(d) {
   const cacheKey = `${d.key || ''}|${d.downloadedAt || ''}`;
@@ -4973,9 +6256,9 @@ function fetchedFindButton(d) {
   const data = d.key
     ? `data-find-id="${escapeHtml(d.key)}"`
     : `data-find-q="${escapeHtml([d.artist, title].filter(Boolean).join(' '))}"`;
-  return `<button type="button" class="btn btn-ghost btn-icon btn-sm dl-find" ${data} data-find-title="${escapeHtml(title)}" data-find-artist="${escapeHtml(d.artist || '')}" data-find-cover="${escapeHtml(d.coverArtUrl || '')}" aria-label="Find songs for ${escapeHtml(title)}" title="Find songs">${icon('i-magnifying-glass')}</button>`;
+  return `<button type="button" class="btn btn-ghost btn-icon btn-sm dl-find" ${data} data-find-title="${escapeHtml(title)}" data-find-artist="${escapeHtml(d.artist || '')}" data-find-cover="${escapeHtml(d.cover || '')}" aria-label="Find songs for ${escapeHtml(title)}" title="Find songs">${icon('i-magnifying-glass')}</button>`;
 }
-document.getElementById('fetched-list')?.addEventListener('toggle', event => {
+function fetchedLogToggle(event) {
   const details = event.target;
   if (!details.matches?.('details.dl-log')) return;
   const key = details.dataset.dlogKey;
@@ -4986,7 +6269,36 @@ document.getElementById('fetched-list')?.addEventListener('toggle', event => {
   const cached = dlog.cache.get(cacheKey);
   holder.innerHTML = dlogBody(cached);
   if (!cached || cached.error || cached.kept === 'live') dlogLoad(cacheKey, key, details.dataset.dlogAt, holder);
-}, true);
+}
+document.getElementById('fetched-list')?.addEventListener('toggle', fetchedLogToggle, true);
+document.getElementById('health-fetched-results')?.addEventListener('toggle', fetchedLogToggle, true);
+
+// Library health: look up one fetched song by name, however old, to see how it was tagged (the
+// release that won and its distance) and its download log. Searches every entry Octo kept. Only
+// the latest lookup draws its answer, so a slow earlier one never replaces it.
+let healthFetchedToken = 0;
+document.getElementById('health-fetched-form')?.addEventListener('submit', async event => {
+  event.preventDefault();
+  const out = document.getElementById('health-fetched-results');
+  const q = document.getElementById('health-fetched-q')?.value.trim() || '';
+  if (!out) return;
+  const token = ++healthFetchedToken;
+  out.hidden = false;
+  if (!q) { out.innerHTML = stateBlock('empty', 'Type a title, an artist or both.'); return; }
+  out.innerHTML = stateBlock('loading', 'Looking through the fetched songs…');
+  try {
+    const r = await api(`/api/admin/downloads?q=${encodeURIComponent(q)}`, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const items = (await r.json()).downloads || [];
+    if (token !== healthFetchedToken) return;
+    out.innerHTML = items.length
+      ? items.map(fetchedRow).join('')
+      : stateBlock('empty', 'No fetched song matches. Only songs Octo downloaded are listed, and only the newest 500 are kept.');
+  } catch (e) {
+    if (token !== healthFetchedToken) return;
+    out.innerHTML = stateBlock('error', `Couldn't search the fetched songs: ${e.message || 'error'}`);
+  }
+});
 
 // ── Find songs ─────────────────────────────────────────────────────────────
 // The apps' Find songs: a song's search run again on the admin's own download sources, every
@@ -5726,6 +7038,9 @@ function buildSegments() {
       seg.appendChild(b);
     });
     seg.dataset.built = '1';
+    // The highlight is placed in pixels, so it is placed again whenever the control's size
+    // changes: the web font arriving, or the page holding it being opened.
+    if ('ResizeObserver' in window) new ResizeObserver(() => syncSegment(seg, false)).observe(seg);
   });
 }
 function syncSegment(seg, animate) {
@@ -5755,6 +7070,8 @@ buildHints();
 labelSettingControls();
 buildSegments();
 window.addEventListener('resize', () => syncSegments(false));
+// A font can change the buttons' widths without changing the control's own width.
+document.fonts?.ready.then(() => syncSegments(false));
 
 // ────────────────────────────────────────────────────────────────
 // "Point your apps at Octo" address + copy
@@ -5910,11 +7227,21 @@ function heartSourceReachable() {
   const steps = currentSettings?.Subsonic?.HeartDownloadSources || [];
   const enabled = steps.filter(step => step.SongEnabled || step.AlbumEnabled).map(step => step.Source);
   if (!enabled.length) return { ok: false, detail: 'No heart source is switched on, so a heart downloads nothing.' };
-  const reachable = enabled.filter(source => {
-    if (source === 'Soulseek') return services.slskd?.ok && !services.slskd?.warning;
-    if (source === 'YouTube') return services.ytDlpShim?.ok;
-    if (source === 'Lidarr') return services.lidarr?.ok && services.lidarr?.configured !== false && !services.lidarr?.warning;
-    return false;
+  // A service answers when it is set up, reachable and not warning. The Soulseek step answers
+  // through slskd, or through Mornye, which takes its place when switched on.
+  const answers = probe => !!probe?.ok && probe.configured !== false && !probe.warning;
+  const reachable = enabled.flatMap(source => {
+    if (source === 'Soulseek') {
+      return [['Soulseek', services.slskd], ['Mornye', services.mornye]]
+        .filter(([, probe]) => answers(probe)).map(([name]) => name);
+    }
+    if (source === 'YouTube') return services.ytDlpShim?.ok ? ['YouTube'] : [];
+    // A warning about Lidarr's indexers is not its setup: it answers, and its card says the rest.
+    if (source === 'Lidarr') {
+      const lidarr = services.lidarr;
+      return answers(lidarr) || (answers({ ...lidarr, warning: false }) && lidarr?.indexers) ? ['Lidarr'] : [];
+    }
+    return [];
   });
   return reachable.length
     ? { ok: true, detail: `${reachable.join(', ')} answering.` }
@@ -8138,7 +9465,7 @@ function renderImportLists() {
               ${list.partial ? `<span class="lossy-detail">${esc(list.partial)}</span>` : ''}
               ${list.playlistNote ? `<span class="lossy-detail">${esc(list.playlistNote)}</span>` : ''}</span></span>
             <span><span class="lossy-sub">${esc(counts)}</span><span class="lossy-meter"><span style="width:${pct}%"></span></span></span>
-            <span class="imp-switch-cell"><span class="imp-cell-label">Stream without downloading</span><label class="switch" title="Show the saved snapshot in Octo, including previews. Does not queue downloads. Get missing songs is independent."><input type="checkbox" data-imp-stream="${esc(list.id)}" ${list.streamWithoutDownloading ? 'checked' : ''}
+            <span class="imp-switch-cell"><span class="imp-cell-label">Stream without downloading</span><label class="switch" title="Show the saved snapshot in Octo, its missing songs streamed from YouTube. Does not queue downloads. Get missing songs is independent."><input type="checkbox" data-imp-stream="${esc(list.id)}" ${list.streamWithoutDownloading ? 'checked' : ''}
               aria-label="Stream ${esc(list.name)} in Octo without downloading" /><span class="sw-track"></span><span class="sw-thumb"></span></label></span>
             <span class="imp-switch-cell"><span class="imp-cell-label">Keep as playlist</span><label class="switch" title="Keep as playlist"><input type="checkbox" data-imp-playlist="${esc(list.id)}" ${list.keepPlaylist ? 'checked' : ''}
               aria-label="Keep ${esc(list.name)} as a Navidrome playlist" /><span class="sw-track"></span><span class="sw-thumb"></span></label></span>
@@ -8210,6 +9537,20 @@ function renderImportDetail() {
     </div>`;
 }
 
+// While songs wait or are fetched and the server checks them with Octo's own AcoustID key (at the
+// pace work nobody waits on goes), the card says a free key of the person's own checks them
+// faster, with where to get one. The words are the server's.
+function renderImportKeyLine(key, t) {
+  const line = impEl('imp-acoustid-key');
+  if (!line) return;
+  const moving = (t?.queued ?? 0) > 0 || (t?.downloading ?? 0) > 0;
+  const shown = Boolean(moving && key?.text);
+  line.hidden = !shown;
+  line.innerHTML = shown
+    ? `${escapeHtml(key.text)}.${key.link ? ` <a href="${escapeHtml(key.link)}" target="_blank" rel="noopener">Get a free key</a>` : ''}`
+    : '';
+}
+
 function renderTrickle() {
   const t = imp.view.trickle;
   const words = {
@@ -8219,12 +9560,16 @@ function renderTrickle() {
     off: 'Off',
     yielding: 'Waiting for other downloads',
     waitingForSoulseek: 'Waiting for Soulseek',
+    waitingForMornye: 'Waiting for Mornye',
+    waitingForMornyeCheck: "Waiting for Mornye's check",
     waitingForMusicDatabase: 'Waiting for MusicBrainz',
   };
   impEl('imp-trickle-title').textContent = t.label || words[t.state] || t.state;
   const parts = [];
   if (t.state === 'yielding') parts.push('Someone\'s own downloads come first; it goes on once they finish.');
   if (t.state === 'waitingForSoulseek') parts.push('slskd is not logged in to Soulseek; it goes on once it is back.');
+  if (t.state === 'waitingForMornye') parts.push('Mornye is the only lossless source, and it is not answering or cannot download now (its card on the Mornye page says why); it goes on once it can.');
+  if (t.state === 'waitingForMornyeCheck') parts.push("Mornye could not pass its check and Soulseek cannot be used; it goes on when Mornye may try its check again, or once you pass it on the Mornye page.");
   if (t.state === 'waitingForMusicDatabase') parts.push('MusicBrainz is not answering; songs it has to check go on once it is back.');
   if (t.state === 'off') parts.push('Songs an hour is 0, so nothing starts. Change it above.');
   else parts.push(`Up to ${t.perHour}\u00a0${t.perHour === 1 ? 'song' : 'songs'} an hour.`);
@@ -8233,6 +9578,7 @@ function renderTrickle() {
     .filter(([count]) => count > 0).map(([count, label]) => `${count}\u00a0${label}`);
   if (tally.length) parts.push(`${tally.join(', ')}.`);
   impEl('imp-trickle-line').textContent = parts.join(' ');
+  renderImportKeyLine(imp.view.acoustIdKey, t);
 
   const pause = impEl('imp-pause');
   pause.hidden = t.state === 'idle' && t.queued === 0;
@@ -9632,7 +10978,7 @@ const ART_PAGE = 60;
 
 function artTile(album) {
   const name = `${album.album} by ${album.artist}`;
-  const art = album.poster ? `<img loading="lazy" alt="" src="${esc(album.poster)}" onerror="this.remove()">` : '';
+  const art = album.still ? `<img loading="lazy" alt="" src="${esc(album.still)}" onerror="this.remove()">` : '';
   // One badge: Hidden says the most, and a full-screen loop is worth knowing otherwise.
   const badges = album.hidden
     ? '<span class="cover-badge warn">Hidden</span>'

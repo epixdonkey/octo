@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use octo_core::common::Clock;
+use octo_core::fingerprint::heart_gate::{HeardRecord, WaitingFor};
 use octo_core::places::PlaceIndex;
 use octo_core::settings::{AppSettings, RestartTracker, SettingsFileWriter, SettingsStore};
 use octo_core::tagging::{CatalogLookup, FingerprintVerifier, ReleaseIdentifier, ReleaseLookup, TagPreview};
@@ -52,9 +53,12 @@ use crate::services::cover_art::{
 };
 use octo_media::cover::CoverArtService;
 
+use crate::services::apple::{AppleCatalog, ApplePace, PaceConfig, ServerStore};
 use crate::services::charts::{AppleMusicPages, ChartCountryStore, ChartsWarmWorker, GenreNames};
+use crate::services::common::HeartGates;
 use crate::services::common::IAcquisitionActivity;
 use crate::services::common::TopSongsService;
+use crate::services::common::album_gates::AlbumGates;
 use crate::services::cover_art::{AnimatedArt, ArtworkHints, HintedArtwork};
 use crate::services::family::LibraryWriteGate as FamilyWriteGate;
 use crate::services::family::request_service::{
@@ -66,6 +70,9 @@ use crate::services::family::{
     NavidromeAdmin, NavidromeMemberStars, PersonalLibrary, PlayerCaps, PoolParts, RequestStore, SavedStore,
     ScopeResolver, family_service::FamilyService,
 };
+use crate::services::fingerprint::catalog_clip::CatalogClip;
+use crate::services::fingerprint::download_verification_service::HeartParts;
+use crate::services::fingerprint::heard_master_check::HeardMasterCheck;
 use crate::services::fingerprint::preview_check::PreviewSource;
 use crate::services::fingerprint::{
     AcoustIdClient, AcoustIdRateLimitHandler, AcoustIdRateLimiter, DownloadVerificationService,
@@ -103,6 +110,7 @@ use crate::services::library::library_youtube_check::{
 use crate::services::library::navidrome_song_list;
 use crate::services::library::tidy::worker::ListSongs;
 use crate::services::library::tidy::{TidyJournal, TidyServices, TidyStore, TidyWorker};
+use crate::services::library::upgrade_queue::{KeptRechecks, UpgradeAsk};
 use crate::services::library::{AlbumOwnership, GeneratedPlaylistService, LibrarySnapshot};
 use crate::services::library::{ChartPlaylistService, LibraryMatchCache};
 use crate::services::library::{
@@ -125,20 +133,20 @@ use crate::services::lidarr::{
 };
 use crate::services::listen_brainz::{ListenBrainzRadioClient, ListenBrainzService};
 use crate::services::local::DownloadHistoryService;
-use crate::services::local::{ILocalLibraryService, LocalLibraryService};
+use crate::services::local::{ILocalLibraryService, LocalLibraryService, LocalSongMapping};
 use crate::services::lyrics::{
-    LyricsChoiceService, LyricsChoiceStore, LyricsLibraryStore, LyricsLibraryWorker, LyricsService,
-    LyricsSidecarWriter, LyricsUndoJournal, lyrics_http,
+    LyricsChoiceService, LyricsChoiceStore, LyricsLibraryStore, LyricsLibraryWorker, LyricsPathRemap,
+    LyricsService, LyricsSidecarWriter, LyricsUndoJournal, lyrics_http,
 };
 use crate::services::metadata::{
     DeezerExplicitCatalog, DeezerMetadataService, DeezerPublishedTempo, DeezerRateLimitHandler,
-    DeezerRateLimiter,
+    DeezerRateLimiter, DeezerReach, DeezerStandIn, DoorInfos,
 };
 use crate::services::metadata::{GenreBackfillJournal, GenreBackfillStore, GenreBackfillWorker};
 use crate::services::notifications::{DiscordSink, INotificationSink, NotificationService, NtfySink};
 use crate::services::prefetch::{
-    AppKeepReadySources, KeepReadyService, KeepReadyStore, PrefetchParts, PrefetchService, PrefetchStore,
-    PrefetchedFiles, PreviewCopies,
+    AppKeepReadySources, HeardSampleParts, HeardSamples, KeepReadyService, KeepReadyStore, PrefetchParts,
+    PrefetchService, PrefetchStore, PrefetchedFiles, PreviewCopies,
 };
 use crate::services::radio::{
     IRadioSource, LastFmRadioSource, ListenBrainzRadioSource, RadioOutcomeStore, RadioSourceSet,
@@ -154,7 +162,7 @@ use crate::services::soulseek::{
     SoulseekLink, SoulseekMetadataService, SoulseekPortCheck, SoulseekShareSwitch, SoulseekSharing,
     SoulseekStartupValidator,
 };
-use crate::services::spotiflac::SpotiflacClient;
+use crate::services::spotiflac::{CheckTimes, MornyeCheck, MornyeCheckStore, SpotiflacClient};
 use crate::services::subsonic::personal_playlist_reconciler::PersonalPlaylistReconciler;
 use crate::services::subsonic::personal_playlist_store::PersonalPlaylistStore;
 use crate::services::subsonic::{
@@ -168,6 +176,7 @@ use crate::services::validation::{
 };
 use crate::services::you_tube::{PinRecheck, StreamSizeWarmer, YouTubeMusicClient, YouTubeResolver};
 use crate::workers::WorkerSupervisor;
+use octo_core::notifications::{NotificationEvent, NotificationEventType};
 
 /// Cheap to clone; handlers and workers receive it by value.
 #[derive(Clone)]
@@ -276,6 +285,9 @@ pub struct AppInner {
     /// The "deezer" HTTP client with `DeezerRateLimitHandler` in its chain. Every Deezer
     /// caller goes through it.
     pub deezer_client: Arc<DeezerRateLimitHandler>,
+    /// Whether Deezer serves this server, and so which catalog answers its searches. None in test
+    /// builds, which wire no stand-in.
+    pub deezer_reach: Option<Arc<DeezerReach>>,
     /// `DeezerMetadataService`.
     pub deezer_metadata: Arc<DeezerMetadataService>,
     /// `MusicBrainzClient` with its own HTTP client.
@@ -296,9 +308,11 @@ pub struct AppInner {
     /// `<config>/covers` replace the generated cover of the playlist they are named after.
     /// Warmed in the background at startup by the "CoverArtService" worker.
     pub cover_art_service: Arc<CoverArtService>,
-    /// `AmbientPaletteService` ("ambient-palette" client, 6 s): the colors of the fetched songs'
-    /// covers, the dashboard's light.
+    /// `AmbientPaletteService`: the colors of the fetched songs' covers, the dashboard's light.
     pub ambient_palettes: Arc<crate::services::admin::AmbientPaletteService>,
+    /// `FetchedCovers` (its own 6 s client): every cover the dashboard draws, served from Octo,
+    /// read from the song's file first.
+    pub fetched_covers: Arc<crate::services::admin::FetchedCovers>,
     /// `DownloadHistoryService`: the fetched-songs log, `downloads-history.json` beside settings.json.
     pub download_history: Arc<DownloadHistoryService>,
     /// `DownloadConcurrency`: how many downloads transfer at once.
@@ -327,6 +341,10 @@ pub struct AppInner {
     pub prefetch: Arc<PrefetchService>,
     /// `PreviewCopies`: whole copies of outside songs' previews, `<config>/preview-copies`.
     pub preview_copies: Arc<PreviewCopies>,
+    /// `HeardSamples`: the prints of what each person heard, `<config>/heard-samples`, with
+    /// scratch files under `<config>/preview-copies/scratch`; the `fpcalc` queue and the shim's
+    /// rounds.
+    pub heard_samples: Arc<HeardSamples>,
     /// `KeepReadyService`: each listener's playlists kept ready, `keep-ready.json`; its loop is the
     /// "KeepReady" worker.
     pub keep_ready: Arc<KeepReadyService>,
@@ -345,6 +363,8 @@ pub struct AppInner {
     pub admin_role_check: Arc<AdminRoleCheck>,
     /// The signed-out `GET /api/admin/status` answer, kept ten seconds.
     pub anonymous_status: crate::controllers::admin::system::AnonymousStatusCache,
+    /// Mornye's row of the admin status, kept between answers.
+    pub mornye_row: crate::controllers::admin::system::MornyeRowKeeper,
     /// `RejectedPeerRegistry`: peer files that proved wrong, `rejected-peers.json` (flushed by
     /// a worker), with `Soulseek:RejectedPeerTtlDays` read live.
     pub rejected_peers: Arc<RejectedPeerRegistry>,
@@ -740,6 +760,7 @@ fn prefetch_service(
         concurrency: Some(stores.download_concurrency.clone()),
         names: Some(stores.external_id_registry.clone()),
         soulseek: Some(soulseek_link),
+        spotiflac: Some(acquisition.spotiflac.clone()),
         clock: Clock::system(),
     })
 }
@@ -842,6 +863,8 @@ struct DownloadDeps<'a> {
     tagging: &'a Tagging,
     lyrics: &'a Arc<LyricsSidecarWriter>,
     soulseek_client: &'a SoulseekClient,
+    /// Whether hearts and plays are judged by the heart gate.
+    heart_gate: bool,
 }
 
 /// The acquisition pipeline, over the services it routes to. Two links would close a cycle, so
@@ -869,6 +892,7 @@ struct Acquisition {
     heart_acquisition_coordinator: Arc<HeartAcquisitionCoordinator>,
     external_search: Arc<ExternalSearchService>,
     family_pool_service: Arc<FamilyPool>,
+    kept_rechecks: Arc<KeptRechecks>,
 }
 
 impl Acquisition {
@@ -913,7 +937,26 @@ impl Acquisition {
             Clock::system(),
         );
         let upgrade_queue = stores.upgrade_queue.clone();
-        let upgrade_sources = Arc::new(UpgradeSources::new(settings.clone(), Some(soulseek_link.clone())));
+        // Mornye: its check is kept in mornye-check.json and pushes once per stretch of failing.
+        let check_notifications = integrations.notifications.clone();
+        let spotiflac = Arc::new(
+            SpotiflacClient::new(settings.clone())
+                .with_slskd(soulseek_link.clone())
+                .with_check(MornyeCheck::new(
+                    stores.mornye_check.clone(),
+                    CheckTimes::default(),
+                    Some(Arc::new(move |words: String| {
+                        check_notifications.notify(NotificationEvent {
+                            detail: Some(words),
+                            ..NotificationEvent::new(NotificationEventType::MornyeCheck)
+                        });
+                    })),
+                )),
+        );
+        let upgrade_sources = Arc::new(
+            UpgradeSources::new(settings.clone(), Some(soulseek_link.clone()))
+                .with_spotiflac(spotiflac.clone()),
+        );
         let library_ownership = Arc::new(LibraryOwnership::new(
             settings.clone(),
             Some(OwnershipNavidrome {
@@ -936,10 +979,11 @@ impl Acquisition {
             settings.clone(),
             navidrome.navidrome_identity.clone(),
             lidarr_album_claims.clone(),
-            Some(clients.music_brainz.clone()),
         ));
         let lidarr_track_fetcher: Arc<dyn ILidarrTrackFetcher> = lidarr_fetcher.clone();
-        let spotiflac = Arc::new(SpotiflacClient::new(settings.clone()));
+
+        // The gates of hearted albums' chains, which every source's check point files tracks by.
+        let album_gates = Arc::new(AlbumGates::new());
 
         // The download service: the base is built over the services above, and the Soulseek
         // backend's optional ones are the link and Lidarr's two. A handler test may swap in its
@@ -975,9 +1019,11 @@ impl Acquisition {
                         last_fm: Some(integrations.last_fm.clone()),
                         picks: Some(stores.download_picks.clone()),
                         write_gate: Some(stores.library_write_gate.clone()),
+                        lidarr_pending: Some(stores.lidarr_pending.clone()),
                         family: Some(navidrome.family_pool_service.clone() as Arc<dyn FamilyPlacement>),
                         arrivals: Some(stores.download_arrivals.clone()),
                         prefetched: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
+                        album_gates: Some(album_gates.clone()),
                     },
                     SoulseekDownloadParts {
                         slskd: downloads.soulseek_client.clone(),
@@ -997,27 +1043,49 @@ impl Acquisition {
         };
         acquisition_activity.set_downloads(&download_service);
 
-        let lidarr_hearts: Arc<dyn ILidarrHeartAcquisitionService> =
-            Arc::new(LidarrHeartAcquisitionService::new(
-                lidarr_client.clone(),
-                music_metadata.clone(),
-                clients.deezer_metadata.clone(),
-                settings.clone(),
-                navidrome.navidrome_identity.clone(),
-                integrations.notifications.clone(),
-                LidarrHeartExtras {
-                    tracker: Some(acquisition_tracker.clone()),
-                    music_brainz: Some(clients.music_brainz.clone()),
-                    claims: Some(lidarr_album_claims.clone()),
-                    imports: Some(lidarr_import_handoff.clone()),
-                    ids: Some(stores.external_id_registry.clone()),
-                    downloads: Some(download_service.clone()),
-                    journal: Some(stores.library_action_journal.clone()),
-                    ownership: Some(library_ownership.clone()),
-                    upgrades: Some(upgrade_queue.clone()),
-                    pending: Some(stores.lidarr_pending.clone()),
-                },
-            ));
+        let lidarr_heart_service = LidarrHeartAcquisitionService::new(
+            lidarr_client.clone(),
+            music_metadata.clone(),
+            clients.deezer_metadata.clone(),
+            settings.clone(),
+            navidrome.navidrome_identity.clone(),
+            integrations.notifications.clone(),
+            LidarrHeartExtras {
+                tracker: Some(acquisition_tracker.clone()),
+                music_brainz: Some(clients.music_brainz.clone()),
+                claims: Some(lidarr_album_claims.clone()),
+                imports: Some(lidarr_import_handoff.clone()),
+                ids: Some(stores.external_id_registry.clone()),
+                downloads: Some(download_service.clone()),
+                journal: Some(stores.library_action_journal.clone()),
+                ownership: Some(library_ownership.clone()),
+                upgrades: Some(upgrade_queue.clone()),
+                pending: Some(stores.lidarr_pending.clone()),
+                catalog: None,
+                rounds: Some({
+                    let verification = downloads.tagging.download_verification.clone();
+                    let pause: crate::services::lidarr::PauseRounds = Arc::new(
+                        move |key: &str, gates: &[octo_core::fingerprint::heart_gate::HeartGate]| {
+                            verification.pause_rounds(key, gates)
+                        },
+                    );
+                    pause
+                }),
+                // A hearted album's import is filed track by track by its own sound.
+                album_gates: Some(album_gates.clone()),
+                gates: downloads
+                    .heart_gate
+                    .then(|| downloads.tagging.download_verification.clone() as Arc<dyn HeartGates>),
+            },
+        );
+        // A replacement's fetch is picked and followed as a heart's search is.
+        lidarr_fetcher.use_replacements(Arc::new(lidarr_heart_service.clone()));
+        // A pick a restart cut short before its search is put back, and every search a restart
+        // cut short is followed on.
+        lidarr_heart_service.resume_after_restart();
+        let lidarr_music = lidarr_heart_service.artist_music();
+        let lidarr_indexers = lidarr_heart_service.clone();
+        let lidarr_hearts: Arc<dyn ILidarrHeartAcquisitionService> = Arc::new(lidarr_heart_service);
         let heart_ownership = Arc::new(HeartOwnership::new(
             library_ownership.clone(),
             music_metadata.clone(),
@@ -1025,12 +1093,90 @@ impl Acquisition {
             Some(upgrade_queue.clone()),
             Some(upgrade_sources.clone()),
         ));
+        // The heart gate: what each person heard, the heard-master runner and the catalog's clip,
+        // over the verification service every source's check point asks.
+        let verification = downloads.tagging.download_verification.clone();
+        if downloads.heart_gate {
+            verification.use_heart(HeartParts {
+                registry: stores.external_id_registry.clone(),
+                samples: stores.heard_samples.clone(),
+                master: Arc::new(HeardMasterCheck::new(stores.heard_samples.clone())),
+                clip: Arc::new(CatalogClip::new(
+                    clients.deezer_metadata.clone(),
+                    stores.heard_samples.clone(),
+                    stores.you_tube_resolver.clone(),
+                )),
+                catalog: clients.deezer_metadata.clone(),
+                holds: stores.soulseek_holds.clone(),
+                rejected: stores.rejected_peers.clone(),
+            });
+        }
+        // A replacement's file that waits for AcoustID's bulk turn goes on once the lane gives
+        // turns again.
+        {
+            let acoust_id = clients.acoust_id.clone();
+            track_acquisition_queue.use_turns(Arc::new(move |wake| acoust_id.hold_lookup(wake)));
+        }
+        // Files kept as heard are checked again on a play or a heart of their song and after each
+        // heart a gate proves; a check that could now prove a better copy queues its upgrade.
+        let kept_rechecks = Arc::new(KeptRechecks::new(
+            navidrome.local_library.clone(),
+            clients.acoust_id.clone(),
+            settings.clone(),
+            stores.external_id_registry.clone(),
+        ));
+        {
+            let (resolver, upgrades) = (
+                navidrome.navidrome_song_path_resolver.clone(),
+                upgrade_queue.clone(),
+            );
+            kept_rechecks.use_upgrade(Arc::new(move |kept: LocalSongMapping| {
+                let (resolver, upgrades) = (resolver.clone(), upgrades.clone());
+                Box::pin(async move {
+                    let Some(navidrome_id) = resolver
+                        .find_id_by_path(&kept.artist, &kept.title, &kept.local_path)
+                        .await
+                    else {
+                        tracing::info!(
+                            "Navidrome does not show {} yet; its upgrade waits for the next check",
+                            kept.local_path
+                        );
+                        return;
+                    };
+                    let requester = kept
+                        .heart
+                        .as_ref()
+                        .and_then(|heart| heart.users.first().cloned())
+                        .unwrap_or_default();
+                    upgrades.add(
+                        vec![UpgradeAsk {
+                            title: Some(kept.title.clone()),
+                            artist: Some(kept.artist.clone()),
+                            album: Some(kept.album.clone()),
+                            ..UpgradeAsk::new(navidrome_id)
+                        }],
+                        &requester,
+                        "recheck",
+                    );
+                })
+            }));
+            let kept = kept_rechecks.clone();
+            stores
+                .external_id_registry
+                .on_heard(Arc::new(move |id: &str, _: &str, _: &HeardRecord| {
+                    let (kept, id) = (kept.clone(), id.to_string());
+                    tokio::spawn(async move {
+                        kept.song_event(SoulseekMetadataService::PROVIDER_NAME, &id).await
+                    });
+                }));
+        }
         let heart_acquisition_coordinator = HeartAcquisitionCoordinator::new(
             settings.clone(),
             track_acquisition_queue.clone(),
             download_service.clone(),
             lidarr_hearts.clone(),
             HeartCoordinatorExtras {
+                kept: Some(kept_rechecks.clone()),
                 tracker: Some(acquisition_tracker.clone()),
                 id_registry: Some(stores.external_id_registry.clone()),
                 soulseek: Some(soulseek_link.clone()),
@@ -1038,8 +1184,162 @@ impl Acquisition {
                 owned: Some(heart_ownership.clone()),
                 stars: Some(star_on_arrival.clone()),
                 ahead: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
+                gates: downloads
+                    .heart_gate
+                    .then(|| verification.clone() as Arc<dyn HeartGates>),
+                music_brainz: Some(clients.music_brainz.clone()),
+                heard: Some(stores.heard_samples.clone()),
+                acoust_id_on: Some({
+                    let acoust_id = clients.acoust_id.clone();
+                    Arc::new(move || acoust_id.is_on())
+                }),
+                album_gates: Some(album_gates.clone()),
+                metadata: Some(music_metadata.clone()),
+                library: Some(navidrome.local_library.clone()),
+                deezer_answering: Some({
+                    let deezer = clients.deezer_metadata.clone();
+                    Arc::new(move || deezer.answering())
+                }),
             },
         );
+        // Held files no hold names go before any worker runs.
+        heart_acquisition_coordinator.sweep_held_files();
+        // The shim's rounds resume a held heart once the shim answers for it, and show a hold
+        // they moved on its row.
+        {
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            stores.heard_samples.on_resume(Arc::new(move |key: &str| {
+                if let Some(coordinator) = coordinator.upgrade() {
+                    coordinator.resume_held(key);
+                }
+            }));
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            stores.heard_samples.on_hold_row(Arc::new(
+                move |record: &crate::services::common::HeldAcquisition| {
+                    if let Some(coordinator) = coordinator.upgrade() {
+                        coordinator.hold_row_for(record);
+                    }
+                },
+            ));
+            // A hold waiting for AcoustID resumes when its held lookup's turn comes.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            verification.on_resume(Arc::new(move |key: &str| {
+                if let Some(coordinator) = coordinator.upgrade() {
+                    coordinator.resume_held(key);
+                }
+            }));
+            // AcoustID turning off runs every hold waiting for it through the catalog's clip; a
+            // key working again runs every hold the clip check left through the heard answer.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            clients.acoust_id.subscribe_on(Arc::new(move |on: bool| {
+                if let Some(coordinator) = coordinator.upgrade() {
+                    coordinator.resume_waiting(if on {
+                        WaitingFor::AcoustIdOff
+                    } else {
+                        WaitingFor::AcoustId
+                    });
+                }
+            }));
+            // Deezer answering again after a call it did not answer runs every hold waiting for it.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            clients.deezer_metadata.on_answered_again(Arc::new(move || {
+                if let Some(coordinator) = coordinator.upgrade() {
+                    coordinator.resume_waiting(WaitingFor::Deezer);
+                }
+            }));
+            // Lidarr's indexers searching again runs every heart waiting for them; their health is
+            // read only while one waits.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            let holds = stores.soulseek_holds.clone();
+            lidarr_indexers.on_indexers_back(
+                Arc::new(move || {
+                    if let Some(coordinator) = coordinator.upgrade() {
+                        coordinator.resume_waiting(WaitingFor::LidarrIndexers);
+                    }
+                }),
+                Some(Arc::new(move || {
+                    holds
+                        .snapshot()
+                        .iter()
+                        .any(|record| record.waiting_for == Some(WaitingFor::LidarrIndexers))
+                })),
+            );
+            // The tracks a hearted album's Lidarr import held wait as held album tracks of the
+            // heart, whenever the import comes.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            lidarr_indexers.on_album_holds(Arc::new(
+                move |provider: &str,
+                      album: &str,
+                      user: &str,
+                      origin: octo_core::fingerprint::heart_gate::AcquisitionOrigin| {
+                    if let Some(coordinator) = coordinator.upgrade() {
+                        coordinator.file_album_holds(provider, album, user, origin);
+                    }
+                },
+            ));
+            // A held song streamed again brings a new heard source to the holds that wait on one.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            stores.external_id_registry.on_heard(Arc::new(
+                move |id: &str, user: &str, record: &HeardRecord| {
+                    if let Some(coordinator) = coordinator.upgrade() {
+                        coordinator.heard_again(id, user, record);
+                    }
+                },
+            ));
+            // A kept file that a check finds is another song holds its heart for a play.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            kept_rechecks.use_hold(Arc::new(
+                move |provider: &str, id: &str, users: &[String], line: &str| {
+                    if let Some(coordinator) = coordinator.upgrade() {
+                        coordinator.hold_not_yet_proven(provider, id, users, line);
+                    }
+                },
+            ));
+            // The holds a person waits on join kept files in the one order a heart's proof checks
+            // items in.
+            let (waiting, recheck) = (
+                Arc::downgrade(&heart_acquisition_coordinator),
+                Arc::downgrade(&heart_acquisition_coordinator),
+            );
+            kept_rechecks.use_holds(
+                Arc::new(move || {
+                    waiting
+                        .upgrade()
+                        .map(|coordinator| coordinator.rechecked_holds())
+                        .unwrap_or_default()
+                }),
+                Arc::new(move |key: &str| {
+                    if let Some(coordinator) = recheck.upgrade() {
+                        coordinator.resume_held(key);
+                    }
+                }),
+            );
+        }
+        // A kept file's checks ask MusicBrainz as the heart's gate does, and its replacements are
+        // compared with its own print.
+        kept_rechecks.use_music_brainz(clients.music_brainz.clone(), clients.deezer_metadata.clone());
+        kept_rechecks.use_samples(stores.heard_samples.clone());
+        // What a replacement's original is by its own sound, which Lidarr's walk picks an album
+        // for when the original's tags and its album name find none.
+        {
+            let kept = kept_rechecks.clone();
+            lidarr_fetcher.use_original_sound(Arc::new(move |path: String, seconds: Option<i32>| {
+                let kept = kept.clone();
+                Box::pin(async move {
+                    match kept
+                        .original_sound(
+                            &path,
+                            seconds,
+                            crate::services::fingerprint::acoust_id_rate_limiter::LookupClass::Bulk,
+                        )
+                        .await
+                    {
+                        crate::services::library::upgrade_queue::OriginalSound::Clear(r) => r.ids,
+                        _ => Vec::new(),
+                    }
+                })
+            }));
+        }
         heart_acquisition_coordinator.use_family(FamilyHooks {
             gate: navidrome.family_write_gate.clone(),
             pool: navidrome.family_pool_service.clone(),
@@ -1060,7 +1360,13 @@ impl Acquisition {
             soulseek_link: Some(soulseek_link.clone()),
             lidarr_fetcher: Some(lidarr_fetcher),
             lidarr_client: Some(lidarr_client.clone()),
+            lidarr_music: Some(lidarr_music),
             family: Default::default(),
+            // A pick's file is held to the recording its song is, by the import rule.
+            gates: downloads
+                .heart_gate
+                .then(|| verification.clone() as Arc<dyn HeartGates>),
+            journal: Some(stores.library_action_journal.clone()),
         }));
         song_finder.use_family(navidrome.family_write_gate.clone());
         let external_search = Arc::new(ExternalSearchService::new(
@@ -1091,17 +1397,21 @@ impl Acquisition {
             heart_acquisition_coordinator,
             external_search,
             family_pool_service: navidrome.family_pool_service.clone(),
+            kept_rechecks,
         }
     }
 
-    /// `AcquisitionWorker`, `SoulseekHoldResumer` and `CacheCleanupService`, as workers.
+    /// `AcquisitionWorker`, `SoulseekHoldResumer`, `CacheCleanupService` and
+    /// `MornyeLeftPassJobs`, as workers.
     fn register_workers(
         &self,
         workers: &WorkerSupervisor,
         settings: &Arc<SettingsStore>,
         stores: &Stores,
         notifications: &Arc<NotificationService>,
+        verification: &Arc<DownloadVerificationService>,
     ) {
+        let rounds = Arc::clone(verification);
         let worker = Arc::new(
             AcquisitionWorker::new(
                 self.track_acquisition_queue.clone(),
@@ -1110,19 +1420,27 @@ impl Acquisition {
                 notifications.clone(),
                 Some(stores.download_concurrency.clone()),
             )
-            .with_family(self.family_pool_service.clone() as Arc<dyn FamilyPlacement>),
+            .with_family(self.family_pool_service.clone() as Arc<dyn FamilyPlacement>)
+            .with_end_rounds(Arc::new(move |key: &str| rounds.pause_acquisition(key))),
         );
         workers.register("AcquisitionWorker", move |stopping| worker.clone().run(stopping));
-        let resumer = Arc::new(SoulseekHoldResumer::new(
-            stores.soulseek_holds.clone(),
-            self.heart_acquisition_coordinator.clone(),
-        ));
+        let resumer = Arc::new(
+            SoulseekHoldResumer::new(
+                stores.soulseek_holds.clone(),
+                self.heart_acquisition_coordinator.clone(),
+            )
+            .with_heard(stores.heard_samples.clone()),
+        );
         workers.register("SoulseekHoldResumer", move |stopping| {
             resumer.clone().run(stopping)
         });
         let cleanup = Arc::new(CacheCleanupService::new(settings.clone()));
         workers.register("CacheCleanupService", move |stopping| {
             cleanup.clone().run(stopping)
+        });
+        let spotiflac = self.spotiflac.clone();
+        workers.register("MornyeLeftPassJobs", move |stopping| {
+            spotiflac.clone().clean_left_pass_jobs(stopping)
         });
     }
 }
@@ -1251,6 +1569,9 @@ impl NavidromeServices {
             )),
             shared_root: Box::new(move || shared_identity.effective_download_path(&configured_download_path)),
         });
+        // Promotions, shared copies and relayouts take the music folder gate's share, so none of
+        // them names a file while a library job moves folders.
+        family_pool_service.set_write_gate(stores.library_write_gate.clone());
         let personal_library = Arc::new(PersonalLibrary::new(
             Arc::clone(settings),
             Arc::clone(&stores.family_store),
@@ -1330,6 +1651,8 @@ struct Stores {
     download_concurrency: Arc<DownloadConcurrency>,
     download_picks: Arc<DownloadPicks>,
     soulseek_holds: Arc<SoulseekHoldStore>,
+    /// Mornye's check episodes and the songs it refused while paused, `mornye-check.json`.
+    mornye_check: Arc<MornyeCheckStore>,
     you_tube_resolver: Arc<YouTubeResolver>,
     stream_size_warmer: Arc<StreamSizeWarmer>,
     local_cover_cache: Arc<LocalCoverCache>,
@@ -1337,6 +1660,7 @@ struct Stores {
     radio_queues: Arc<RadioQueueStore>,
     prefetch_store: Arc<PrefetchStore>,
     preview_copies: Arc<PreviewCopies>,
+    heard_samples: Arc<HeardSamples>,
     directory_browser: Arc<DirectoryBrowser>,
     browse_sessions: Arc<BrowseSessionStore>,
     rejected_peers: Arc<RejectedPeerRegistry>,
@@ -1419,6 +1743,20 @@ impl Stores {
             config_dir.join("cover-cache"),
             Arc::new(move || cover_settings.current().subsonic.effective_cover_cache_bytes()),
         ));
+        let soulseek_holds = Arc::new(SoulseekHoldStore::new(Some(
+            config_dir.join("soulseek-holds.json"),
+        )));
+        let heard_samples = HeardSamples::new(HeardSampleParts {
+            folder: config_dir.join("heard-samples"),
+            scratch: config_dir.join("preview-copies").join("scratch"),
+            settings: settings.clone(),
+            registry: external_id_registry.clone(),
+            youtube: you_tube_resolver.clone(),
+            copies: preview_copies.clone(),
+            prefetch: prefetch_store.clone(),
+            holds: soulseek_holds.clone(),
+            clock: Clock::system(),
+        });
         Stores {
             download_history: Arc::new(DownloadHistoryService::new(
                 config_dir.join("downloads-history.json"),
@@ -1426,9 +1764,8 @@ impl Stores {
             download_arrivals: Arc::new(DownloadArrivals::default()),
             download_concurrency: Arc::new(DownloadConcurrency::new(settings.clone())),
             download_picks: Arc::new(DownloadPicks::default()),
-            soulseek_holds: Arc::new(SoulseekHoldStore::new(Some(
-                config_dir.join("soulseek-holds.json"),
-            ))),
+            soulseek_holds,
+            mornye_check: Arc::new(MornyeCheckStore::new(Some(config_dir.join("mornye-check.json")))),
             you_tube_resolver,
             subsonic_response_builder: Arc::new(SubsonicResponseBuilder::new(
                 stream_size_warmer.clone(),
@@ -1440,6 +1777,7 @@ impl Stores {
             radio_queues: Arc::new(RadioQueueStore::new()),
             prefetch_store,
             preview_copies,
+            heard_samples,
             directory_browser: Arc::new(DirectoryBrowser::new()),
             browse_sessions: Arc::new(BrowseSessionStore::new(Some(
                 config_dir.join("browse-sessions.json"),
@@ -1554,17 +1892,22 @@ struct MetadataClients {
 impl MetadataClients {
     /// `itunes_cache`: where the iTunes matches persist, or None to keep them in memory only.
     fn build(settings: &Arc<SettingsStore>, itunes_cache: Option<PathBuf>) -> Self {
-        Self::build_with(settings, itunes_cache, None)
+        Self::build_with(settings, itunes_cache, None, None)
     }
 
-    /// `deezer_base_url`: a test's mock server in place of api.deezer.com.
+    /// `deezer_base_url`: a test's mock server in place of api.deezer.com; `deezer_api_host`: the
+    /// host the door treats as Deezer's API (the mock's, when a test wires the catalog stand-in).
     fn build_with(
         settings: &Arc<SettingsStore>,
         itunes_cache: Option<PathBuf>,
         deezer_base_url: Option<&str>,
+        deezer_api_host: Option<&str>,
     ) -> Self {
         let deezer_rate_limiter = Arc::new(DeezerRateLimiter::new());
-        let deezer_client = Arc::new(DeezerRateLimitHandler::new(Arc::clone(&deezer_rate_limiter)));
+        let deezer_client = Arc::new(match deezer_api_host {
+            Some(host) => DeezerRateLimitHandler::with_api_host(Arc::clone(&deezer_rate_limiter), host),
+            None => DeezerRateLimitHandler::new(Arc::clone(&deezer_rate_limiter)),
+        });
         let deezer_metadata = Arc::new(match deezer_base_url {
             Some(base) => {
                 DeezerMetadataService::with_base_url(Arc::clone(&deezer_client), Arc::clone(settings), base)
@@ -1572,9 +1915,10 @@ impl MetadataClients {
             None => DeezerMetadataService::new(Arc::clone(&deezer_client), Arc::clone(settings)),
         });
         let acoust_id_rate_limiter = Arc::new(AcoustIdRateLimiter::new());
-        let acoust_id = Arc::new(AcoustIdClient::new(Arc::new(AcoustIdRateLimitHandler::new(
-            Arc::clone(&acoust_id_rate_limiter),
-        ))));
+        let acoust_id = Arc::new(AcoustIdClient::new(
+            Arc::new(AcoustIdRateLimitHandler::new(Arc::clone(&acoust_id_rate_limiter))),
+            Arc::clone(settings),
+        ));
 
         // The cover sources take their settings once: captured here, at construction.
         let current = settings.current();
@@ -1606,6 +1950,93 @@ impl MetadataClients {
             artwork_hints,
             you_tube_music: Arc::new(YouTubeMusicClient::new(settings)),
         }
+    }
+}
+
+/// Apple's catalog standing in for Deezer's where Deezer does not serve this server, wired into
+/// the Deezer client before any worker or request uses it. Test builds wire none.
+struct CatalogStandIn {
+    reach: Arc<DeezerReach>,
+    apple: Arc<AppleCatalog>,
+    stand_in: Arc<DeezerStandIn>,
+}
+
+impl CatalogStandIn {
+    fn wire(clients: &MetadataClients, config_dir: &Path) -> Self {
+        let pace = ApplePace::shared();
+        let apple = Arc::new(AppleCatalog::new(
+            Arc::clone(&pace),
+            Some(config_dir.join("apple-store.json")),
+        ));
+        Self::wire_with(clients, pace, apple, DeezerMetadataService::BASE)
+    }
+
+    /// A test's stand-in: Apple at its mock server on a pace that never waits, and `/infos` read
+    /// from the test's mock Deezer.
+    fn wire_for_tests(clients: &MetadataClients, apple_base: &str, deezer_base: &str) -> Self {
+        let pace = Arc::new(ApplePace::new(PaceConfig::unpaced()));
+        let apple = Arc::new(AppleCatalog::with_bases(
+            Arc::clone(&pace),
+            apple_base,
+            apple_base,
+            None,
+        ));
+        let wired = Self::wire_with(clients, pace, apple, deezer_base);
+        clients.deezer_metadata.follow_switches();
+        wired.stand_in.follow_switches();
+        wired
+    }
+
+    fn wire_with(
+        clients: &MetadataClients,
+        pace: Arc<ApplePace>,
+        apple: Arc<AppleCatalog>,
+        infos_origin: &str,
+    ) -> Self {
+        let reach = Arc::new(DeezerReach::new(Arc::clone(&pace)));
+        let stand_in = Arc::new(DeezerStandIn::new(Arc::clone(&reach), Arc::clone(&apple)));
+        stand_in.set_door(Arc::downgrade(&clients.deezer_client));
+        stand_in.set_hints(Arc::clone(&clients.artwork_hints));
+        clients.deezer_client.set_stand_in(Arc::clone(&stand_in));
+        reach.set_reader(Arc::new(DoorInfos::new(
+            Arc::downgrade(&clients.deezer_client),
+            infos_origin,
+        )));
+        Self {
+            reach,
+            apple,
+            stand_in,
+        }
+    }
+
+    /// Which Apple store to ask: the server's own country, once the charts can tell it.
+    fn use_store_of(&self, settings: &Arc<SettingsStore>, top_songs: &TopSongsService) {
+        let (pages, apple_has) = (top_songs.clone(), top_songs.clone());
+        self.apple.set_store_source(Arc::new(ServerStore::new(
+            Arc::clone(settings),
+            Arc::new(move || pages.known_country()),
+            Arc::new(move |code: &str| apple_has.has_country(code)),
+            Arc::clone(&self.reach),
+        )));
+    }
+
+    /// At start: Deezer's `/infos` is read once, and the Deezer service's caches and what the
+    /// stand-in learned are cleared at every catalog switch from then on.
+    fn register_workers(&self, workers: &WorkerSupervisor, deezer: &Arc<DeezerMetadataService>) {
+        let (reach, stand_in, deezer) = (
+            Arc::clone(&self.reach),
+            Arc::clone(&self.stand_in),
+            Arc::clone(deezer),
+        );
+        workers.register("DeezerReach", move |_stopping| {
+            let (reach, stand_in, deezer) = (Arc::clone(&reach), Arc::clone(&stand_in), Arc::clone(&deezer));
+            async move {
+                deezer.follow_switches();
+                stand_in.follow_switches();
+                reach.read_at_start();
+                Ok(())
+            }
+        });
     }
 }
 
@@ -1732,6 +2163,7 @@ fn build_tidy(
     stores: &Stores,
     jobs: &GenreAndCoverJobs,
     lyrics_undo: &Arc<LyricsUndoJournal>,
+    lyrics_remap: LyricsPathRemap,
 ) -> Arc<TidyWorker> {
     let (identity, http, list_settings) = (
         navidrome.navidrome_identity.clone(),
@@ -1742,9 +2174,10 @@ fn build_tidy(
         let (identity, http, settings) = (identity.clone(), http.clone(), list_settings.clone());
         Box::pin(async move {
             let base = settings.current().subsonic.url.clone();
-            let root = settings
+            let configured = settings
                 .raw("Library:DownloadPath")
                 .unwrap_or_else(|| "./downloads".to_string());
+            let root = identity.effective_download_path(&configured);
             navidrome_song_list::list(Some(&identity), Some(&http), base.as_deref(), &root).await
         })
     });
@@ -1771,6 +2204,13 @@ fn build_tidy(
                 lyrics_undo: Some(lyrics_undo.clone()),
                 explicit: Some(jobs.explicit_backfill_store.clone()),
                 quarantine: Some(Arc::new(LibraryActionQuarantine::new(settings.clone()))),
+                // Its own client: Lidarr's address and key are read from the settings at each
+                // request, as every client of Octo's reads them.
+                lidarr: Some(Arc::new(LidarrClient::new(settings.clone()))),
+                lidarr_pending: Some(stores.lidarr_pending.clone()),
+                identity: Some(Arc::new(navidrome.navidrome_identity.clone())),
+                family_pool: Some(navidrome.family_pool_service.clone()),
+                lyrics_remap: Some(lyrics_remap),
             },
         )
         .with_write_gate(stores.library_write_gate.clone()),
@@ -1963,6 +2403,7 @@ impl Imports {
                 downloads: acquisition.track_acquisition_queue.clone(),
                 tracker: acquisition.acquisition_tracker.clone(),
                 soulseek: soulseek_link,
+                spotiflac: Some(acquisition.spotiflac.clone()),
             },
         );
         let service = ImportService::new(ImportParts {
@@ -2333,6 +2774,11 @@ impl LibraryActions {
             sources: Some(acquisition.upgrade_sources.clone()),
             answers: Some(answers),
         }));
+        // Better quality of a file a heart kept is judged by that heart's own gate, and a Wrong song
+        // or Wrong version by what its original's own sound says. A copy picked for a Wrong
+        // version is compared with the song's own file, window by window.
+        executor.use_kept_rechecks(acquisition.kept_rechecks.clone());
+        executor.use_master(Arc::new(HeardMasterCheck::new(stores.heard_samples.clone())));
         let rating_worker = Arc::new(LibraryActionRatingWorker::new(
             executor.clone(),
             navidrome.subsonic_proxy.clone(),
@@ -2493,6 +2939,30 @@ pub struct TestServices {
     /// Where Apple Music's pages are read from (a test's mock server). None in a handler test
     /// is an address that refuses at once, so no test reaches music.apple.com.
     pub apple_music_base_url: Option<String>,
+    /// The heart gate on hearts and plays. Off by default, so a test of what an endpoint does
+    /// never asks the real AcoustID, MusicBrainz or Deezer hosts; a test of the gate turns it on.
+    pub heart_gate: bool,
+    /// Where MusicBrainz is asked (a test's mock server, `<base>/ws/2/`), at a test's pace.
+    pub music_brainz_base_url: Option<String>,
+    /// Where AcoustID is asked (a test's mock server).
+    pub acoust_id_base_url: Option<String>,
+    /// Where the catalog stand-in asks Apple (a test's mock server), with `deezer_base_url` as
+    /// Deezer's API and its `/infos`. None wires no stand-in: a mock Deezer answers as Deezer and
+    /// no test asks Apple.
+    pub apple_catalog_base_url: Option<String>,
+}
+
+/// MusicBrainz at a test's mock server, paced for a test that runs in seconds.
+fn test_music_brainz(base: &str) -> MusicBrainzClient {
+    let client =
+        MusicBrainzClient::with_base_url(url::Url::parse(base).expect("a test's MusicBrainz address"));
+    #[cfg(test)]
+    let client = client.with_pace(
+        Duration::from_millis(5),
+        Duration::from_secs(5),
+        Duration::from_millis(5),
+    );
+    client
 }
 
 /// The queues and sweeps: the upgrade queue's worker, the weekly quality upgrade, the
@@ -2947,11 +3417,13 @@ impl AppState {
         let stores = Stores::build(&settings, &config_dir);
         // Matches survive a restart, so a library is not sent back to Apple album by album.
         let clients = MetadataClients::build(&settings, Some(config_dir.join("itunes-masters.json")));
+        let catalog_stand_in = CatalogStandIn::wire(&clients, &config_dir);
         let tagging = Tagging::build(&settings, &clients);
         let lyrics = Lyrics::build(&settings, Some(&config_dir));
         let workers = Arc::new(WorkerSupervisor::new());
         stores.register_workers(&workers);
         lyrics.register_workers(&workers);
+        catalog_stand_in.register_workers(&workers, &clients.deezer_metadata);
 
         // The iTunes matches flush every 15 seconds, and once more on shutdown.
         let itunes = Arc::clone(&clients.itunes_cover_art);
@@ -3009,6 +3481,7 @@ impl AppState {
             &stores,
             &genre_cover_jobs,
             &lyrics.undo_journal,
+            lyrics.sidecar_writer.path_remap(),
         );
         {
             let worker = tidy_worker.clone();
@@ -3026,10 +3499,17 @@ impl AppState {
                 tagging: &tagging,
                 lyrics: &lyrics.sidecar_writer,
                 soulseek_client: &soulseek.client,
+                heart_gate: true,
             },
             None,
         );
-        acquisition.register_workers(&workers, &settings, &stores, &integrations.notifications);
+        acquisition.register_workers(
+            &workers,
+            &settings,
+            &stores,
+            &integrations.notifications,
+            &tagging.download_verification,
+        );
         let library_actions = LibraryActions::build(
             &settings,
             &stores,
@@ -3098,6 +3578,8 @@ impl AppState {
             &config_dir,
         );
         charts.register_workers(&workers);
+        catalog_stand_in.use_store_of(&settings, &charts.top_songs);
+        let deezer_reach = Some(Arc::clone(&catalog_stand_in.reach));
         let sync_catalog = Arc::new(SyncCatalogService::new(
             navidrome.subsonic_proxy.clone(),
             metadata_service.clone(),
@@ -3288,6 +3770,7 @@ impl AppState {
             radio_queues: stores.radio_queues,
             prefetch,
             preview_copies: stores.preview_copies,
+            heard_samples: stores.heard_samples,
             keep_ready,
             directory_browser: stores.directory_browser,
             browse_sessions: stores.browse_sessions,
@@ -3296,6 +3779,7 @@ impl AppState {
             admin_recovery_code: admin_sign_in.recovery_code,
             admin_role_check: admin_sign_in.role_check,
             anonymous_status: Default::default(),
+            mornye_row: Default::default(),
             rejected_peers: stores.rejected_peers,
             release_check: stores.release_check,
             http: navidrome.http,
@@ -3313,6 +3797,7 @@ impl AppState {
             startup_validation: navidrome.startup_validation,
             deezer_rate_limiter: clients.deezer_rate_limiter,
             deezer_client: clients.deezer_client,
+            deezer_reach,
             deezer_metadata: clients.deezer_metadata,
             music_brainz: clients.music_brainz,
             acoust_id_rate_limiter: clients.acoust_id_rate_limiter,
@@ -3322,6 +3807,7 @@ impl AppState {
             cover_art_archive: clients.cover_art_archive,
             cover_art_service,
             ambient_palettes: Arc::new(crate::services::admin::AmbientPaletteService::new()),
+            fetched_covers: Arc::new(crate::services::admin::FetchedCovers::new()),
             last_fm: integrations.last_fm,
             last_fm_scrobbles: integrations.last_fm_scrobbles,
             listen_brainz: integrations.listen_brainz,
@@ -3468,7 +3954,38 @@ impl AppState {
         let stores = Stores::build_with(&settings, &config_dir, overrides.external_id_registry.clone());
         // The clients point at the real hosts but ask nothing until a test calls them, and
         // the iTunes matches stay in memory.
-        let clients = MetadataClients::build_with(&settings, None, overrides.deezer_base_url.as_deref());
+        // Test builds wire no stand-in unless a test asks for one: a mock Deezer answers as Deezer,
+        // and no test asks Apple.
+        let stand_in_bases = overrides
+            .apple_catalog_base_url
+            .as_deref()
+            .zip(overrides.deezer_base_url.as_deref());
+        let deezer_api_host = stand_in_bases
+            .and_then(|(_, deezer)| url::Url::parse(deezer).ok())
+            .and_then(|deezer| deezer.host_str().map(str::to_string));
+        let mut clients = MetadataClients::build_with(
+            &settings,
+            None,
+            overrides.deezer_base_url.as_deref(),
+            deezer_api_host.as_deref(),
+        );
+        let catalog_stand_in =
+            stand_in_bases.map(|(apple, deezer)| CatalogStandIn::wire_for_tests(&clients, apple, deezer));
+        let deezer_reach: Option<Arc<DeezerReach>> =
+            catalog_stand_in.as_ref().map(|wired| Arc::clone(&wired.reach));
+        if let Some(base) = overrides.music_brainz_base_url.as_deref() {
+            clients.music_brainz = Arc::new(test_music_brainz(base));
+        }
+        if let Some(base) = overrides.acoust_id_base_url.as_deref() {
+            let base = url::Url::parse(base).expect("a test's AcoustID address");
+            clients.acoust_id = Arc::new(AcoustIdClient::new(
+                Arc::new(AcoustIdRateLimitHandler::with_base_url(
+                    Arc::clone(&clients.acoust_id_rate_limiter),
+                    base,
+                )),
+                Arc::clone(&settings),
+            ));
+        }
         let tagging = Tagging::build(&settings, &clients);
         let lyrics = Lyrics::build(&settings, None);
         // The Last.fm, ListenBrainz and notification clients point at the real hosts too, and
@@ -3514,6 +4031,7 @@ impl AppState {
             &stores,
             &genre_cover_jobs,
             &lyrics.undo_journal,
+            lyrics.sidecar_writer.path_remap(),
         );
         // No workers: the acquisition worker, the resumer and the cache cleanup are not run.
         let acquisition = Acquisition::build(
@@ -3528,6 +4046,7 @@ impl AppState {
                 tagging: &tagging,
                 lyrics: &lyrics.sidecar_writer,
                 soulseek_client: &soulseek.client,
+                heart_gate: overrides.heart_gate,
             },
             overrides.download_service.clone(),
         );
@@ -3594,6 +4113,9 @@ impl AppState {
             Some(&apple_base),
             &config_dir,
         );
+        if let Some(wired) = &catalog_stand_in {
+            wired.use_store_of(&settings, &charts.top_songs);
+        }
         let sync_catalog = Arc::new(SyncCatalogService::new(
             navidrome.subsonic_proxy.clone(),
             metadata_service.clone(),
@@ -3732,6 +4254,7 @@ impl AppState {
             radio_queues: stores.radio_queues,
             prefetch,
             preview_copies: stores.preview_copies,
+            heard_samples: stores.heard_samples,
             keep_ready,
             directory_browser: stores.directory_browser,
             browse_sessions: stores.browse_sessions,
@@ -3740,6 +4263,7 @@ impl AppState {
             admin_recovery_code: admin_sign_in.recovery_code,
             admin_role_check: admin_sign_in.role_check,
             anonymous_status: Default::default(),
+            mornye_row: Default::default(),
             rejected_peers: stores.rejected_peers,
             release_check: stores.release_check,
             http: navidrome.http,
@@ -3757,6 +4281,7 @@ impl AppState {
             startup_validation: navidrome.startup_validation,
             deezer_rate_limiter: clients.deezer_rate_limiter,
             deezer_client: clients.deezer_client,
+            deezer_reach,
             deezer_metadata: clients.deezer_metadata,
             music_brainz: clients.music_brainz,
             acoust_id_rate_limiter: clients.acoust_id_rate_limiter,
@@ -3766,6 +4291,7 @@ impl AppState {
             cover_art_archive: clients.cover_art_archive,
             cover_art_service,
             ambient_palettes: Arc::new(crate::services::admin::AmbientPaletteService::new()),
+            fetched_covers: Arc::new(crate::services::admin::FetchedCovers::new()),
             last_fm: integrations.last_fm,
             last_fm_scrobbles: integrations.last_fm_scrobbles,
             listen_brainz: integrations.listen_brainz,
@@ -3922,6 +4448,26 @@ mod tests {
         ));
     }
 
+    /// A held file no hold names (a hold that ended before its files went) is gone once the state
+    /// is built, before any worker runs.
+    #[tokio::test]
+    async fn held_files_no_hold_names_go_while_the_state_is_built() {
+        let config = tempfile::tempdir().expect("a temp dir");
+        let folder = crate::services::common::soulseek_hold_store::held_root(&config.path().join("music"))
+            .join("Track_soulseek_x");
+        std::fs::create_dir_all(&folder).expect("made");
+        let stray = folder.join("stray.flac");
+        std::fs::write(&stray, b"x").expect("written");
+        let _state = AppState::for_tests_with(
+            AppSettings::default(),
+            TestServices {
+                config_dir: Some(config.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        assert!(!stray.exists());
+    }
+
     /// The sinks in send order, ntfy then Discord, and nothing from the notification, Last.fm or
     /// ListenBrainz services sent anywhere with the default settings.
     #[tokio::test]
@@ -3962,7 +4508,7 @@ mod tests {
         );
     }
 
-    /// The acquisition pipeline: its three background services run as workers, the activity
+    /// The acquisition pipeline: its background services run as workers, the activity
     /// sees the download service, and StarOnArrival is already listening to the tracker.
     #[tokio::test]
     async fn the_acquisition_pipeline_is_wired_with_its_workers() {
@@ -3973,6 +4519,7 @@ mod tests {
             "SoulseekHoldResumer",
             "CacheCleanupService",
             "PrefetchService",
+            "MornyeLeftPassJobs",
         ] {
             assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
         }
@@ -4029,6 +4576,8 @@ mod tests {
             original_path: None,
             release: None,
             step: None,
+            song: None,
+            recordings: Vec::new(),
         };
         let refused = state
             .lidarr_track_fetcher

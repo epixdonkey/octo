@@ -1,7 +1,8 @@
 //! Hearts sent several at once, outside artists, and the outside songs a caller hearted that
 //! are still downloading, which their starred lists show until the file lands.
 
-use octo_core::settings::{AppSettings, SoulseekSettings};
+use chrono::Utc;
+use octo_core::settings::{AppSettings, LibraryAction, SoulseekSettings};
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
 use serde_json::Value;
 use wiremock::matchers::any;
@@ -11,6 +12,7 @@ use super::ARTIST_NOT_IN_LIBRARY;
 use crate::app::AppState;
 use crate::controllers::subsonic::test_app::*;
 use crate::http::pipeline::App;
+use crate::services::library::{LibraryActionEntry, LibraryActionJournal, LibraryActionState, PathSource};
 
 /// Navidrome's getStarred2 answer in JSON: one library song.
 const STARRED2_JSON: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","starred2":{"song":[{"id":"nd-7","title":"Library song","starred":"2026-01-01T00:00:00Z"}]}}}"#;
@@ -75,6 +77,11 @@ struct HeartApp {
 
 impl HeartApp {
     async fn new() -> HeartApp {
+        HeartApp::with(|_| {}).await
+    }
+
+    /// The same, with `change` made to the app's services.
+    async fn with(change: impl FnOnce(&mut crate::app::AppInner)) -> HeartApp {
         let navidrome = MockServer::builder().start().await;
         Mock::given(any())
             .respond_with(HeartNavidrome)
@@ -90,7 +97,7 @@ impl HeartApp {
         };
         // A waiting heart is listed only when it becomes a favorite on landing.
         settings.subsonic.star_downloads_for_requester = true;
-        let state = state_with(settings, |_| {});
+        let state = state_with(settings, change);
         state
             .settings
             .set_raw("Library:DownloadPath", Some(&directory.path().to_string_lossy()));
@@ -148,6 +155,52 @@ impl HeartApp {
 
 fn alice() -> String {
     auth("alice", "good", "Symfonium")
+}
+
+/// A song removed with Delete from disk by alice, which keeps it from downloading again.
+fn removed(id: &str, title: &str) -> LibraryActionEntry {
+    LibraryActionEntry {
+        key: LibraryActionJournal::make_key(LibraryAction::Delete, id, "1:2"),
+        action: LibraryAction::Delete,
+        navidrome_id: id.into(),
+        username: "alice".into(),
+        title: title.into(),
+        artist: "Massive Attack".into(),
+        album: "Mezzanine".into(),
+        source_path: Some(format!("/music/{id}.flac")),
+        quarantine_path: Some(format!("/music/.octo-trash/{id}.flac")),
+        resolution: Some(PathSource::NativeApi),
+        state: LibraryActionState::Applied,
+        detail: Some("Removed.".into()),
+        dry_run: false,
+        at_utc: Utc::now(),
+        history_kept: None,
+        revealed_path: None,
+        copy: false,
+        download_allowed: false,
+        denied_source: None,
+    }
+}
+
+/// A heart asks for the song again: the Delete from disk that kept it from downloading is lifted,
+/// and only for that song.
+#[tokio::test]
+async fn a_heart_lifts_the_delete_that_kept_its_song_from_downloading() {
+    let t = HeartApp::new().await;
+    let teardrop = t.register(RoutingKind::Song, "Teardrop");
+    let journal = &t.state.library_action_journal;
+    journal.record(removed("nd-1", "Teardrop"));
+    journal.record(removed("nd-2", "Angel"));
+
+    let reply = get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&id={teardrop}", alice()),
+    )
+    .await;
+
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    assert!(!journal.is_never_requested(Some("Massive Attack"), Some("Teardrop")));
+    assert!(journal.is_never_requested(Some("Massive Attack"), Some("Angel")));
 }
 
 /// Library ids sent together reach Navidrome together, outside songs among them are each queued
@@ -340,6 +393,132 @@ async fn an_unstar_before_the_song_lands_takes_it_off_the_lists() {
     assert_eq!(t.starred2_song_ids(&alice()).await, ["nd-7"]);
 }
 
+/// A held heart two people of Octo's own apps hearted: one taking theirs back leaves the other's
+/// hold, and the last one taking theirs back ends it.
+#[tokio::test]
+async fn an_unstar_by_one_of_two_octo_app_users_keeps_the_others_hold() {
+    use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, WaitingFor};
+
+    use crate::services::common::{HeldAcquisition, Holder, StarOnArrival};
+
+    let t = HeartApp::new().await;
+    let teardrop = t.register(RoutingKind::Song, "Teardrop");
+    let (_, provider, external_id) = t.state.local_library.parse_song_id(&teardrop);
+    let holder = |user: &str| Holder {
+        user: user.into(),
+        ..Default::default()
+    };
+    let record = t.state.soulseek_holds.hold(HeldAcquisition {
+        provider: provider.expect("an outside id"),
+        external_id: external_id.expect("an outside id"),
+        requested_by: Some("alice".into()),
+        origin: Some(AcquisitionOrigin::Heart),
+        waiting_for: Some(WaitingFor::MusicBrainz),
+        holders: vec![holder("alice"), holder("carol")],
+        ..Default::default()
+    });
+    let octo_app = StarOnArrival::OCTO_APP_CLIENT;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/unstar.view?{}&f=json&id={teardrop}",
+            auth("carol", "good", octo_app)
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    let kept = t
+        .state
+        .soulseek_holds
+        .get(&record.key())
+        .expect("alice still holds it");
+    let users: Vec<&str> = kept.holders.iter().map(|h| h.user.as_str()).collect();
+    assert_eq!(users, ["alice"]);
+
+    // A wrong sign-in takes nobody off.
+    get(
+        &t.app,
+        &format!(
+            "/rest/unstar.view?{}&f=json&id={teardrop}",
+            auth("alice", "bad", octo_app)
+        ),
+    )
+    .await;
+    assert!(t.state.soulseek_holds.get(&record.key()).is_some());
+
+    get(
+        &t.app,
+        &format!(
+            "/rest/unstar.view?{}&f=json&id={teardrop}",
+            auth("alice", "good", octo_app)
+        ),
+    )
+    .await;
+    assert!(t.state.soulseek_holds.snapshot().is_empty(), "nobody is left");
+}
+
+/// Un-hearting an album deletes its held tracks: each track nobody else holds ends, its held file
+/// with it, and a wrong sign-in takes nobody off.
+#[tokio::test]
+async fn an_album_unstar_deletes_its_held_tracks() {
+    use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, WaitingFor};
+
+    use crate::services::common::acquisition_tracker::key_of;
+    use crate::services::common::soulseek_hold_store::HeldAlbumTrack;
+    use crate::services::common::{HeldAcquisition, StarOnArrival};
+
+    let t = HeartApp::new().await;
+    let album = t.register(RoutingKind::Album, "Mezzanine");
+    let angel = t.register(RoutingKind::Song, "Angel");
+    let (_, provider, external_id) = t.state.local_library.parse_song_id(&angel);
+    let provider = provider.expect("an outside id");
+    let file = t._directory.path().join("angel.flac");
+    std::fs::write(&file, b"the held track").expect("written");
+    let record = t.state.soulseek_holds.hold(HeldAcquisition {
+        provider: provider.clone(),
+        external_id: external_id.expect("an outside id"),
+        requested_by: Some("alice".into()),
+        origin: Some(AcquisitionOrigin::AlbumHeart),
+        waiting_for: Some(WaitingFor::NotYetProven),
+        held_files: vec![file.to_string_lossy().to_string()],
+        album_track: Some(HeldAlbumTrack {
+            album_key: key_of(&provider, &album),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let octo_app = StarOnArrival::OCTO_APP_CLIENT;
+
+    get(
+        &t.app,
+        &format!(
+            "/rest/unstar.view?{}&f=json&albumId={album}",
+            auth("alice", "bad", octo_app)
+        ),
+    )
+    .await;
+    assert!(
+        t.state.soulseek_holds.get(&record.key()).is_some(),
+        "a wrong sign-in"
+    );
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/unstar.view?{}&f=json&albumId={album}",
+            auth("alice", "good", octo_app)
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    assert!(
+        t.state.soulseek_holds.snapshot().is_empty(),
+        "the held track ends"
+    );
+    assert!(!file.exists(), "its held file is deleted");
+}
+
 /// Someone else cannot take back a heart by naming its owner without their sign-in.
 #[tokio::test]
 async fn an_unstar_with_a_wrong_sign_in_keeps_the_heart() {
@@ -413,4 +592,111 @@ async fn a_star_navidrome_refuses_queues_nothing_from_outside() {
     assert!(t.state.track_acquisition_queue.is_idle());
     assert_eq!(t.state.star_on_arrival.held(), 0);
     assert_eq!(t.starred2_song_ids(&alice()).await, ["nd-7"]);
+}
+
+/// Lidarr as far as an un-heart goes: the songs and albums an open follow is on, and every
+/// un-heart it is told of.
+#[derive(Default)]
+struct FollowedLidarr {
+    on: parking_lot::Mutex<Vec<String>>,
+    unhearted: parking_lot::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::services::lidarr::ILidarrHeartAcquisitionService for FollowedLidarr {
+    async fn try_acquire_track(
+        &self,
+        _: &str,
+        _: &str,
+        _: bool,
+        _: Option<&str>,
+        _: octo_core::fingerprint::heart_gate::AcquisitionOrigin,
+        _: &[octo_core::fingerprint::heart_gate::HeartGate],
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn try_acquire_album(
+        &self,
+        _: &str,
+        _: &str,
+        _: bool,
+        _: Option<&str>,
+        _: octo_core::fingerprint::heart_gate::AcquisitionOrigin,
+        _: &[octo_core::fingerprint::heart_gate::HeartGate],
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn follows_heart(&self, provider: &str, external_id: &str) -> bool {
+        self.on.lock().contains(&format!("{provider}:{external_id}"))
+    }
+
+    fn unhearted(&self, provider: &str, external_id: &str, user: &str) {
+        self.unhearted
+            .lock()
+            .push((format!("{provider}:{external_id}"), user.to_string()));
+    }
+}
+
+/// Un-hearting reaches the Lidarr follow a heart is on whether or not anything of it is held: a
+/// song, an album sent as albumId, and an album sent as id each leave their follow for the person
+/// who signed in, and a wrong sign-in leaves nothing.
+#[tokio::test]
+async fn every_unstar_of_a_followed_song_or_album_reaches_its_lidarr_follow() {
+    use crate::services::common::StarOnArrival;
+
+    let lidarr = std::sync::Arc::new(FollowedLidarr::default());
+    let held = lidarr.clone();
+    let t = HeartApp::with(move |inner| inner.lidarr_hearts = held).await;
+    let teardrop = t.register(RoutingKind::Song, "Teardrop");
+    let mezzanine = t.register(RoutingKind::Album, "Mezzanine");
+    let key = |id: &str| {
+        let (_, provider, external_id) = t.state.local_library.parse_song_id(id);
+        format!(
+            "{}:{}",
+            provider.unwrap_or_else(|| "soulseek".into()),
+            external_id.unwrap_or_else(|| id.to_string())
+        )
+    };
+    let album_key = format!(
+        "{}:{mezzanine}",
+        t.state
+            .local_library
+            .parse_song_id(&mezzanine)
+            .1
+            .unwrap_or_else(|| "soulseek".into())
+    );
+    lidarr.on.lock().extend([key(&teardrop), album_key.clone()]);
+    let octo_app = StarOnArrival::OCTO_APP_CLIENT;
+    let unstar = |query: String, token: &'static str| {
+        let app = &t.app;
+        async move {
+            get(
+                app,
+                &format!(
+                    "/rest/unstar.view?{}&f=json&{query}",
+                    auth("alice", token, octo_app)
+                ),
+            )
+            .await
+        }
+    };
+
+    unstar(format!("id={teardrop}"), "bad").await;
+    assert!(lidarr.unhearted.lock().is_empty(), "a wrong sign-in");
+
+    let reply = unstar(format!("id={teardrop}"), "good").await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    unstar(format!("albumId={mezzanine}"), "good").await;
+    unstar(format!("id={mezzanine}"), "good").await;
+
+    assert_eq!(
+        *lidarr.unhearted.lock(),
+        [
+            (key(&teardrop), "alice".to_string()),
+            (album_key.clone(), "alice".to_string()),
+            (album_key, "alice".to_string()),
+        ]
+    );
 }

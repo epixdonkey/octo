@@ -493,6 +493,49 @@ async fn a_refused_replacement_keeps_the_originals_mapping() {
     assert!(f.forgotten().is_empty());
 }
 
+/// A replacement runs as a replacement: work nobody waits on, whose file's check takes the bulk
+/// turn. A file left waiting for that turn in the one hold path goes on with the same source once
+/// AcoustID's lane gives turns again, carrying the labels of a file Lidarr brought, and the
+/// replacement lands from it.
+#[tokio::test]
+async fn a_replacement_runs_as_one_and_its_file_waits_for_the_bulk_turn() {
+    let f = Fixture::new().await;
+    // The lane gives turns again at once here.
+    f.queue
+        .use_turns(Arc::new(|wake: Box<dyn FnOnce() + Send>| wake()));
+    let action = spawn_apply(&f.plain_executor(), wrong_version());
+    let download = f.next_download().await;
+    assert_eq!(
+        download.origin,
+        Some(octo_core::fingerprint::heart_gate::AcquisitionOrigin::Replacement)
+    );
+    let staged = f.staged(&flac(), ".flac");
+    let brought = crate::services::common::soulseek_hold_store::HeldLidarrFile {
+        path: staged.clone(),
+        delivered: Some("/downloads/complete/04 - Teardrop.flac".into()),
+    };
+    f.fail(
+        &download,
+        anyhow::Error::new(crate::services::common::AcquisitionHeld {
+            waiting_for: octo_core::fingerprint::heart_gate::WaitingFor::AcoustId,
+            line: "Waiting for AcoustID".into(),
+            files: vec![staged.clone()],
+            lidarr: vec![brought.clone()],
+            users: Vec::new(),
+        }),
+    );
+
+    let again = f.next_download().await;
+    assert_eq!(again.place().held_files, std::slice::from_ref(&staged));
+    assert_eq!(again.place().held_lidarr, [brought]);
+    assert!(again.replacement.is_some(), "still the same replacement");
+    let landed = reveal(&again, &staged).await.expect("admitted");
+    f.finish(&again, &landed);
+    let outcome = outcome_of(action).await;
+    assert_eq!(outcome.state, LibraryActionState::Applied);
+    assert!(Path::new(&f.revealed()).exists());
+}
+
 /// The replacement moved in and then the bookkeeping after it failed (saving the mappings, say).
 /// Restoring the original now would put a duplicate beside it, or be refused at a shared path;
 /// the swap is done, so it counts as applied.
@@ -573,6 +616,115 @@ async fn better_quality_asks_lidarr_when_soulseek_finds_nothing() {
     assert_eq!(outcome.state, LibraryActionState::Applied);
     assert!(Path::new(&f.revealed()).exists());
     assert!(!Path::new(&f.original).exists());
+}
+
+/// A wait read from Mornye's words beside a working read: it watches no check, and shares
+/// Example's.
+fn kept_by_mornye() -> anyhow::Error {
+    let pause = octo_core::spotiflac::check::CheckPause {
+        until_utc: chrono::Utc::now() + chrono::Duration::minutes(15),
+        labels: Vec::new(),
+        holding: vec!["Example".into()],
+        url: String::new(),
+    };
+    crate::services::spotiflac::MornyeWaiting::new(pause, false, chrono::Utc::now()).into_error()
+}
+
+#[tokio::test]
+async fn better_quality_whose_copy_mornyes_check_kept_waits_for_mornye() {
+    let f = Fixture::new().await;
+    let action = spawn_apply(&f.plain_executor(), better_quality());
+
+    let download = f.next_download().await;
+    f.fail(&download, kept_by_mornye());
+    let outcome = outcome_of(action).await;
+
+    assert_eq!(outcome.state, LibraryActionState::Failed);
+    assert_eq!(outcome.code.as_deref(), Some(LibraryActionCodes::MORNYE_KEPT));
+    assert!(
+        outcome.detail.as_deref().unwrap_or_default().starts_with(
+            "Waiting for Mornye's check, which it could not pass for Example; it allows its next try at "
+        ),
+        "{outcome:?}"
+    );
+    assert!(!outcome.consumed());
+    assert!(Path::new(&f.original).exists());
+}
+
+#[tokio::test]
+async fn a_mornye_wait_on_the_first_source_still_waits_when_lidarr_has_nothing_either() {
+    let f = Fixture::new().await;
+    let action = spawn_apply(&f.executor(false, None, both_sources(None)), better_quality());
+
+    let soulseek = f.next_download().await;
+    f.fail(&soulseek, kept_by_mornye());
+    let lidarr = f.next_download().await;
+    assert_eq!(lidarr.source_override, Some(DownloadSource::Lidarr));
+    f.fail(&lidarr, not_found("Lidarr found no release"));
+    let outcome = outcome_of(action).await;
+
+    assert_eq!(
+        outcome.code.as_deref(),
+        Some(LibraryActionCodes::MORNYE_KEPT),
+        "{outcome:?}"
+    );
+    assert!(!outcome.consumed());
+}
+
+#[tokio::test]
+async fn better_quality_waits_for_mornyes_check_when_every_source_is_out() {
+    // slskd is logged out and Mornye's check keeps it from every extension.
+    let mornye = MockServer::builder().start().await;
+    for (at, body) in [
+        (
+            "/api/get_signed_sessions",
+            serde_json::json!({"result": {"sessions": [
+            {"key": "gateway-v2-abc-6836abb49bb0e8c9", "kind": "gateway", "label": "Example",
+             "extensions": ["example-ext"], "state": "unverified", "auth_paused_s": 900.0}]}}),
+        ),
+        (
+            "/api/get_download_services",
+            serde_json::json!({"result": {"services": [
+            {"id": "ext:example-ext", "label": "Example", "extensions": ["example-ext"]}]}}),
+        ),
+    ] {
+        Mock::given(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&mornye)
+            .await;
+    }
+    let settings = store(AppSettings {
+        soulseek: slskd_set_up(),
+        spotiflac: octo_core::settings::SpotiflacSettings {
+            enabled: true,
+            url: mornye.uri(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let sources = UpgradeSources::new(Arc::clone(&settings), Some(Arc::new(OfflineLink))).with_spotiflac(
+        Arc::new(crate::services::spotiflac::SpotiflacClient::new(settings)),
+    );
+    let f = Fixture::new().await;
+    let executor = f.executor(false, Some(Arc::new(OfflineLink)), Some(Arc::new(sources)));
+
+    let outcome = executor.apply(better_quality()).await.expect("an outcome");
+
+    assert_eq!(
+        outcome.code.as_deref(),
+        Some(LibraryActionCodes::MORNYE_CHECK),
+        "{outcome:?}"
+    );
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("Waiting for Mornye's check"),
+        "{outcome:?}"
+    );
+    assert!(f.queue.is_idle(), "nothing was asked");
+    assert!(Path::new(&f.original).exists());
 }
 
 #[tokio::test]

@@ -265,6 +265,170 @@ async fn parse_external_id_various_inputs_returns_expected() {
     }
 }
 
+// ---- One song id, several versions ------------------------------------------------------------
+
+fn version_of(recording: &str) -> Song {
+    Song {
+        music_brainz_recording_id: Some(recording.into()),
+        ..song("ext-soulseek-help", "Help!", Some("soulseek"), Some("help"))
+    }
+}
+
+fn kept_for(user: &str) -> Option<KeptHeart> {
+    Some(KeptHeart {
+        users: vec![user.into()],
+        ..Default::default()
+    })
+}
+
+/// Two people hearted one song id and heard two mixes: each kept file is its own mapping, and
+/// each person's lookup finds their own mix.
+#[tokio::test]
+async fn two_people_with_two_mixes_of_one_song_id_each_find_their_own() {
+    let f = Fixture::new().await;
+    let (mix_2009, mix_2015) = (f.path("Help 2009.flac"), f.path("Help 2015.flac"));
+    std::fs::write(&mix_2009, "2009").expect("write");
+    std::fs::write(&mix_2015, "2015").expect("write");
+    f.service
+        .register_downloaded_song_as(&version_of("rec-2009"), &mix_2009, kept_for("ana"))
+        .await
+        .expect("registered");
+    f.service
+        .register_downloaded_song_as(&version_of("rec-2015"), &mix_2015, kept_for("bo"))
+        .await
+        .expect("registered");
+
+    let mine = |user: &'static str| {
+        f.service
+            .get_local_path_for_external_song_as(Some(user), "soulseek", "help")
+    };
+    assert_eq!(mine("ana").await, Some(mix_2009.clone()));
+    assert_eq!(mine("bo").await, Some(mix_2015.clone()));
+    // Someone who kept neither gets no other person's mix; with nobody named, the newest.
+    assert_eq!(mine("cy").await, None);
+    assert_eq!(
+        f.service
+            .get_local_path_for_external_song("soulseek", "help")
+            .await,
+        Some(mix_2015)
+    );
+    let keys: Vec<String> = f.service.read(|map| map.keys().cloned().collect()).expect("read");
+    assert_eq!(
+        keys,
+        [
+            "soulseek:help#recording:rec-2009",
+            "soulseek:help#recording:rec-2015"
+        ]
+    );
+}
+
+/// A version kept for nobody in particular (an import, a download before hearts kept versions)
+/// is anyone's: a person with no version of their own finds it, and their own wins when there is
+/// one.
+#[tokio::test]
+async fn a_version_kept_for_nobody_is_anyones_and_a_persons_own_comes_first() {
+    let f = Fixture::new().await;
+    let (plain, theirs) = (f.path("Help.mp3"), f.path("Help heard.m4a"));
+    std::fs::write(&plain, "plain").expect("write");
+    std::fs::write(&theirs, "theirs").expect("write");
+    f.service
+        .register_downloaded_song(&version_of("rec-2009"), &plain)
+        .await
+        .expect("registered");
+    f.service
+        .register_downloaded_song_as(&version_of("rec-2015"), &theirs, kept_for("ana"))
+        .await
+        .expect("registered");
+
+    let mine = |user: &'static str| {
+        f.service
+            .get_local_path_for_external_song_as(Some(user), "soulseek", "help")
+    };
+    assert_eq!(mine("ana").await, Some(theirs));
+    assert_eq!(mine("bo").await, Some(plain));
+}
+
+/// The same version downloaded again replaces its own mapping, whatever key it was saved under,
+/// and a file that took another mapping's place on disk takes its mapping too: no song keeps two
+/// mappings of one file or one version.
+#[tokio::test]
+async fn the_same_version_again_replaces_its_mapping_and_never_doubles_it() {
+    let f = Fixture::new().await;
+    let (first, again) = (f.path("Help.mp3"), f.path("Help.flac"));
+    std::fs::write(&first, "mp3").expect("write");
+    std::fs::write(&again, "flac").expect("write");
+    // Saved as today's code saves it: the plain key, with its recording.
+    {
+        let mut cached = f.service.mappings.lock();
+        let map = f.service.loaded(&mut cached).expect("loaded");
+        map.set(
+            "soulseek:help".to_string(),
+            LocalSongMapping {
+                external_provider: "soulseek".into(),
+                external_id: "help".into(),
+                local_path: first.clone(),
+                music_brainz_recording_id: Some("rec-2009".into()),
+                ..Default::default()
+            },
+        );
+    }
+    f.service
+        .register_downloaded_song(&version_of("REC-2009"), &again)
+        .await
+        .expect("registered");
+
+    let mappings = f.service.get_mappings().await;
+    assert_eq!(mappings.len(), 1, "{mappings:?}");
+    assert_eq!(mappings[0].local_path, again);
+
+    // An unproven copy placed over that very file takes its place, mapping and all.
+    f.service
+        .register_downloaded_song(&song("x", "Help!", Some("soulseek"), Some("help")), &again)
+        .await
+        .expect("registered");
+    let mappings = f.service.get_mappings().await;
+    assert_eq!(mappings.len(), 1, "{mappings:?}");
+    assert_eq!(mappings[0].music_brainz_recording_id, None);
+}
+
+/// Today's mappings file loads as it is, every mapping under its own key: a second version of one
+/// of its songs is added beside it, and the file's own entries are written back unchanged.
+#[tokio::test]
+async fn todays_mappings_file_loads_unchanged_beside_a_second_version() {
+    let text = std::fs::read_to_string(FIXTURE).expect("the fixture is in the repo");
+    let f = Fixture::new().await;
+    std::fs::write(f.mappings_file(), &text).expect("copy the fixture");
+    let other = f.path("Svefn-g-englar (live).flac");
+    std::fs::write(&other, "live").expect("write");
+
+    f.service
+        .register_downloaded_song_as(
+            &Song {
+                music_brainz_recording_id: Some("live-take".into()),
+                ..song(
+                    "ext-soulseek-7YzXwVu6TsRq5PoN4mLk3J",
+                    "Svefn-g-englar",
+                    Some("soulseek"),
+                    Some("7YzXwVu6TsRq5PoN4mLk3J"),
+                )
+            },
+            &other,
+            kept_for("ana"),
+        )
+        .await
+        .expect("registered");
+
+    let before: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&text).expect("the fixture parses");
+    let after: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(f.mappings_file()).expect("written")).expect("parses");
+    for (key, entry) in &before {
+        assert_eq!(after.get(key), Some(entry), "{key} is written as it was");
+    }
+    assert!(after.contains_key("soulseek:7YzXwVu6TsRq5PoN4mLk3J#recording:live-take"));
+    assert_eq!(after.len(), before.len() + 1);
+}
+
 // ---- The .mappings.json contract and the rest of the interface -----------------------------
 
 /// The fixture is read and written back byte for byte, in its own key order.
@@ -642,6 +806,60 @@ async fn update_local_path_the_mapping_follows_a_moved_folder() {
     );
     let on_disk = std::fs::read_to_string(f.mappings_file()).expect("written");
     assert!(on_disk.contains("Bizarrap/Album/Session.flac"), "{on_disk}");
+}
+
+/// A batch of moves writes the mappings once, and each move sees the ones before it: a song
+/// moved from `A` to `B` and then on to `C` is found in `C`.
+#[tokio::test]
+async fn update_local_paths_saves_once_and_follows_each_move_in_order() {
+    let f = Fixture::new().await;
+    let song = |id: &str| Song {
+        title: format!("Song {id}"),
+        artist: "Artist".into(),
+        external_provider: Some("deezer".into()),
+        external_id: Some(id.into()),
+        ..Song::default()
+    };
+    let (a, b, c) = (f.path("Artist/A"), f.path("Artist/B"), f.path("Artist/C"));
+    // The files are where the moves put them.
+    std::fs::create_dir_all(&c).expect("made");
+    std::fs::create_dir_all(f.path("Other")).expect("made");
+    std::fs::write(format!("{c}/1.flac"), "moved").expect("written");
+    std::fs::write(f.path("Other/Two.flac"), "moved").expect("written");
+    f.service
+        .register_downloaded_song(&song("1"), &format!("{a}/1.flac"))
+        .await
+        .expect("registered");
+    f.service
+        .register_downloaded_song(&song("2"), &f.path("Other/2.flac"))
+        .await
+        .expect("registered");
+    let before = f.service.saves();
+
+    let moved = f
+        .service
+        .update_local_paths(&[
+            (a.clone(), b.clone()),
+            (b.clone(), c.clone()),
+            (f.path("Other/2.flac"), f.path("Other/Two.flac")),
+        ])
+        .await
+        .expect("saved");
+
+    assert_eq!(moved, 3);
+    assert_eq!(f.service.saves(), before + 1, "one write for the whole batch");
+    assert_eq!(
+        f.service.get_local_path_for_external_song("deezer", "1").await,
+        Some(format!("{c}/1.flac"))
+    );
+    assert_eq!(
+        f.service.get_local_path_for_external_song("deezer", "2").await,
+        Some(f.path("Other/Two.flac"))
+    );
+    let on_disk = std::fs::read_to_string(f.mappings_file()).expect("written");
+    assert!(on_disk.contains("Artist/C/1.flac"), "{on_disk}");
+    assert_eq!(f.service.update_local_paths(&[]).await.expect("nothing"), 0);
+    assert_eq!(f.service.saves(), before + 1);
 }
 
 // ---- Scans of one library ----

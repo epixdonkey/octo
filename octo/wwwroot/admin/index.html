@@ -256,6 +256,15 @@
           <div id="setup-checklist"></div>
         </details>
 
+        <!-- ─── Downloads: what Octo's checks by sound cannot do right now ─── -->
+        <div class="set-section download-checks" id="download-checks" hidden>
+          <div class="set-head">
+            <h3 class="set-title">Downloads</h3>
+            <p class="set-desc">How Octo checks a download by its sound before it keeps it.</p>
+          </div>
+          <div class="set-card" id="download-checks-list" aria-live="polite"></div>
+        </div>
+
         <div class="callout callout-accent" id="point-at-octo">
           <div class="callout-title">Point your music apps here</div>
           <p>In your Subsonic app, set the <strong>server address</strong> to Octo rather than to Navidrome.</p>
@@ -316,6 +325,16 @@
             <div class="status-card-body">Checking…</div>
             <div class="status-card-foot">slskd, downloads on heart</div>
           </article>
+          <article class="status-card" data-svc="mornye">
+            <div class="status-card-head">
+              <span class="status-card-mark"><svg class="icon" aria-hidden="true"><use href="#i-plugs-connected"/></svg></span>
+              <span class="status-card-title">Mornye (SpotiFLAC)</span>
+              <span class="status-dot pending"></span>
+            </div>
+            <div class="status-card-body">Checking…</div>
+            <button type="button" class="link-button status-card-action" data-status-action="spotiflac" hidden>Pass Mornye's check</button>
+            <div class="status-card-foot">Optional, songs Soulseek does not have</div>
+          </article>
           <article class="status-card" data-svc="lidarr">
             <div class="status-card-head">
               <span class="status-card-mark"><svg class="icon brand" aria-hidden="true"><use href="#b-lidarr"/></svg></span>
@@ -323,6 +342,7 @@
               <span class="status-dot pending"></span>
             </div>
             <div class="status-card-body">Checking…</div>
+            <div class="status-card-follows" id="lidarr-follows" hidden></div>
             <div class="status-card-foot">Optional, whole albums</div>
           </article>
           <article class="status-card" data-svc="ytDlpShim">
@@ -332,7 +352,7 @@
               <span class="status-dot pending"></span>
             </div>
             <div class="status-card-body">Checking…</div>
-            <div class="status-card-foot">Previews from YouTube</div>
+            <div class="status-card-foot">Songs from YouTube</div>
           </article>
           <article class="status-card" data-svc="sonic">
             <div class="status-card-head">
@@ -351,6 +371,15 @@
             </div>
             <div class="status-card-body">Checking…</div>
             <div class="status-card-foot">Optional, discovery and radio</div>
+          </article>
+          <article class="status-card" data-svc="catalog">
+            <div class="status-card-head">
+              <span class="status-card-mark"><svg class="icon" aria-hidden="true"><use href="#i-music-notes"/></svg></span>
+              <span class="status-card-title">Music catalog</span>
+              <span class="status-dot pending"></span>
+            </div>
+            <div class="status-card-body">Checking…</div>
+            <div class="status-card-foot">Albums, artists and song details</div>
           </article>
         </div>
 
@@ -458,11 +487,12 @@
             <h3 class="set-title">File layout</h3>
             <p class="set-desc">How downloaded songs are named and filed on disk.</p>
           </div>
-          <form data-section="subsonic-storage" class="set-card">
+          <form data-section="subsonic-storage" class="set-card" id="file-layout-form">
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t">Folder structure</div>
-                <div class="set-info-d">Flat is <code>Artist - Title.flac</code>, By artist is <code>Artist/Title.flac</code>, Organized is <code>Artist/Album/01 - Title.flac</code>.</div>
+                <div class="set-info-d">New songs follow it and join the folders already there. Names are made safe for Windows and network shares.</div>
+                <div class="set-info-more">Songs already in your library stay where they are. To move them into this layout, use <a href="#library-tidy" data-tidy-task="FileLayout">Tidy the library, File layout</a>.</div>
               </div>
               <div class="set-ctrl">
                 <div class="seg" data-seg-for="f-folder-structure"><span class="seg-thumb"></span></div>
@@ -470,8 +500,51 @@
                   <option value="Flat">Flat</option>
                   <option value="ByArtist">By artist</option>
                   <option value="Organized">Organized</option>
+                  <option value="Custom">Custom</option>
                 </select>
               </div>
+            </div>
+            <div class="notice notice-warn" id="layout-fallback" role="status" hidden></div>
+            <div class="notice notice-warn" id="layout-caps-problem" role="status" hidden></div>
+            <div class="set-row stack" data-layout-custom hidden>
+              <div class="set-info">
+                <div class="set-info-t" id="f-folder-template-label">Albums</div>
+                <div class="set-info-d">Names in braces are filled in for each song, and a <code>/</code> starts a folder.</div>
+              </div>
+              <textarea class="set-input layout-template" id="f-folder-template" name="Subsonic.FolderTemplate" rows="1" enterkeyhint="done" placeholder="{Artist}/{Album}/{Track:00} - {Title}" aria-labelledby="f-folder-template-label" aria-describedby="f-folder-template-error" spellcheck="false" autocomplete="off"></textarea>
+              <div class="field-error" id="f-folder-template-error" role="alert" hidden></div>
+            </div>
+            <div class="set-row stack" data-layout-custom hidden>
+              <div class="set-info"><div class="set-info-t" id="f-folder-template-singles-label">Singles</div></div>
+              <textarea class="set-input layout-template" id="f-folder-template-singles" name="Subsonic.FolderTemplateSingles" rows="1" enterkeyhint="done" aria-labelledby="f-folder-template-singles-label" aria-describedby="f-folder-template-singles-error" placeholder="Same as albums" spellcheck="false" autocomplete="off"></textarea>
+              <div class="field-error" id="f-folder-template-singles-error" role="alert" hidden></div>
+            </div>
+            <div class="set-row stack" data-layout-custom hidden>
+              <div class="set-info"><div class="set-info-t" id="f-folder-template-compilations-label">Compilations</div></div>
+              <textarea class="set-input layout-template" id="f-folder-template-compilations" name="Subsonic.FolderTemplateCompilations" rows="1" enterkeyhint="done" aria-labelledby="f-folder-template-compilations-label" aria-describedby="f-folder-template-compilations-error" placeholder="Same as albums" spellcheck="false" autocomplete="off"></textarea>
+              <div class="field-error" id="f-folder-template-compilations-error" role="alert" hidden></div>
+            </div>
+            <div class="set-row stack" data-layout-custom hidden>
+              <div class="set-info">
+                <div class="set-info-t">Names</div>
+                <div class="set-info-d">Pick one to add it where you are typing. A name with no value takes the brackets around it, so write <code>({Year})</code> or <code>[{Album Type}]</code>.</div>
+                <div class="set-info-more">From Lidarr: paste its artist folder format, a <code>/</code>, then its track format.</div>
+              </div>
+              <div class="layout-names" id="layout-names" role="group" aria-label="Names to add">
+                <button type="button" class="layout-name" data-layout-name="{Artist}">{Artist}</button>
+                <button type="button" class="layout-name" data-layout-name="{Album Artist}">{Album Artist}</button>
+                <button type="button" class="layout-name" data-layout-name="{Track Artist}">{Track Artist}</button>
+                <button type="button" class="layout-name" data-layout-name="{Album}">{Album}</button>
+                <button type="button" class="layout-name" data-layout-name="{Title}">{Title}</button>
+                <button type="button" class="layout-name" data-layout-name="{Track:00}">{Track:00}</button>
+                <button type="button" class="layout-name" data-layout-name="{Disc}">{Disc}</button>
+                <button type="button" class="layout-name" data-layout-name="{Year}">{Year}</button>
+                <button type="button" class="layout-name" data-layout-name="{Album Type}">{Album Type}</button>
+              </div>
+            </div>
+            <div class="set-row stack layout-example-row" id="layout-example-row">
+              <div class="set-info"><div class="set-info-t">Example</div></div>
+              <div class="layout-examples" id="layout-examples" aria-live="polite"></div>
             </div>
             <div class="set-row">
               <div class="set-info">
@@ -532,7 +605,7 @@
             <div class="set-row" data-stream-source="Lossless" hidden>
               <div class="set-info">
                 <div class="set-info-t">Lossless wait <span class="set-opt">seconds</span></div>
-                <div class="set-info-d">How long to wait before playing the YouTube preview instead. 0 waits as long as it takes.</div>
+                <div class="set-info-d">How long to wait before playing the song straight from YouTube instead. 0 waits as long as it takes.</div>
                 <div class="set-info-more">The lossless download carries on either way.</div>
               </div>
               <input class="set-input" id="f-lossless-wait-timeout" name="Subsonic.LosslessWaitTimeoutSeconds" type="number" min="0" />
@@ -726,8 +799,8 @@
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t">Keep playlists ready</div>
-                <div class="set-info-d">Picked playlists start right away in any app. Every song's preview is kept here, and the first few also download as FLAC.</div>
-                <div class="set-info-more">Checked every hour. Previews are kept even while nothing plays; the FLAC downloads follow Pause when nothing plays. Kept songs count toward Space to use.</div>
+                <div class="set-info-d">Picked playlists start right away in any app. Every song's YouTube stream is kept here, and the first few also download as FLAC.</div>
+                <div class="set-info-more">Checked every hour. The YouTube streams are kept even while nothing plays; the FLAC downloads follow Pause when nothing plays. Kept songs count toward Space to use.</div>
               </div>
               <div class="set-ctrl" id="keep-ready-person-wrap" hidden>
                 <select class="set-input kr-person" id="keep-ready-person" aria-label="Whose playlists"></select>
@@ -827,9 +900,17 @@
             </div>
             <div class="set-row">
               <div class="set-info">
+                <div class="set-info-t">Library only up to <span class="set-opt">songs</span></div>
+                <div class="set-info-d">A search asking for this many songs or fewer looks only in your library.</div>
+                <div class="set-info-more">Such a small search is usually an app searching as you type. Some apps ask for few songs on a finished search too, like the Music Assistant app with 10, and then never show songs you don't own: set it below their count, or to 0.</div>
+              </div>
+              <input class="set-input" id="f-search-library-only-up-to" name="Subsonic.SearchLibraryOnlyUpTo" type="number" min="0" max="100" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
                 <div class="set-info-t">Discovery for offline-search apps</div>
                 <div class="set-info-d">Adds your stations' songs you don't own yet to apps that search their own copy of your library.</div>
-                <div class="set-info-more">Apps like Symfonium copy your library to the phone and search only that copy, so their searches never reach Octo. With this on, the copy also holds your radio stations' songs you don't own yet: they show up in search, play as previews, and download when hearted. Run a full sync in the app to pick up changes.</div>
+                <div class="set-info-more">Apps like Symfonium copy your library to the phone and search only that copy, so their searches never reach Octo. With this on, the copy also holds your radio stations' songs you don't own yet: they show up in search, play straight from YouTube, and download when hearted. Run a full sync in the app to pick up changes.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-sync-catalog" name="Subsonic.EnableSyncCatalog" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -922,7 +1003,7 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title">Scrobbling</h3>
-            <p class="set-desc">Sends plays to each listener's own Last.fm: outside songs, such as previews and Continuous Radio, and your library songs too.</p>
+            <p class="set-desc">Sends plays to each listener's own Last.fm: outside songs, such as songs streamed from YouTube and Continuous Radio, and your library songs too.</p>
           </div>
           <form data-section="lastfm-scrobble" class="set-card">
             <div class="set-row">
@@ -993,7 +1074,7 @@
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t">Radio loudness target (LUFS)</div>
-                <div class="set-info-d">Every radio track is brought to this EBU R128 loudness before it joins the stream, so local files and previews play at one level. -16 suits headphones and speakers; -14 is what most streaming services use. 0 turns it off.</div>
+                <div class="set-info-d">Every radio track is brought to this EBU R128 loudness before it joins the stream, so local files and songs streamed from YouTube play at one level. -16 suits headphones and speakers; -14 is what most streaming services use. 0 turns it off.</div>
               </div>
               <input class="set-input" name="LastFm.RadioLoudnessTargetLufs" type="number" min="-23" max="0" />
             </div>
@@ -1243,6 +1324,14 @@
             </div>
             <div class="set-row">
               <div class="set-info">
+                <div class="set-info-t">Mornye could not pass its check</div>
+                <div class="set-info-d">Mornye's check paused its downloads. One message when its check stops passing, not one per song.</div>
+                <div class="set-info-more">It links to the Mornye page, where you can pass the check, when Octo's outside address is saved on Status. On by default.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-notify-mornye-check" name="Notifications.NotifyMornyeCheck" checked /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
                 <div class="set-info-t">Album completed</div>
                 <div class="set-info-d">One message per album: the songs fetched and how many are lossless.</div>
                 <div class="set-info-more">Per-song messages stay quiet while an album downloads.</div>
@@ -1483,16 +1572,30 @@
           </div>
         </div>
 
-        <div class="set-section" id="library-tidy">
+        <div class="set-section" id="library-tidy" data-spot="library-tidy">
           <div class="set-head">
-            <h3 class="set-title">Tidy artists</h3>
-            <p class="set-desc">New downloads are filed under their first artist, with one spelling per artist and guests listed in their own tag. This brings music already in your library in line. Nothing is written until you have seen a preview.</p>
+            <h3 class="set-title">Tidy the library</h3>
+            <p class="set-desc" id="library-tidy-desc">New downloads are filed under their first artist, with one spelling per artist and guests listed in their own tag. This brings music already in your library in line. Nothing is written until you have seen a preview.</p>
           </div>
           <div class="set-card">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t" id="library-tidy-task-title">What to tidy</div>
+                <div class="set-info-d" id="library-tidy-task-desc">Artists brings artist folders, spellings and guests in line. File layout moves and renames songs to match your File layout.</div>
+                <div class="set-info-d scope-hint" id="library-tidy-task-hint" role="status" hidden>You switched what to tidy. Preview again before applying.</div>
+              </div>
+              <div class="set-ctrl">
+                <div class="seg" data-seg-for="library-tidy-task"><span class="seg-thumb"></span></div>
+                <select id="library-tidy-task" class="seg-src" hidden aria-label="What to tidy">
+                  <option value="Artists">Artists</option>
+                  <option value="FileLayout">File layout</option>
+                </select>
+              </div>
+            </div>
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t">Which files</div>
-                <div class="set-info-d">Every file is read either way, because the spelling most of your library uses is the one that wins. Only downloads Octo made are changed, or the whole library, your own rips and purchases included.</div>
+                <div class="set-info-d"><span id="library-tidy-scope-desc">Every file is read either way, because the spelling most of your library uses is the one that wins. Only downloads Octo made are changed, or the whole library, your own rips and purchases included.</span></div>
                 <div class="set-info-more">The whole library asks you to type the music path to confirm.</div>
               </div>
               <select class="set-input" id="library-tidy-scope">
@@ -1508,11 +1611,11 @@
               </div>
               <textarea class="set-input" id="library-tidy-excluded" rows="3" spellcheck="false"></textarea>
             </div>
-            <div class="notice notice-warn">
+            <div class="notice notice-warn" id="library-tidy-notice">
               <strong>Back up your music folder first.</strong> Apply rewrites artist tags, waits for Navidrome to finish a scan that saw them, and only then moves whole album folders, so each song keeps its stars, plays and playlist entries. That needs Navidrome 0.55 or newer. A rename marked with a warning changes which artist Navidrome files the songs under, and stars and ratings on the old artist are lost for every user, so those rows only run when you tick them. Undo moves folders back and restores the artist tags.
             </div>
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Preview</div><div class="set-info-d">Reads every file and lists what would change and what is left alone, with the reason. Writes nothing. Folders whose songs say nothing are looked up on MusicBrainz, about one a second, so a large library may need a second preview to finish asking.</div></div>
+              <div class="set-info"><div class="set-info-t">Preview</div><div class="set-info-d" id="library-tidy-preview-note">Reads every file and lists what would change and what is left alone, with the reason. Writes nothing. Folders whose songs say nothing are looked up on MusicBrainz, about one a second, so a large library may need a second preview to finish asking.</div></div>
               <button class="btn btn-ghost" type="button" id="library-tidy-preview">Preview changes</button>
             </div>
             <div id="library-tidy-status" class="set-row stack"></div>
@@ -1520,10 +1623,11 @@
               <div class="set-info"><div class="set-info-t">Show</div></div>
               <select class="set-input" id="library-tidy-kind">
                 <option value="Changes">Every change</option>
-                <option value="Split">Folders split</option>
-                <option value="Respell">Spellings</option>
-                <option value="Rename">Renames that lose stars</option>
-                <option value="Guest">Guests</option>
+                <option value="Split" data-task="Artists">Folders split</option>
+                <option value="Respell" data-task="Artists">Spellings</option>
+                <option value="Rename" data-task="Artists">Renames that lose stars</option>
+                <option value="Guest" data-task="Artists">Guests</option>
+                <option value="Layout" data-task="FileLayout" hidden>Into the layout</option>
                 <option value="Skip">Left alone</option>
               </select>
             </div>
@@ -1596,7 +1700,7 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title">Sending plays</h3>
-            <p class="set-desc">Navidrome already sends plays from your own library. This covers previews and Continuous Radio.</p>
+            <p class="set-desc">Navidrome already sends plays from your own library. This covers songs streamed from YouTube and Continuous Radio.</p>
           </div>
           <form data-section="listenbrainz" class="set-card">
             <div class="set-row">
@@ -1963,8 +2067,8 @@
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-acoustid"/></svg>Verify downloads</div>
-                <div class="set-info-d">Fingerprints each Soulseek and YouTube download and asks AcoustID what it really is. Off by default.</div>
-                <div class="set-info-more"><p>Catches covers, karaoke versions, live takes and mislabelled compilation tracks, which all pass the length check. A peer that sends a different recording has that file remembered and never tried again.</p><p>A song AcoustID has never heard of is always kept. YouTube downloads are identified too but never rejected, since there is no second copy to try.</p></div>
+                <div class="set-info-d">Fingerprints each download and asks AcoustID what it really is. On by default.</div>
+                <div class="set-info-more"><p>Hearts and plays are always checked by their sound: a file that is not the recording you heard is refused, and Octo keeps the version you heard instead.</p><p>Other downloads: covers, karaoke versions, live takes and mislabeled compilation tracks are refused, a peer that sends a different recording is never tried again, a YouTube video AcoustID names as another recording is never used for that song again, and a song AcoustID has never heard of is kept and marked not proven.</p></div>
               </div>
               <label class="switch"><input type="checkbox" name="Soulseek.VerifyDownloads" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -1980,7 +2084,7 @@
               <div class="set-info">
                 <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-acoustid"/></svg>AcoustID API key</div>
                 <div class="set-info-d">Free from <a href="https://acoustid.org/new-application" target="_blank" rel="noopener">acoustid.org/new-application</a>.</div>
-                <div class="set-info-more">Without a key the fingerprint lookup is skipped; the length check and its memory of rejected files still work.</div>
+                <div class="set-info-more" id="acoustid-key-help">Octo's published images bring Octo's own key, used while this is blank; your own key takes its place. Type off to turn AcoustID off; the length check and its memory of rejected files still work.</div>
               </div>
               <input class="set-input" type="password" name="Soulseek.AcoustIdApiKey" autocomplete="new-password" />
             </div>
@@ -2159,7 +2263,7 @@
               <div class="set-info">
                 <div class="set-info-t">Write cover.jpg</div>
                 <div class="set-info-d">Also save the cover beside the file, full size, where Navidrome looks first.</div>
-                <div class="set-info-more">Only in the Organized layout, and only in a folder the download created. A cover.jpg Octo wrote gives way to a larger one later; one you put there never changes.</div>
+                <div class="set-info-more">Only in a folder the file layout gives each album alone (Organized, or a Custom layout with an album folder), and only in a folder the download created. A cover.jpg Octo wrote gives way to a larger one later; one you put there never changes.</div>
               </div>
               <label class="switch"><input type="checkbox" name="Metadata.WriteCoverFile" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -2461,7 +2565,7 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title" id="imp-lists-title">Your lists</h3>
-            <p class="set-desc">Open a list to see its songs. <strong>Stream without downloading</strong> shows the saved snapshot as a private playlist in Octo, including previews of missing songs. Heart a song to keep it. <strong>Keep as playlist</strong> makes a Navidrome playlist of the songs you have. <strong>Get missing songs</strong> separately queues downloads. Streaming snapshots are not updated from their source automatically.</p>
+            <p class="set-desc">Open a list to see its songs. <strong>Stream without downloading</strong> shows the saved snapshot as a private playlist in Octo, its missing songs streamed from YouTube. Heart a song to keep it. <strong>Keep as playlist</strong> makes a Navidrome playlist of the songs you have. <strong>Get missing songs</strong> separately queues downloads. Streaming snapshots are not updated from their source automatically.</p>
           </div>
           <div class="set-card imp-card imp-lists-card">
             <div id="imp-lists" aria-live="polite"></div>
@@ -2479,6 +2583,7 @@
               <div class="set-info">
                 <div class="set-info-t" id="imp-trickle-title">Nothing to fetch</div>
                 <div class="set-info-d" id="imp-trickle-line"></div>
+                <div class="set-info-d" id="imp-acoustid-key" hidden></div>
               </div>
               <div class="imp-actions">
                 <button class="btn" type="button" id="imp-retry" hidden>Try not found again</button>
@@ -2609,6 +2714,22 @@
         </div>
 
         <p class="set-desc health-foot">Copies a fix removes wait in the server's trash, where they can be put back from <button type="button" class="link-button" id="health-trash-link">Recently removed</button> under Library actions.</p>
+
+        <div class="set-section health-fetched">
+          <div class="set-head">
+            <h3 class="set-title">How a song was fetched</h3>
+            <p class="set-desc">Look up a song Octo downloaded to see how it was tagged: the release that won, its distance, the candidates it beat, where each tag came from, and the download log.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row stack">
+              <form class="set-inline" id="health-fetched-form" role="search">
+                <input class="set-input" id="health-fetched-q" type="search" placeholder="Title, artist or both" aria-label="Fetched song to look up" autocomplete="off" spellcheck="false" />
+                <button class="btn" type="submit"><svg class="icon" aria-hidden="true"><use href="#i-magnifying-glass"/></svg><span>Look up</span></button>
+              </form>
+            </div>
+          </div>
+          <div id="health-fetched-results" class="dl-list" aria-live="polite" hidden></div>
+        </div>
       </section>
 
       <section data-pane="libraryactions">
@@ -2703,7 +2824,7 @@
               <input class="set-input" name="LibraryActions.ReviewSweepAutoReplacePerDay" type="number" min="1" max="100" data-number="true" />
             </div>
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Also replace a song that sounds nothing like its YouTube preview</div><div class="set-info-d">For a sound AcoustID has never heard. Octo fetches the right song through Wrong song instead of asking. Off by default.</div><div class="set-info-more"><p>Only when the preview is a YouTube Music row with the song's title, artist and length, from the same album as the file and not a live album, and at least 42% of the file differs from it. A song with no tags, an ISRC tag, a star or a rating, anything the preview cannot settle, anything AcoustID does hear and the re-check of Octo's own downloads stay questions in Review.</p><p>Needs Wrong song on, dry run off, Keep the original after a replacement on and a download source other than YouTube alone (with Soulseek then YouTube, the replacement comes from Soulseek only), and counts toward the same limit a day as the replacing above. The new file is checked like any download, against the song's YouTube preview, and Review keeps a note of what was replaced.</p></div></div>
+              <div class="set-info"><div class="set-info-t">Also replace a song that sounds nothing like its YouTube stream</div><div class="set-info-d">For a sound AcoustID has never heard. Octo fetches the right song through Wrong song instead of asking. Off by default.</div><div class="set-info-more"><p>Only when the video is a YouTube Music row with the song's title, artist and length, from the same album as the file and not a live album, and at least 42% of the file differs from it. A song with no tags, an ISRC tag, a star or a rating, anything the YouTube stream cannot settle, anything AcoustID does hear and the re-check of Octo's own downloads stay questions in Review.</p><p>Needs Wrong song on, dry run off, Keep the original after a replacement on and a download source other than YouTube alone (with Soulseek then YouTube, the replacement comes from Soulseek only), and counts toward the same limit a day as the replacing above. The new file is checked like any download, against the song's YouTube stream, and Review keeps a note of what was replaced.</p></div></div>
               <label class="switch"><input type="checkbox" name="LibraryActions.ReviewSweepAutoReplacePreview" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
@@ -2722,7 +2843,7 @@
               <input class="set-input" name="LibraryActions.YoutubeCheckPerHour" type="number" min="0" max="360" data-number="true" />
             </div>
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Check every song against YouTube</div><div class="set-info-d" id="youtube-check-status">Compares the songs AcoustID cannot vouch for with their YouTube preview, once.</div><div class="set-info-more"><p>The same comparison a new download gets: songs AcoustID already vouches for are passed over quickly, and the rest are compared with their YouTube preview. A song that sounds nothing like a preview with its title, artist and length becomes a question in Review, or is added to a question AcoustID left open. Nothing is changed or removed, and nothing is uploaded.</p><p>Songs with no preview, or one that may be another version, are left alone, and a song is never asked twice. If the YouTube shim stops answering, the check rests an hour and carries on. Press the button again to forget the answers and compare everything anew.</p></div></div>
+              <div class="set-info"><div class="set-info-t">Check every song against YouTube</div><div class="set-info-d" id="youtube-check-status">Compares the songs AcoustID cannot vouch for with their YouTube stream, once.</div><div class="set-info-more"><p>The same comparison a new download gets: songs AcoustID already vouches for are passed over quickly, and the rest are compared with their YouTube stream. A song that sounds nothing like a YouTube video with its title, artist and length becomes a question in Review, or is added to a question AcoustID left open. Nothing is changed or removed, and nothing is uploaded.</p><p>Songs with no YouTube video, or one that may be another version, are left alone, and a song is never asked twice. If the YouTube shim stops answering, the check rests an hour and carries on. Press the button again to forget the answers and compare everything anew.</p></div></div>
               <div class="set-buttons">
                 <button class="btn btn-ghost" type="button" id="youtube-check-pause" hidden><span>Pause</span></button>
                 <button class="btn btn-ghost" type="button" id="youtube-check-start"><span>Check</span></button>
@@ -2989,7 +3110,7 @@
               <div class="set-info">
                 <label class="set-info-t" for="f-lidarr-webhook">Webhook password <span class="set-opt">optional</span></label>
                 <div class="set-info-d">Lets Lidarr tell Octo the moment it imports an album. Leave it blank to keep the webhook off.</div>
-                <div class="set-info-more">In Lidarr, open Settings, then Connect, and add a Webhook. Paste the address below as its URL, keep the method POST, type any user name and this password, and turn on On Release Import. A heart then hears about the import at once, and an album Lidarr imports after Octo stopped waiting for it is still added to your library.</div>
+                <div class="set-info-more">In Lidarr, open Settings, then Connect, and add a Webhook. Paste the address below as its URL, keep the method POST, type any user name and this password, and tick On Release Import, On Grab and On Health Restored. A heart then hears about the import at once, an album Lidarr imports after Octo stopped waiting for it is still added to your library, and a heart waiting for Lidarr's indexers goes on as soon as they can search again.</div>
               </div>
               <input class="set-input" id="f-lidarr-webhook" name="Lidarr.WebhookSecret" type="password" autocomplete="new-password" />
               <div class="callout-address">
@@ -3020,14 +3141,60 @@
 
         <div class="set-section">
           <div class="set-head">
+            <h3 class="set-title">Mornye now</h3>
+            <p class="set-desc">What Mornye answers right now, and whether its check lets songs through.</p>
+          </div>
+          <div class="set-card mornye-card" id="mornye-card">
+            <div class="set-row stack mornye-now">
+              <div class="mornye-head">
+                <span class="status-dot pending" id="mornye-dot" aria-hidden="true"></span>
+                <p class="mornye-title" id="mornye-title" role="status" aria-live="polite">Asking Mornye…</p>
+                <button type="button" class="btn btn-ghost btn-icon" id="mornye-refresh" aria-label="Ask Mornye again" title="Ask again"><svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg></button>
+              </div>
+              <ul class="test-checks mornye-findings" id="mornye-findings" hidden></ul>
+              <div class="mornye-actions" id="mornye-actions" hidden>
+                <button type="button" class="btn btn-primary" id="mornye-pass-open" hidden>Pass Mornye's check</button>
+                <a class="btn btn-ghost" id="mornye-open" target="_blank" rel="noopener noreferrer" title="Mornye's own page, in a new tab" hidden><svg class="icon" aria-hidden="true"><use href="#i-arrow-square-out"/></svg><span>Open Mornye</span></a>
+              </div>
+            </div>
+            <div class="set-row stack pass-panel" id="mornye-pass" hidden>
+              <div class="pass-head">
+                <h4 class="pass-title" id="mornye-pass-title" tabindex="-1">Pass Mornye's check</h4>
+                <button type="button" class="btn btn-ghost btn-sm" id="mornye-pass-close">Close</button>
+              </div>
+              <p class="pass-line" id="mornye-pass-line" role="status" aria-live="polite"></p>
+              <ul class="test-checks" id="mornye-pass-notes" hidden></ul>
+              <div class="pass-live" id="mornye-pass-live" hidden>
+                <div class="pass-zoom" id="mornye-pass-zoom" role="group" aria-labelledby="mornye-pass-zoom-label">
+                  <span class="pass-zoom-label" id="mornye-pass-zoom-label">Zoom</span>
+                  <button type="button" data-zoom="1" aria-pressed="true"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span>1×</span></button>
+                  <button type="button" data-zoom="2" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span>2×</span></button>
+                  <button type="button" data-zoom="3" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span>3×</span></button>
+                  <button type="button" data-zoom="4" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span>4×</span></button>
+                </div>
+                <div class="pass-box" id="mornye-pass-box" data-zoom="1">
+                  <img id="mornye-pass-frame" alt="Mornye's check, live" draggable="false" hidden />
+                  <span class="pass-wait" id="mornye-pass-wait">Waiting for Mornye's browser…</span>
+                </div>
+              </div>
+              <p class="pass-note" id="mornye-pass-note" role="alert" hidden></p>
+              <div class="pass-actions" id="mornye-pass-actions" hidden>
+                <button type="button" class="btn" id="mornye-pass-retry"><span>Try again</span></button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
             <h3 class="set-title">What you bring</h3>
             <p class="set-desc">Set these up in Mornye first, then test the connection below.</p>
           </div>
           <div class="set-card">
             <ol class="bring-list">
-              <li><span class="bring-t">Mornye with its web page on</span><span class="bring-d">Started with <code>mornye --web --host 0.0.0.0</code>, or the optional <code>spotiflac</code> service in Octo's <code>docker-compose.yml</code>, which builds and runs Mornye. An older SpotiFLAC works too.</span></li>
+              <li><span class="bring-t">Mornye with its web page on</span><span class="bring-d">Started with <code>mornye --web --host 0.0.0.0</code>, or the optional <code>spotiflac</code> service in Octo's <code>docker-compose.yml</code>, which runs Mornye 1.0.5 from its published image. An older SpotiFLAC works too.</span></li>
               <li><span class="bring-t">Your extension registry and an extension</span><span class="bring-d">Mornye has none of its own. Give it the registry you choose in <code>SPOTIFLAC_REGISTRIES</code>. Mornye installs every extension it lists by itself, when it starts and again every hour.</span></li>
-              <li><span class="bring-t">A web token</span><span class="bring-d">Set <code>SPOTIFLAC_WEB_TOKEN</code> (Mornye's own name: <code>MORNYE_WEB_TOKEN</code>) and type the same token here, so nobody else can use it.</span></li>
+              <li><span class="bring-t">A web token</span><span class="bring-d">Set <code>SPOTIFLAC_WEB_TOKEN</code> (Mornye's own name: <code>MORNYE_WEB_TOKEN</code>) and type the same token here, so nobody else can use it. With Octo's <code>spotiflac</code> service, it also lets you pass Mornye's check from this page.</span></li>
               <li><span class="bring-t">Octo's music folder, shared</span><span class="bring-d">Mornye saves into a hidden folder inside Octo's music folder, so it needs that folder mounted. If its path differs in Mornye, set it under More settings.</span></li>
             </ol>
           </div>
@@ -3204,7 +3371,7 @@
         </header>
 
         <div class="info-card">
-          <p>Octo sits in front of your Navidrome library and adds discovery and downloads to it. Search shows songs you don't own beside your own. Radio on any song finds more through Last.fm and plays previews from YouTube. Heart a song you don't own and Octo fetches it through Soulseek, YouTube or your own Lidarr.</p>
+          <p>Octo sits in front of your Navidrome library and adds discovery and downloads to it. Search shows songs you don't own beside your own. Radio on any song finds more through Last.fm and plays them straight from YouTube. Heart a song you don't own and Octo fetches it through Soulseek, YouTube or your own Lidarr.</p>
         </div>
 
         <div class="info-card" id="update-card" tabindex="-1">

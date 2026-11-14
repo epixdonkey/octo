@@ -179,6 +179,11 @@ pub struct Song {
     /// (song)", "YouTube Music (video)", "YouTube"). Never stored.
     #[serde(skip)]
     pub suggested_by: Option<String>,
+
+    /// What the file layout's names were filled from when the download was placed, carried to
+    /// the library's record of it. Never serialized here.
+    #[serde(skip)]
+    pub layout_values: Option<Box<crate::common::LayoutValues>>,
 }
 
 impl Song {

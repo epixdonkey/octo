@@ -19,6 +19,9 @@ use crate::services::local::{DownloadHistoryService, ILocalLibraryService};
 use crate::services::notifications::NotificationService;
 use crate::services::subsonic::NavidromeIdentityService;
 
+/// How the test catalog's album ids start; the rest is the album's own id.
+pub(crate) const TEST_ALBUM: &str = "test-album:";
+
 /// What the transfer does with the song: correct it the way a backend would, and say where the
 /// file landed.
 pub(crate) type Landing = Arc<dyn Fn(&mut Song, &str) -> String + Send + Sync>;
@@ -29,6 +32,11 @@ pub(crate) type Landing = Arc<dyn Fn(&mut Song, &str) -> String + Send + Sync>;
 pub(crate) struct TestBackend {
     pub landing: Mutex<Option<Landing>>,
     pub transfers: AtomicUsize,
+    /// What the download's own gates say of a file that landed for someone else while it waited:
+    /// None judges nothing, else each gate accepts it (true) or refuses it (false).
+    pub landed_verdict: Mutex<Option<bool>>,
+    /// The files of the song the download's gates judged that way.
+    pub judged: Mutex<Vec<String>>,
 }
 
 impl TestBackend {
@@ -65,8 +73,28 @@ impl DownloadBackend for TestBackend {
         }
     }
 
-    fn extract_external_id_from_album_id(&self, _: &str) -> Option<String> {
-        None
+    /// An album id the test catalog gives as `test-album:<id>`.
+    fn extract_external_id_from_album_id(&self, album_id: &str) -> Option<String> {
+        album_id.strip_prefix(TEST_ALBUM).map(str::to_string)
+    }
+
+    async fn judge_landed(
+        &self,
+        _: &BaseDownloadService,
+        download: &mut TrackDownload,
+        path: &str,
+    ) -> Option<bool> {
+        let passes = (*self.landed_verdict.lock())?;
+        self.judged.lock().push(path.to_string());
+        for gate in &download.gates {
+            let outcome = if passes {
+                crate::services::common::GateOutcome::Accepted
+            } else {
+                crate::services::common::GateOutcome::NotAccepted("another version".into())
+            };
+            download.ledger.record(&gate.user, gate.origin, outcome);
+        }
+        Some(passes)
     }
 }
 

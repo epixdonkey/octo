@@ -19,6 +19,7 @@ use octo_core::models::download::{AcquisitionCandidate, AcquisitionEvent, Acquis
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
+use super::SoulseekHoldStore;
 use crate::services::framework::DotnetDictionary;
 use crate::services::library::NavidromeSongPathResolver;
 use crate::services::local::ILocalLibraryService;
@@ -78,6 +79,8 @@ pub mod acquisition_kinds {
     pub const UPGRADE: &str = "upgrade";
     /// The one copy someone picked from Find songs.
     pub const PICK: &str = "pick";
+    /// A hearted album's own row, whatever its state: no one song, so nothing to find songs for.
+    pub const ALBUM: &str = "album";
 }
 
 pub use octo_core::models::download::acquisition_event::acquisition_event_kinds;
@@ -114,6 +117,15 @@ pub struct AcquisitionSnapshot {
     pub log_lines: i32,
     /// The log itself, oldest first; only [`AcquisitionTracker::detail`] fills it in.
     pub events: Option<Vec<AcquisitionEvent>>,
+    /// The row waits in a hold whose heard audio the person may keep anyway. A person's list sets
+    /// it for them alone, from the holds they wait in.
+    pub keep_anyway: bool,
+    /// How many held tracks a hearted album's row holds, filled in from the holds when a person's
+    /// list is read; None on every other row.
+    pub held_tracks: Option<i32>,
+    /// The row's copy plays from where it waits aside for Lidarr's download of its artist: it is
+    /// still waiting, whatever its state says.
+    pub waits_aside: bool,
 }
 
 /// How a row ended. `library_id` is set only for a song Navidrome showed; `album_keys` are
@@ -244,11 +256,33 @@ struct Entry {
 
     /// This run found the file already in the library rather than downloading it.
     already_there: bool,
+
+    /// A hold record of this acquisition is live: the row never expires and never falls to the
+    /// cap until [`AcquisitionTracker::release_row`] finds none left.
+    held: bool,
+
+    /// The hold offers to keep the heard audio anyway.
+    keep_anyway: bool,
+
+    /// The line this run's row keeps once it is done: what was kept and why.
+    done_line: Option<String>,
+
+    /// The line the row says over its own while its copy waits aside for Lidarr, and the last line
+    /// it keeps when that wait ended with something worth saying.
+    aside_line: Option<String>,
+
+    /// The row's copy waits aside: the row never expires and never falls to the cap meanwhile.
+    aside: bool,
 }
 
 impl Entry {
     fn finished(&self) -> bool {
         matches!(self.state, AcquisitionState::Done | AcquisitionState::Failed)
+    }
+
+    /// The row waits for work, so time never takes it: a hold, or a copy waiting aside.
+    fn waits(&self) -> bool {
+        self.held || self.aside
     }
 }
 
@@ -472,6 +506,217 @@ impl AcquisitionTracker {
             add(entry, now, acquisition_event_kinds::QUEUED, text, None, None);
         }
         prune(&mut state, now);
+    }
+
+    /// An acquisition entered the hold path: its row is opened (or reopened), set searching with
+    /// `note` as its line, given these owners, and held, so it never expires and never falls to
+    /// the cap while a hold record of it lives. `keep_anyway` offers to keep the heard audio.
+    pub fn hold_row(
+        &self,
+        provider: &str,
+        external_id: &str,
+        owners: &[String],
+        note: &str,
+        keep_anyway: bool,
+    ) {
+        self.hold_row_of(provider, external_id, owners, note, keep_anyway, None);
+    }
+
+    /// [`Self::hold_row`] for a hearted album's own row, which says it is an album's
+    /// ([`acquisition_kinds::ALBUM`]) from then on, in every state it reaches.
+    pub fn hold_album_row(
+        &self,
+        provider: &str,
+        album_id: &str,
+        owners: &[String],
+        note: &str,
+        keep_anyway: bool,
+    ) {
+        self.hold_row_of(
+            provider,
+            album_id,
+            owners,
+            note,
+            keep_anyway,
+            Some(acquisition_kinds::ALBUM),
+        );
+    }
+
+    fn hold_row_of(
+        &self,
+        provider: &str,
+        external_id: &str,
+        owners: &[String],
+        note: &str,
+        keep_anyway: bool,
+        kind: Option<&str>,
+    ) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let now = self.now();
+        let mut state = self.state.lock();
+        let fresh = state
+            .entries
+            .get(&key_of(provider, external_id))
+            .is_none_or(Entry::finished);
+        let entry = open(&mut state, provider, external_id, true, now);
+        if let Some(kind) = kind {
+            entry.kind = kind.to_string();
+        }
+        union_owners(&mut entry.owners, owners);
+        entry.state = AcquisitionState::Searching;
+        entry.progress = None;
+        entry.held = true;
+        entry.keep_anyway = keep_anyway;
+        let note = Some(note.trim().to_string()).filter(|n| !n.is_empty());
+        if fresh || entry.note != note {
+            add(
+                entry,
+                now,
+                acquisition_event_kinds::NOTE,
+                note.as_deref().unwrap_or("Waiting"),
+                None,
+                None,
+            );
+        }
+        entry.note = note;
+        entry.updated_at = now;
+        prune(&mut state, now);
+    }
+
+    /// The one line this run's row says if it ends done (what was kept, and why): shown and
+    /// logged when it does, never when it fails. Nothing for a row already finished or not there.
+    pub fn done_line(&self, provider: &str, external_id: &str, line: &str) {
+        let line = Some(line.trim().to_string()).filter(|line| !line.is_empty());
+        self.update(provider, external_id, false, |entry| entry.done_line = line);
+    }
+
+    /// Lets the row of an acquisition go back to the usual rules once `holds` keeps no record of
+    /// it, whatever it waited for; a record still there keeps it held.
+    pub fn release_row(&self, provider: &str, external_id: &str, holds: &SoulseekHoldStore) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let still_held = holds.snapshot().iter().any(|record| {
+            eq_ignore_case(record.provider.trim(), provider.trim()) && record.external_id == external_id
+        });
+        if still_held {
+            return;
+        }
+        let mut state = self.state.lock();
+        if let Some(entry) = state.entries.get_mut(&key_of(provider, external_id)) {
+            entry.held = false;
+            entry.keep_anyway = false;
+        }
+    }
+
+    /// `user` took back their heart of an acquisition nothing holds or fetches any more: they
+    /// leave its row, which goes once nobody is left on it. A row still held for someone, or one
+    /// that finished, stays as it is.
+    pub fn leave_row(&self, provider: &str, external_id: &str, user: &str) {
+        if blank(provider) || blank(external_id) || blank(user) {
+            return;
+        }
+        let key = key_of(provider, external_id);
+        let mut state = self.state.lock();
+        let Some(entry) = state.entries.get_mut(&key) else {
+            return;
+        };
+        if entry.held || entry.finished() {
+            return;
+        }
+        entry.owners.retain(|owner| !eq_ignore_case(owner, user.trim()));
+        if entry.owners.is_empty() {
+            state.entries.remove(&key);
+        }
+    }
+
+    /// A held acquisition runs again: its row leaves the line it waited with at once and shows
+    /// the search, while its record keeps the row from being pruned until the run ends.
+    pub fn resume_row(&self, provider: &str, external_id: &str) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let now = self.now();
+        let mut state = self.state.lock();
+        if let Some(entry) = state.entries.get_mut(&key_of(provider, external_id))
+            && !entry.finished()
+        {
+            entry.state = AcquisitionState::Searching;
+            entry.progress = None;
+            entry.note = None;
+            entry.updated_at = now;
+        }
+    }
+
+    /// The line a row shows now, for tests.
+    #[cfg(test)]
+    pub fn note_of(&self, provider: &str, external_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .entries
+            .get(&key_of(provider, external_id))
+            .and_then(|entry| entry.note.clone())
+    }
+
+    /// Whether the row of this acquisition is held.
+    pub fn is_held(&self, provider: &str, external_id: &str) -> bool {
+        self.state
+            .lock()
+            .entries
+            .get(&key_of(provider, external_id))
+            .is_some_and(|entry| entry.held)
+    }
+
+    /// The song's copy plays from where it waits aside (for Lidarr's download of its artist): the
+    /// row says `line` over its own, running or done, given these owners, and never expires while
+    /// the copy waits. A row a restart left out comes back done with that line.
+    pub fn wait_aside(&self, provider: &str, external_id: &str, owners: &[String], line: &str) {
+        if blank(provider) || blank(external_id) || blank(line) {
+            return;
+        }
+        let now = self.now();
+        let mut state = self.state.lock();
+        let fresh = state.entries.get(&key_of(provider, external_id)).is_none();
+        let entry = open(&mut state, provider, external_id, false, now);
+        if fresh {
+            entry.state = AcquisitionState::Done;
+        }
+        union_owners(&mut entry.owners, owners);
+        let line = line.trim().to_string();
+        if entry.aside_line.as_deref() != Some(line.as_str()) {
+            add(entry, now, acquisition_event_kinds::NOTE, &line, None, None);
+        }
+        entry.aside_line = Some(line);
+        entry.aside = true;
+        entry.updated_at = now;
+        prune(&mut state, now);
+    }
+
+    /// The song's copy no longer waits aside: the row says its own line again, or keeps `last`
+    /// as its last line (logged once), and goes back to the usual rules.
+    pub fn end_aside(&self, provider: &str, external_id: &str, last: Option<&str>) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let now = self.now();
+        let mut state = self.state.lock();
+        let Some(entry) = state.entries.get_mut(&key_of(provider, external_id)) else {
+            return;
+        };
+        if !entry.aside && last.is_none() {
+            return;
+        }
+        entry.aside = false;
+        entry.aside_line = last
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string);
+        if let Some(line) = entry.aside_line.clone() {
+            add(entry, now, acquisition_event_kinds::NOTE, &line, None, None);
+        }
+        entry.updated_at = now;
     }
 
     /// A star on an album was accepted. Its tracks are listed as the walk reaches them.
@@ -848,6 +1093,36 @@ impl AcquisitionTracker {
         self.raise(ended);
     }
 
+    /// A heart that ended with nothing says `why` on its row: a row left looking for a source
+    /// fails with it, and a row that already failed says `why` instead of what it failed with. A
+    /// row with a file on its way, or one that landed, keeps its line.
+    pub fn ended_with_nothing(&self, provider: &str, external_id: &str, why: &str) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let key = key_of(provider, external_id);
+        let looking = {
+            let now = self.now();
+            let mut state = self.state.lock();
+            let Some(entry) = state.entries.get_mut(&key) else {
+                return;
+            };
+            match entry.state {
+                AcquisitionState::Failed => {
+                    entry.error = Some(why.to_string());
+                    entry.updated_at = now;
+                    add(entry, now, acquisition_event_kinds::NOTE, why, None, None);
+                    false
+                }
+                AcquisitionState::Queued | AcquisitionState::Searching => !entry.finished(),
+                _ => false,
+            }
+        };
+        if looking {
+            self.fail(provider, external_id, Some(why));
+        }
+    }
+
     /// Fail every track of a hearted album that is still running.
     pub fn fail_album(&self, provider: &str, album_id: &str, error: Option<&str>) {
         let keys = {
@@ -1137,7 +1412,7 @@ impl AcquisitionTracker {
             entry.state = AcquisitionState::Done;
             entry.progress = None;
             entry.error = None;
-            entry.note = None;
+            entry.note = entry.done_line.clone();
             if let Some(library_id) = library_id.filter(|l| !blank(l)) {
                 entry.library_id = Some(library_id.to_string());
             }
@@ -1154,6 +1429,9 @@ impl AcquisitionTracker {
                 not_shown,
                 None,
             );
+            if let Some(line) = entry.done_line.clone() {
+                add(entry, now, acquisition_event_kinds::NOTE, &line, None, None);
+            }
             end_of(&state, key)
         };
         self.raise(ended);
@@ -1295,6 +1573,7 @@ fn open<'a>(
         entry.error = None;
         entry.library_id = None;
         entry.note = None;
+        entry.done_line = None;
         entry.kind = acquisition_kinds::DOWNLOAD.to_string();
         entry.quality = None;
         entry.peer = None;
@@ -1302,6 +1581,10 @@ fn open<'a>(
         entry.events.clear();
         entry.path = None;
         entry.already_there = false;
+        entry.held = false;
+        entry.keep_anyway = false;
+        entry.aside_line = None;
+        entry.aside = false;
     } else {
         state.entries.set(
             key.clone(),
@@ -1332,6 +1615,11 @@ fn open<'a>(
                 logged_source: None,
                 path: None,
                 already_there: false,
+                held: false,
+                keep_anyway: false,
+                done_line: None,
+                aside_line: None,
+                aside: false,
             },
         );
     }
@@ -1364,14 +1652,18 @@ fn end_of(state: &State, key: &str) -> Option<AcquisitionEnd> {
     })
 }
 
-/// Drop what has expired, then the oldest past the cap. Caller holds the lock.
+/// Drop what has expired, then the oldest past the cap. A held row, one whose copy waits aside,
+/// and the album claim a held row is listed under, never go: they wait for work, not for time.
+/// Caller holds the lock.
 fn prune(state: &mut State, now: DateTime<Utc>) {
     let expired: Vec<String> = state
         .entries
         .iter()
         .filter(|(_, entry)| {
             let age = now - entry.updated_at;
-            if entry.finished() {
+            if entry.waits() {
+                false
+            } else if entry.finished() {
                 age >= AcquisitionTracker::FINISHED_RETENTION
             } else {
                 age >= AcquisitionTracker::STALLED_RETENTION
@@ -1382,10 +1674,17 @@ fn prune(state: &mut State, now: DateTime<Utc>) {
     for key in expired {
         state.entries.remove(&key);
     }
+    let held: std::collections::HashSet<&str> = state
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.held)
+        .map(|(key, _)| key.as_str())
+        .collect();
     let stale: Vec<String> = state
         .albums
         .iter()
         .filter(|(_, claim)| now - claim.updated_at >= AcquisitionTracker::STALLED_RETENTION)
+        .filter(|(_, claim)| !claim.track_keys.iter().any(|key| held.contains(key.as_str())))
         .map(|(key, _)| key.clone())
         .collect();
     for key in stale {
@@ -1399,6 +1698,7 @@ fn prune(state: &mut State, now: DateTime<Utc>) {
     let mut order: Vec<(bool, DateTime<Utc>, String)> = state
         .entries
         .iter()
+        .filter(|(_, entry)| !entry.waits())
         .map(|(key, entry)| (!entry.finished(), entry.updated_at, key.clone()))
         .collect();
     order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -1464,13 +1764,16 @@ fn snapshot(entry: &Entry, ahead: Option<i32>, with_events: bool) -> Acquisition
         error: entry.error.clone(),
         library_id: entry.library_id.clone(),
         ahead,
-        note: entry.note.clone(),
+        note: entry.aside_line.clone().or_else(|| entry.note.clone()),
         key: key_of(&entry.provider, &entry.external_id),
         kind: entry.kind.clone(),
         quality: entry.quality.clone(),
         peer: entry.peer.clone(),
         log_lines: entry.events.len() as i32,
         events: with_events.then(|| entry.events.clone()),
+        keep_anyway: entry.held && entry.keep_anyway,
+        held_tracks: None,
+        waits_aside: entry.aside,
     }
 }
 

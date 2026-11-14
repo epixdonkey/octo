@@ -5,7 +5,7 @@
 //! after a delete, `apply` answers `Err`.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 
 use super::duplicate_fixer::DuplicateFixer;
 use super::library_action_journal::{
-    DeniedSource, LibraryActionEntry, LibraryActionJournal, LibraryActionState, action_name,
+    DeniedSource, LibraryActionEntry, LibraryActionJournal, LibraryActionState, PICK_SUFFIX, action_name,
 };
 use super::library_action_quarantine::LibraryActionQuarantine;
 use super::navidrome_song_path_resolver::get_full_path;
@@ -36,19 +36,23 @@ use super::rejections::RejectionStore;
 use super::replacement_handoff::{
     BeforeReveal, OnRevealed, ReplacementHandoff, ReplacementRejectedException,
 };
-use super::upgrade_sources::UpgradeSources;
+use super::upgrade_queue::{KEPT_BUSY, KeptFor, KeptRechecks, MornyeHold, OriginalSound};
+use super::upgrade_sources::{SourcesOut, UpgradeSources};
 use super::{NavidromeSongPathResolver, ResolvedSongFile};
 use crate::services::common::download_picks::AnywaySong;
-use crate::services::common::{StarOnArrival, TrackAcquisitionQueue};
+use crate::services::common::{SoundDeny, StarOnArrival, TrackAcquisitionQueue};
 use crate::services::cover_art::{CoverUpgradeWorker, RejectedCovers};
+use crate::services::fingerprint::acoust_id_rate_limiter::LookupClass;
+use crate::services::fingerprint::heard_master_check::{HeardAudio, HeardMasterCheck};
 use crate::services::library::library_tag_edits::{self, song_tag_fields};
 use crate::services::library::replacement_handoff::ArrivedTags;
-use crate::services::local::ILocalLibraryService;
+use crate::services::local::{ILocalLibraryService, LocalSongMapping};
 use crate::services::lyrics::{LyricsChoiceService, LyricsService, LyricsSidecarWriter};
 use crate::services::soulseek::soulseek_link::{OFFLINE_TEXT, SoulseekLinkState};
 use crate::services::soulseek::{
     ExternalIdRegistry, ISoulseekLink, RejectedPeerRegistry, SoulseekMetadataService,
 };
+use octo_core::fingerprint::heart_gate::HeardMaster;
 
 /// Told the provider and external id of the replacement download the moment it is queued, so the
 /// upgrade queue can follow that download's progress.
@@ -72,6 +76,10 @@ pub struct LibraryActionRequest {
     /// Better quality for a copy someone picked and said to take whatever its quality: the song
     /// the replacement is held to, and no quality check on it.
     pub anyway: Option<AnywaySong>,
+    /// A Wrong version for a copy someone picked in Find songs after Octo could not tell their
+    /// song's version apart by sound: the copy is fetched as it is, and refused only when it is
+    /// the very master of the song's file.
+    pub picked: bool,
 }
 
 impl LibraryActionRequest {
@@ -85,6 +93,7 @@ impl LibraryActionRequest {
             only_a_copy: false,
             only_source: None,
             anyway: None,
+            picked: false,
         }
     }
 
@@ -115,6 +124,10 @@ pub struct LibraryActionOutcome {
 
     /// For a replacement that went in: where the original waits in quarantine.
     pub quarantine_path: Option<String>,
+
+    /// For a request Mornye's check keeps: the pause, so a caller waits for that pause's own end
+    /// or its checks passing.
+    pub mornye_wait: Option<Box<octo_core::spotiflac::check::CheckPause>>,
 }
 
 impl LibraryActionOutcome {
@@ -155,8 +168,38 @@ impl LibraryActionCodes {
     /// slskd is not logged in to Soulseek, so a replacement could only fail.
     pub const SOULSEEK_OFFLINE: &'static str = "soulseekOffline";
 
+    /// Mornye is the only source that could look (slskd is not set up) and it is not answering
+    /// or cannot download, so the request waits like an outage, until it answers again.
+    pub const MORNYE_OUT: &'static str = "mornyeOut";
+
     /// The search found no copy good enough to replace the song with.
     pub const NO_REPLACEMENT: &'static str = "noReplacement";
+
+    /// Mornye's check keeps it from every extension (and slskd cannot be used either), so the
+    /// request waits like an outage, until a source can be asked again.
+    pub const MORNYE_CHECK: &'static str = "mornyeCheck";
+
+    /// The sources that were asked had no copy and Mornye's check kept the song from Mornye, so
+    /// the request waits until Mornye may try its check again.
+    pub const MORNYE_KEPT: &'static str = "mornyeKept";
+
+    /// The request waits on Mornye's check, either way.
+    pub fn waits_on_mornye(code: Option<&str>) -> bool {
+        matches!(code, Some(Self::MORNYE_CHECK | Self::MORNYE_KEPT))
+    }
+}
+
+/// The words of a request waiting for a Mornye that is not answering or cannot download.
+const MORNYE_OUT_TEXT: &str =
+    "Mornye is not answering or cannot download, and no other source can look for this song now.";
+
+/// The words of a request waiting for Mornye's check.
+fn mornye_wait_text(pause: &octo_core::spotiflac::check::CheckPause) -> String {
+    format!(
+        "Waiting for Mornye's check, which it could not pass for {}; it allows its next try at {}.",
+        octo_core::spotiflac::check::names_list(pause.shared()),
+        octo_core::spotiflac::check::until_words(pause.until_utc, Utc::now())
+    )
 }
 
 /// Navidrome shows this id at this file. Tests set it; otherwise the resolver.
@@ -216,6 +259,12 @@ pub struct LibraryActionExecutorParts {
     pub answers: Option<SongAnswers>,
 }
 
+/// A copy for a file a heart kept that its gate could not judge now: the replacement stops, and
+/// the kept file waits for its next check.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("the copy could not be judged now")]
+struct KeptUpgradeWaits;
+
 /// How a replacement ended: the outcome, where the original waits, and the new file.
 struct Replaced {
     outcome: LibraryActionOutcome,
@@ -268,6 +317,11 @@ pub struct LibraryActionExecutor {
     seams: Mutex<ExecutorSeams>,
     /// Library health's duplicate fix, which Fix duplicates hands each request to.
     fixer: OnceLock<Arc<dyn DuplicateFixer>>,
+    /// What a file a heart kept is replaced by: only a copy that heart's own gate passes. Also what
+    /// a Wrong song's or Wrong version's original sounds like.
+    kept: OnceLock<Arc<KeptRechecks>>,
+    /// Whether a copy is the very master of a library file, window by window.
+    master: OnceLock<Arc<HeardMasterCheck>>,
     /// The library's version check, which Check version hands each request to.
     version_checker: OnceLock<Arc<dyn super::version_check::VersionChecker>>,
     /// What the last Check version requests found, newest first.
@@ -408,6 +462,12 @@ impl LibraryActionExecutor {
         "Navidrome kept it as the same song, so its plays, favorites and playlist places stayed with it.";
     pub const HISTORY_LOST_TEXT: &'static str =
         "Navidrome took it for a new song, so its plays and playlist places stayed with the old entry.";
+    /// A Wrong version whose original AcoustID cannot tell apart from another mix: nothing is
+    /// downloaded, and the person picks the copy they want.
+    pub const WRONG_VERSION_FIND_SONGS: &'static str = "Octo cannot tell this version apart by sound. Open Find songs on this song and pick the copy you want";
+    /// A copy picked for a Wrong version that is the very master of the file it was to replace.
+    pub const SAME_AS_REJECTED: &'static str =
+        "This copy is the same recording as the one you said is the wrong version";
 
     pub fn new(parts: LibraryActionExecutorParts) -> Self {
         LibraryActionExecutor {
@@ -428,6 +488,8 @@ impl LibraryActionExecutor {
             reconciled: AtomicBool::new(false),
             busy: Mutex::new(HashSet::new()),
             fixer: OnceLock::new(),
+            kept: OnceLock::new(),
+            master: OnceLock::new(),
             version_checker: OnceLock::new(),
             version_checks: Mutex::new(std::collections::VecDeque::new()),
             seams: Mutex::new(ExecutorSeams::default()),
@@ -446,6 +508,18 @@ impl LibraryActionExecutor {
     /// Hands every Fix duplicates request to Library health's duplicate fix.
     pub fn use_duplicate_fixer(&self, fixer: Arc<dyn DuplicateFixer>) {
         let _ = self.fixer.set(fixer);
+    }
+
+    /// Judges every Better quality of a file a heart kept by that heart's own gate, and reads what
+    /// a Wrong song's or Wrong version's original sounds like. Once only.
+    pub fn use_kept_rechecks(&self, kept: Arc<KeptRechecks>) {
+        let _ = self.kept.set(kept);
+    }
+
+    /// Compares a copy picked for a Wrong version with the song's own file, window by window.
+    /// Once only.
+    pub fn use_master(&self, master: Arc<HeardMasterCheck>) {
+        let _ = self.master.set(master);
     }
 
     /// Hands every Check version request to the library's version check.
@@ -642,8 +716,12 @@ impl LibraryActionExecutor {
             return Ok(self.answer(&request, &resolved, settings.dry_run).await);
         }
 
-        let fingerprint =
+        let mut fingerprint =
             LibraryActionJournal::fingerprint(resolved.size_bytes, last_write_ticks(&resolved.absolute_path));
+        // A pick is an action of its own: never the Wrong version already answered on this file.
+        if request.picked {
+            fingerprint.push_str(PICK_SUFFIX);
+        }
         if self
             .journal
             .already_applied(request.action, &request.navidrome_id, &fingerprint)
@@ -701,11 +779,30 @@ impl LibraryActionExecutor {
             let sources = self.sources_for(request.action, request.only_source).await;
             let replacing = request.action != LibraryAction::BetterQuality;
             if sources.is_empty() && (replacing || self.waiting_for_soulseek().await) {
-                return Ok(LibraryActionOutcome::coded(
-                    LibraryActionState::Failed,
-                    OFFLINE_TEXT,
-                    Some(LibraryActionCodes::SOULSEEK_OFFLINE),
-                ));
+                let out = match &self.sources {
+                    Some(sources) => sources.waiting_for().await,
+                    None => None,
+                };
+                return Ok(match out {
+                    Some(SourcesOut::MornyeCheck(pause)) => LibraryActionOutcome {
+                        mornye_wait: Some(Box::new(pause.clone())),
+                        ..LibraryActionOutcome::coded(
+                            LibraryActionState::Failed,
+                            mornye_wait_text(&pause),
+                            Some(LibraryActionCodes::MORNYE_CHECK),
+                        )
+                    },
+                    Some(SourcesOut::Mornye) => LibraryActionOutcome::coded(
+                        LibraryActionState::Failed,
+                        MORNYE_OUT_TEXT,
+                        Some(LibraryActionCodes::MORNYE_OUT),
+                    ),
+                    _ => LibraryActionOutcome::coded(
+                        LibraryActionState::Failed,
+                        OFFLINE_TEXT,
+                        Some(LibraryActionCodes::SOULSEEK_OFFLINE),
+                    ),
+                });
             }
             if sources.is_empty() {
                 return Ok(LibraryActionOutcome::said(
@@ -1181,12 +1278,91 @@ impl LibraryActionExecutor {
         key: &str,
         music_root: &str,
     ) -> Replaced {
+        // A Wrong song or a Wrong version is decided by what the original's own sound says, read
+        // once before anything is downloaded: what it clearly is, or for a Wrong song the song it
+        // is, is refused again. A Wrong version AcoustID cannot tell apart from another mix, or
+        // does not know at all, downloads nothing; the person picks the copy they want in Find
+        // songs.
+        let mut deny = None;
+        if matches!(
+            request.action,
+            LibraryAction::WrongSong | LibraryAction::WrongVersion
+        ) && !request.picked
+        {
+            match self.original_sound(request, original).await {
+                OriginalSound::Clear(recording) => deny = Some(SoundDeny::Recordings(recording)),
+                OriginalSound::Ambiguous(song) if request.action == LibraryAction::WrongSong => {
+                    deny = Some(SoundDeny::Song(song));
+                }
+                OriginalSound::Ambiguous(_) | OriginalSound::Unknown | OriginalSound::Empty
+                    if request.action == LibraryAction::WrongVersion =>
+                {
+                    info!(
+                        "Library action {}: AcoustID cannot tell '{} - {}' apart from another version; nothing is downloaded",
+                        action_name(request.action),
+                        original.artist,
+                        original.title
+                    );
+                    return Replaced {
+                        outcome: LibraryActionOutcome::said(
+                            LibraryActionState::Skipped,
+                            Self::WRONG_VERSION_FIND_SONGS,
+                        ),
+                        quarantine_path: None,
+                        new_path: None,
+                        arrived: None,
+                    };
+                }
+                // Not answered is not an answer: the action stays open for its next try.
+                OriginalSound::Busy => {
+                    return Replaced {
+                        outcome: LibraryActionOutcome::said(LibraryActionState::Failed, KEPT_BUSY),
+                        quarantine_path: None,
+                        new_path: None,
+                        arrived: None,
+                    };
+                }
+                _ => {}
+            }
+        }
         if request.action == LibraryAction::WrongSong
             && let Some(denied) = self.blacklist_source(original, request).await
         {
             // Kept on the action's entry, so Put back lifts exactly this denial.
             self.journal.set_denied_source(key, denied);
         }
+
+        // A file a heart kept (as heard, or anyway) is replaced only by a copy proven against it:
+        // its own gate, from what it remembers of that heart, is the one every candidate meets.
+        let kept = match (request.action, self.kept.get()) {
+            (LibraryAction::BetterQuality, Some(kept)) => {
+                kept.gate_for(&original.absolute_path, &request.username).await
+            }
+            _ => KeptFor::NotKept,
+        };
+        let kept_gate = match kept {
+            KeptFor::NotKept => None,
+            KeptFor::Gate(gate) => Some(*gate),
+            KeptFor::Nothing(why) => {
+                info!(
+                    "Library action {}: nothing is tried for the kept {}: {why}",
+                    action_name(request.action),
+                    original.absolute_path
+                );
+                // AcoustID not answering leaves the action open for its next try.
+                let state = if why == KEPT_BUSY {
+                    LibraryActionState::Failed
+                } else {
+                    LibraryActionState::Skipped
+                };
+                return Replaced {
+                    outcome: LibraryActionOutcome::said(state, why),
+                    quarantine_path: None,
+                    new_path: None,
+                    arrived: None,
+                };
+            }
+        };
 
         // Read while the original is in place: Navidrome built this song's ids from these tags.
         let identity = KeptIdentityTags::read(
@@ -1205,9 +1381,14 @@ impl LibraryActionExecutor {
             started_last_write: last_write_ticks(&original.absolute_path),
             quarantine_path: Mutex::new(None),
             any_quality: request.anyway.is_some(),
+            forgotten: Mutex::new(Vec::new()),
+            picked: request.picked,
         });
         // What each source tried before the last one said, for the words when all of them miss.
         let mut misses: Vec<String> = Vec::new();
+        // Mornye's check keeping the song on a source before the last: the request still waits
+        // for it when the last source has no copy either.
+        let mut kept_by_mornye: Option<crate::services::spotiflac::MornyeWaiting> = None;
         let earlier = |misses: &[String]| {
             if misses.is_empty() {
                 String::new()
@@ -1274,10 +1455,12 @@ impl LibraryActionExecutor {
             // `download_song_internal` hands back a file it has a mapping for instead of
             // fetching. The handoff skips that, so only a download without one needs this.
             if handoff.is_none() {
-                self.library
+                let forgotten = self
+                    .library
                     .forget_mapping(&original.absolute_path)
                     .await
                     .map_err(Arc::new)?;
+                admission.forgotten.lock().extend(forgotten);
             }
 
             // In order, and on to the next when one finds nothing or its copy fails the checks:
@@ -1291,13 +1474,32 @@ impl LibraryActionExecutor {
                 .record_requested_by
                 .then_some(request.username.as_str());
             let mut attempt = 0;
+            // The file a replacement's check left waiting for AcoustID's bulk turn, with the labels
+            // of a file Lidarr brought.
+            let mut waiting: Vec<String> = Vec::new();
+            let mut waiting_lidarr = Vec::new();
             loop {
                 let Some(&source) = sources.get(attempt) else {
                     return Err(Arc::new(anyhow::anyhow!(
                         "Index was out of range. Must be non-negative and less than the size of the collection. (Parameter 'index')"
                     )));
                 };
-                let completion = self.acquisitions.enqueue(
+                // A replacement is work nobody waits on: its file's check takes the bulk turn, and
+                // waits for it in the one hold path rather than keeping the download worker. A file
+                // a heart kept is replaced only by a copy that heart's own gate passes.
+                let completion = self.acquisitions.enqueue_denying(
+                    deny.clone(),
+                    Some(match &kept_gate {
+                        Some(_) => octo_core::fingerprint::heart_gate::AcquisitionOrigin::Heart,
+                        None => octo_core::fingerprint::heart_gate::AcquisitionOrigin::Replacement,
+                    }),
+                    kept_gate.iter().cloned().collect(),
+                    crate::services::common::HeldFiles::of(
+                        std::mem::take(&mut waiting),
+                        std::mem::take(&mut waiting_lidarr),
+                    ),
+                    &crate::services::common::AcquisitionTarget::Shared,
+                    false,
                     SoulseekMetadataService::PROVIDER_NAME,
                     &external_id,
                     true,
@@ -1309,7 +1511,35 @@ impl LibraryActionExecutor {
                     upgrade_search,
                     handoff.clone(),
                 );
-                match completion.wait().await {
+                let outcome = completion.wait().await;
+                // A file a heart kept is never held for: a copy its gate cannot judge now (AcoustID
+                // or MusicBrainz not answering) is thrown away, and the next check tries again.
+                if kept_gate.is_some()
+                    && let Err(e) = &outcome
+                    && let Some(held) = e.downcast_ref::<crate::services::common::AcquisitionHeld>()
+                {
+                    for file in &held.files {
+                        try_delete(file);
+                    }
+                    return Err(Arc::new(anyhow::Error::new(KeptUpgradeWaits)));
+                }
+                // Its file waits in the one hold path for AcoustID's bulk turn: once the lane gives
+                // turns again, the same source goes on with that file.
+                if let Err(e) = &outcome
+                    && let Some(held) = e.downcast_ref::<crate::services::common::AcquisitionHeld>()
+                    && self.acquisitions.wait_for_turn().await
+                {
+                    info!(
+                        "Library action {}: the copy of '{} - {}' waited for AcoustID; going on with it",
+                        action_name(request.action),
+                        original.artist,
+                        original.title
+                    );
+                    waiting = held.files.clone();
+                    waiting_lidarr = held.lidarr.clone();
+                    continue;
+                }
+                match outcome {
                     Ok(path) => return Ok(Some(path)),
                     Err(e)
                         if attempt + 1 < sources.len()
@@ -1319,14 +1549,24 @@ impl LibraryActionExecutor {
                         let why = is_rejected(&e)
                             .map(|rejected| rejected.problem.clone())
                             .unwrap_or_else(|| e.to_string());
-                        let word = UpgradeSources::word(source.unwrap_or(DownloadSource::Soulseek));
+                        if let Some(wait) = crate::services::spotiflac::mornye_waited(&e) {
+                            kept_by_mornye = Some(wait.clone());
+                        }
+                        let word_of = |source: Option<DownloadSource>| {
+                            let source = source.unwrap_or(DownloadSource::Soulseek);
+                            match &self.sources {
+                                Some(sources) => sources.step_word(source),
+                                None => UpgradeSources::word(source),
+                            }
+                        };
+                        let word = word_of(source);
                         misses.push(format!("{word}: {why}"));
                         info!(
                             "Library action {}: {word} had no copy of '{} - {}' ({why}); trying {}",
                             action_name(request.action),
                             original.artist,
                             original.title,
-                            UpgradeSources::word(sources[attempt + 1].unwrap_or(DownloadSource::Soulseek))
+                            word_of(sources[attempt + 1])
                         );
                         attempt += 1;
                     }
@@ -1339,15 +1579,38 @@ impl LibraryActionExecutor {
         let quarantine_path = || admission.quarantine_path.lock().clone();
         let replacement = match attempt {
             Ok(replacement) => replacement.unwrap_or_default(),
+            Err(e) if e.downcast_ref::<KeptUpgradeWaits>().is_some() => {
+                // Nothing moved: the kept file stays as it is, with the outside songs it had.
+                let forgotten = std::mem::take(&mut *admission.forgotten.lock());
+                if !forgotten.is_empty()
+                    && let Err(e) = self
+                        .library
+                        .restore_mappings(&forgotten, &original.absolute_path)
+                        .await
+                {
+                    warn!(
+                        "The outside songs of {} could not be linked to it again: {e}",
+                        original.absolute_path
+                    );
+                }
+                info!(
+                    "Library action {}: the copy for the kept {} could not be judged now; it waits for the next check",
+                    action_name(request.action),
+                    original.absolute_path
+                );
+                // No words, and nothing that counts as done: the next check runs it again.
+                return Replaced {
+                    outcome: LibraryActionOutcome::new(LibraryActionState::Failed, None),
+                    quarantine_path: None,
+                    new_path: None,
+                    arrived: None,
+                };
+            }
             Err(e) => {
                 if let Some(rejected) = is_rejected(&e) {
                     // Refused before it was ever in the library; the original never moved.
                     self.log_refused(request, original, &rejected.problem);
-                    return Replaced::failed(format!(
-                        "The replacement {}, so nothing changed.{}",
-                        rejected.problem,
-                        earlier(&misses)
-                    ));
+                    return Replaced::failed(Self::refused_words(&rejected.problem, &earlier(&misses)));
                 }
                 if let Some(revealed) = handoff.as_ref().and_then(|h| h.revealed_path()) {
                     // The replacement already took the original's place and only the bookkeeping
@@ -1372,6 +1635,29 @@ impl LibraryActionExecutor {
                         quarantine_path: quarantined,
                         new_path: Some(revealed),
                         arrived: handoff.as_ref().and_then(|h| h.arrived()),
+                    };
+                }
+                // Mornye's check kept the copy from Mornye, on this source or one before it, and no
+                // source had one: the request waits for Mornye's next try instead of reading as
+                // "no copy found".
+                let wait = crate::services::spotiflac::mornye_waited(&e)
+                    .cloned()
+                    .or_else(|| kept_by_mornye.clone().filter(|_| is_file_not_found(&e)));
+                if quarantine_path().is_none()
+                    && let Some(wait) = wait
+                {
+                    return Replaced {
+                        outcome: LibraryActionOutcome {
+                            mornye_wait: Some(Box::new(wait.pause.clone())),
+                            ..LibraryActionOutcome::coded(
+                                LibraryActionState::Failed,
+                                mornye_wait_text(&wait.pause),
+                                Some(LibraryActionCodes::MORNYE_KEPT),
+                            )
+                        },
+                        quarantine_path: None,
+                        new_path: None,
+                        arrived: None,
                     };
                 }
                 // A search that found nothing usable reports not found, passed through the queue
@@ -1420,7 +1706,7 @@ impl LibraryActionExecutor {
                     if !replacement.is_empty() {
                         try_delete(&replacement);
                     }
-                    return Replaced::failed(format!("The replacement {late}, so nothing changed."));
+                    return Replaced::failed(Self::refused_words(&late, ""));
                 }
                 Err(e) => {
                     // Any other failure after the download.
@@ -1666,6 +1952,20 @@ impl LibraryActionExecutor {
         }
     }
 
+    /// Whether a wait on Mornye's check may end before its pause does (see
+    /// [`UpgradeSources::mornye_wait_over`]).
+    pub async fn mornye_wait_over(&self, hold: &MornyeHold) -> bool {
+        match &self.sources {
+            Some(sources) => sources.mornye_wait_over(&hold.url, &hold.labels).await,
+            None => true,
+        }
+    }
+
+    /// slskd is in use, by [`UpgradeSources::slskd_in_use_with`] on this executor's link.
+    pub fn slskd_in_use(&self, soulseek: &octo_core::settings::SoulseekSettings) -> bool {
+        UpgradeSources::slskd_in_use_with(soulseek, self.soulseek_link.as_deref())
+    }
+
     async fn soulseek_out(&self) -> bool {
         match &self.soulseek_link {
             Some(link) => link
@@ -1764,6 +2064,50 @@ impl LibraryActionExecutor {
                     "{detail} The original could not be put back automatically and is in the quarantine folder."
                 ),
             )
+        }
+    }
+
+    /// What a Wrong song's or Wrong version's original says it is by its own sound: a person's
+    /// action asks on the person's lane, any other on the bulk lane. Nothing is known without the
+    /// kept-file checks, which read it.
+    async fn original_sound(
+        &self,
+        request: &LibraryActionRequest,
+        original: &ResolvedSongFile,
+    ) -> OriginalSound {
+        let Some(kept) = self.kept.get() else {
+            return OriginalSound::Unread;
+        };
+        let class = if request.credential.is_some() {
+            LookupClass::Person
+        } else {
+            LookupClass::Bulk
+        };
+        kept.original_sound(&original.absolute_path, original.duration_seconds, class)
+            .await
+    }
+
+    /// Whether `candidate` is the very master of the library file `original`, window by window,
+    /// both ways. False when it cannot be told.
+    async fn is_original_master(&self, candidate: &str, original: &str) -> bool {
+        let Some(master) = self.master.get() else {
+            return false;
+        };
+        matches!(
+            master
+                .check_once(HeardAudio::File(PathBuf::from(original)), Path::new(candidate))
+                .await,
+            HeardMaster::Same
+        )
+    }
+
+    /// The words a refused replacement ends with: the reason as a sentence about it, or a copy
+    /// picked for a Wrong version that is the very master refused, in the words for that.
+    fn refused_words(problem: &str, earlier: &str) -> String {
+        if problem == Self::SAME_AS_REJECTED {
+            Self::SAME_AS_REJECTED.to_string()
+        } else {
+            format!("The replacement {problem}, so nothing changed.{earlier}")
         }
     }
 
@@ -1874,6 +2218,11 @@ struct Admission {
     quarantine_path: Mutex<Option<String>>,
     /// The person said to take the replacement whatever its quality.
     any_quality: bool,
+    /// The outside songs the original was mapped as, forgotten before a download that could not
+    /// carry its identity: saved with the original once it is in the trash.
+    forgotten: Mutex<Vec<LocalSongMapping>>,
+    /// A copy picked for a Wrong version: refused when it is the original's very master.
+    picked: bool,
 }
 
 impl Admission {
@@ -1909,6 +2258,14 @@ impl Admission {
         }
         if problem.is_some() {
             return Ok(problem);
+        }
+        // The person said the original is the wrong version: their pick must not be its master.
+        if self.picked
+            && executor
+                .is_original_master(candidate, &self.original.absolute_path)
+                .await
+        {
+            return Ok(Some(LibraryActionExecutor::SAME_AS_REJECTED.to_string()));
         }
         let now = std::fs::metadata(&self.original.absolute_path)
             .ok()
@@ -1946,10 +2303,18 @@ impl Admission {
         executor.journal.flush();
         // Only now that the original is out: a refused replacement leaves it with its
         // mapping, and so with the record of who sent it.
-        executor
-            .library
-            .forget_mapping(&self.original.absolute_path)
-            .await?;
+        let mut forgotten = std::mem::take(&mut *self.forgotten.lock());
+        forgotten.extend(
+            executor
+                .library
+                .forget_mapping(&self.original.absolute_path)
+                .await?,
+        );
+        // Saved with the original, so Put back gives it its outside songs again, a kept-as-heard
+        // file's heart with them.
+        if let Some(trashed) = moved.quarantine_path.as_deref() {
+            executor.quarantine.record_mappings(trashed, &forgotten);
+        }
         Ok(None)
     }
 

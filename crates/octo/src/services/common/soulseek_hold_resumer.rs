@@ -2,37 +2,112 @@
 
 use std::sync::Arc;
 
+use octo_core::fingerprint::heart_gate::WaitingFor;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use super::heart_acquisition_coordinator::waits_for_a_person;
 use super::{HeartAcquisitionCoordinator, HeldKind, SoulseekHoldStore};
+use crate::services::prefetch::HeardSamples;
 
-/// Picks up the hearts a restart interrupted while they waited for Soulseek.
+/// Picks up the held acquisitions a restart interrupted, and resumes a held one when what it
+/// waits for arrives.
 pub struct SoulseekHoldResumer {
     store: Arc<SoulseekHoldStore>,
     hearts: Arc<HeartAcquisitionCoordinator>,
+    /// The heard samples: at start the holds take their copies again and the shim's holds wait
+    /// for a round.
+    heard: Option<Arc<HeardSamples>>,
 }
 
 impl SoulseekHoldResumer {
     pub fn new(store: Arc<SoulseekHoldStore>, hearts: Arc<HeartAcquisitionCoordinator>) -> Self {
-        SoulseekHoldResumer { store, hearts }
+        SoulseekHoldResumer {
+            store,
+            hearts,
+            heard: None,
+        }
     }
 
-    /// Starts every held chain again and finishes at once.
+    /// The same resumer, with the heard samples' start work.
+    pub fn with_heard(mut self, heard: Arc<HeardSamples>) -> Self {
+        self.heard = Some(heard);
+        self
+    }
+
+    /// Runs the held acquisition `key` again now: one acquisition, each other holder joining
+    /// with their own gate.
+    pub fn resume(self: &Arc<Self>, key: &str) {
+        self.hearts.resume_held(key);
+    }
+
+    /// Runs again now every held acquisition that waits for `waiting_for`.
+    pub fn resume_waiting(self: &Arc<Self>, waiting_for: WaitingFor) {
+        for record in self
+            .store
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.waiting_for == Some(waiting_for))
+        {
+            self.hearts.resume_held(&record.key());
+        }
+    }
+
+    /// Starts every held chain again and finishes at once. A heart waiting out a Soulseek outage
+    /// keeps its saved start, so its deadline stays; every other hold gets its downloads row back
+    /// (held, with its line and its holders) and runs again. A keep a person asked for before the
+    /// restart is carried out first. The holds a person waits on ("not yet proven" hearts and held
+    /// album tracks) are then checked again once each, oldest first, one at a time, at the AcoustID
+    /// lane's lowest place; files kept as heard are never checked at start.
     pub async fn run(self: Arc<Self>, _stopping: CancellationToken) -> anyhow::Result<()> {
+        // Every live hold holds its heard copies again, and saved copy holds no hold names go;
+        // a hold that waits on the shim joins the round queue instead of running now.
+        if let Some(heard) = &self.heard {
+            heard.rehold_copies();
+            heard.rejoin_holds();
+        }
         let held = self.store.snapshot();
         if !held.is_empty() {
-            info!(
-                "Resuming {} downloads that were waiting for Soulseek before the restart",
-                held.len()
-            );
+            info!("Resuming {} held downloads after the restart", held.len());
         }
+        let mut waiting_on_people = Vec::new();
+        // Keeps saved before the restart, of holds that wait for the shim's round or for a person.
+        let mut keeps = Vec::new();
         for entry in held {
-            if entry.kind == HeldKind::Album {
-                self.hearts.resume_album(entry);
-            } else {
-                self.hearts.resume_track(entry);
+            let keeping = !entry.keep_requested.is_empty();
+            match (entry.waiting_for, entry.kind) {
+                (None, HeldKind::Album) => self.hearts.resume_album(entry),
+                (None, HeldKind::Track) => self.hearts.resume_track(entry),
+                (Some(WaitingFor::Shim), _) if self.heard.is_some() => {
+                    self.hearts.hold_row_for(&entry);
+                    if keeping {
+                        keeps.push(entry.key());
+                    }
+                }
+                (Some(_), _) if waits_for_a_person(&entry) => {
+                    self.hearts.hold_row_for(&entry);
+                    if keeping {
+                        keeps.push(entry.key());
+                    }
+                    waiting_on_people.push(entry.key());
+                }
+                // It runs again now, its saved keeps first.
+                (Some(_), _) => {
+                    self.hearts.hold_row_for(&entry);
+                    self.hearts.resume_held(&entry.key());
+                }
             }
+        }
+        if !keeps.is_empty() || !waiting_on_people.is_empty() {
+            let hearts = self.hearts.clone();
+            tokio::spawn(async move {
+                hearts.finish_keeps(keeps).await;
+                hearts.recheck_at_start(waiting_on_people).await;
+            });
+        }
+        // Octo's start is one of the shim's round events.
+        if let Some(heard) = &self.heard {
+            heard.shim_event();
         }
         Ok(())
     }

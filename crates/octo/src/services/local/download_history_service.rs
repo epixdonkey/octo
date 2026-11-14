@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use chrono::{DateTime, TimeDelta, Utc};
+use octo_core::common::SongIdentity;
 use octo_core::models::download::acquisition_event::acquisition_event_kinds;
 use octo_core::models::download::{AcquisitionEvent, DownloadHistoryEntry};
 use parking_lot::Mutex;
@@ -21,6 +22,9 @@ pub struct DownloadHistoryService {
     cache: Mutex<Option<Vec<DownloadHistoryEntry>>>,
     /// [`Self::MAX_LOG_BYTES`], smaller in tests.
     log_room: AtomicI64,
+    /// How many times the history was written (tests count them).
+    #[cfg(test)]
+    saves: std::sync::atomic::AtomicUsize,
 }
 
 impl DownloadHistoryService {
@@ -44,6 +48,8 @@ impl DownloadHistoryService {
             path: path.as_ref().to_path_buf(),
             cache: Mutex::new(None),
             log_room: AtomicI64::new(Self::MAX_LOG_BYTES),
+            #[cfg(test)]
+            saves: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -87,6 +93,16 @@ impl DownloadHistoryService {
         list.iter()
             .find(|e| e.key.as_deref() == Some(key) && downloaded_at.is_none_or(|at| e.downloaded_at == at))
             .cloned()
+    }
+
+    /// The entry written at this moment, as listed (DownloadedAt), or None.
+    pub fn find_written(&self, downloaded_at: &str) -> Option<DownloadHistoryEntry> {
+        if octo_core::common::dotnet::is_blank(downloaded_at) {
+            return None;
+        }
+        let mut cache = self.cache.lock();
+        let list = self.load_locked(&mut cache);
+        list.iter().find(|e| e.downloaded_at == downloaded_at).cloned()
     }
 
     /// When an entry was written, from its DownloadedAt; None when that does not read.
@@ -185,19 +201,33 @@ impl DownloadHistoryService {
     /// Follow a folder the library tidy moved, so a fetched song's row names where it is now.
     /// Answers how many entries followed.
     pub fn move_paths(&self, from: &str, to: &str) -> usize {
+        self.move_paths_batch(&[(from.to_string(), to.to_string())])
+    }
+
+    /// [`Self::move_paths`] for each `(from, to)` in order, so `a` to `b` then `b` to `c` ends at
+    /// `c`, saved once. Answers how many entries followed, each move counted on its own.
+    pub fn move_paths_batch(&self, moves: &[(String, String)]) -> usize {
         let mut cache = self.cache.lock();
         let list = self.load_locked(&mut cache);
         let mut moved = 0;
-        for entry in list.iter_mut() {
-            if let Some(now) = octo_core::common::PathHelper::moved_path(&entry.path, from, to) {
-                entry.path = now;
-                moved += 1;
+        for (from, to) in moves {
+            for entry in list.iter_mut() {
+                if let Some(now) = octo_core::common::PathHelper::moved_path(&entry.path, from, to) {
+                    entry.path = now;
+                    moved += 1;
+                }
             }
         }
         if moved > 0 {
             self.save_locked(list);
         }
         moved
+    }
+
+    /// How many times the history was written (tests count them).
+    #[cfg(test)]
+    pub(crate) fn saves(&self) -> usize {
+        self.saves.load(Ordering::SeqCst)
     }
 
     /// Append a fetched-song entry (newest first) and persist.
@@ -214,6 +244,31 @@ impl DownloadHistoryService {
         let mut cache = self.cache.lock();
         let list = self.load_locked(&mut cache);
         list.iter().take(limit.max(0) as usize).cloned().collect()
+    }
+
+    /// The entries whose artist, title, album or file path hold every word of `text`, ignoring
+    /// case, accents and full-width forms ([`SongIdentity::plain`]), newest first, at most
+    /// `limit`. Searches every kept entry, not only the newest that the Fetched songs list
+    /// shows. Blank text finds nothing.
+    pub fn search(&self, text: &str, limit: usize) -> Vec<DownloadHistoryEntry> {
+        let plain = SongIdentity::plain(text);
+        let words: Vec<&str> = plain.split_whitespace().collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
+        let mut cache = self.cache.lock();
+        let list = self.load_locked(&mut cache);
+        list.iter()
+            .filter(|entry| {
+                let album = entry.album.as_deref().unwrap_or_default();
+                let said = SongIdentity::plain(
+                    &[entry.artist.as_str(), &entry.title, album, &entry.path].join("\n"),
+                );
+                words.iter().all(|word| said.contains(word))
+            })
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     fn load_locked<'a>(
@@ -238,6 +293,8 @@ impl DownloadHistoryService {
     }
 
     fn save_locked(&self, list: &[DownloadHistoryEntry]) {
+        #[cfg(test)]
+        self.saves.fetch_add(1, Ordering::SeqCst);
         // Written without nulls: a saved log's copies are mostly missing figures, and the file
         // has to stay small enough to read whole.
         if let Err(e) = state_file::save_atomic(&self.path, &octo_core::json::to_string_without_nulls(list)) {
@@ -300,6 +357,51 @@ mod tests {
         assert!(service.get_recent(-5).is_empty());
     }
 
+    /// Three moves in one batch are one write, and each move sees the ones before it: a song in
+    /// `a` that moves to `b` and then on to `c` ends in `c`.
+    #[test]
+    fn a_batch_of_moves_is_saved_once_and_follows_each_move_in_order() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("downloads-history.json");
+        let service = DownloadHistoryService::new(&path);
+        for (title, at) in [
+            ("One", "/m/a/1.flac"),
+            ("Two", "/m/b/2.flac"),
+            ("Three", "/m/x/3.flac"),
+        ] {
+            service.record(DownloadHistoryEntry {
+                path: at.into(),
+                ..entry(title)
+            });
+        }
+        let before = service.saves();
+
+        let moved = service.move_paths_batch(&[
+            ("/m/a".to_string(), "/m/b".to_string()),
+            ("/m/b".to_string(), "/m/c".to_string()),
+            ("/m/x/3.flac".to_string(), "/m/y/3.flac".to_string()),
+        ]);
+
+        assert_eq!(service.saves(), before + 1, "one write for the whole batch");
+        assert_eq!(moved, 4, "One follows twice, Two and Three once each");
+        let reopened = DownloadHistoryService::new(&path);
+        let paths: Vec<(String, String)> = reopened
+            .get_recent(10)
+            .into_iter()
+            .map(|e| (e.title, e.path))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                ("Three".to_string(), "/m/y/3.flac".to_string()),
+                ("Two".to_string(), "/m/c/2.flac".to_string()),
+                ("One".to_string(), "/m/c/1.flac".to_string()),
+            ]
+        );
+        assert_eq!(service.move_paths_batch(&[]), 0);
+        assert_eq!(service.saves(), before + 1, "nothing to follow writes nothing");
+    }
+
     #[test]
     fn the_log_is_capped_at_500_newest_first() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -313,6 +415,66 @@ mod tests {
         assert_eq!(all.len(), 500);
         assert_eq!(all[0].title, "504");
         assert_eq!(all[499].title, "5");
+    }
+
+    #[test]
+    fn a_search_finds_every_word_in_any_field_ignoring_case_newest_first() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let service = DownloadHistoryService::new(dir.path().join("downloads-history.json"));
+        for i in 0..300 {
+            service.record(entry(&format!("Filler {i}")));
+        }
+        service.record(DownloadHistoryEntry {
+            album: Some("Blue Album".into()),
+            path: "/music/A/Blue Album/01 Night Drive.flac".into(),
+            ..entry("Night Drive")
+        });
+        service.record(entry("Night Drive (Live)"));
+        for i in 0..250 {
+            service.record(entry(&format!("Later {i}")));
+        }
+
+        let found = service.search("  night DRIVE ", 50);
+        assert_eq!(found.len(), 2, "older than the newest 200 is still found");
+        assert_eq!(found[0].title, "Night Drive (Live)");
+        assert_eq!(found[1].title, "Night Drive");
+        assert_eq!(
+            service.search("blue night", 50).len(),
+            1,
+            "album and title together"
+        );
+        assert_eq!(
+            service.search("01 night drive.flac", 50).len(),
+            1,
+            "the file path"
+        );
+        assert!(
+            service.search("night blues", 50).is_empty(),
+            "every word must be there"
+        );
+        assert!(service.search("   ", 50).is_empty());
+        assert_eq!(service.search("later", 7).len(), 7, "the limit holds");
+    }
+
+    #[test]
+    fn a_search_ignores_accents_and_full_width_forms_and_reads_any_script() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let service = DownloadHistoryService::new(dir.path().join("downloads-history.json"));
+        service.record(DownloadHistoryEntry {
+            artist: "Beyoncé".into(),
+            ..entry("Halo")
+        });
+        service.record(DownloadHistoryEntry {
+            artist: "周杰倫".into(),
+            ..entry("晴天")
+        });
+
+        assert_eq!(service.search("beyonce", 50).len(), 1, "the accent is not needed");
+        assert_eq!(service.search("BEYONCÉ halo", 50).len(), 1);
+        assert_eq!(service.search("ＨＡＬＯ", 50).len(), 1, "full-width letters");
+        let found = service.search("晴天 周杰倫", 50);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "晴天");
     }
 
     // ---- The saved log --------------------------------------------------------------------

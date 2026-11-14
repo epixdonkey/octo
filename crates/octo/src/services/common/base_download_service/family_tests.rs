@@ -34,12 +34,18 @@ fn song(id: &str) -> Song {
 }
 
 fn family(world: World) -> Family {
+    let songs = ["1", "2", "3", "4"].map(|id| (id, song(id)));
+    family_with(world, &songs, DownloadServices::default())
+}
+
+/// The download service over `world`'s pool, with a catalog of `songs` and these services.
+fn family_with(world: World, songs: &[(&str, Song)], mut services: DownloadServices) -> Family {
     let metadata = FakeMetadata::default();
-    for id in ["1", "2", "3", "4"] {
+    for (id, song) in songs {
         metadata
             .songs
             .lock()
-            .insert(("test".to_string(), id.to_string()), song(id));
+            .insert(("test".to_string(), id.to_string()), song.clone());
     }
     let core = DownloadCore {
         settings: world.settings.clone(),
@@ -50,10 +56,7 @@ fn family(world: World) -> Family {
         notifications: Arc::new(NotificationService::new(Vec::new(), world.settings.clone(), None)),
     };
     let backend = Arc::new(TestBackend::default());
-    let services = DownloadServices {
-        family: Some(world.pool.clone() as Arc<dyn FamilyPlacement>),
-        ..Default::default()
-    };
+    services.family = Some(world.pool.clone() as Arc<dyn FamilyPlacement>);
     let service = BaseDownloadService::new(core, services, Arc::clone(&backend) as Arc<dyn DownloadBackend>);
     Family {
         world,
@@ -86,6 +89,29 @@ impl Family {
         });
     }
 
+    /// Each transfer lands the next of these extensions as a real file of that kind, the last one
+    /// from then on.
+    fn lands_each(&self, extensions: &'static [&'static str]) {
+        let incoming = self.world.dir.path().join("incoming");
+        let turn = std::sync::atomic::AtomicUsize::new(0);
+        self.backend.land(move |_, track_id| {
+            let next = turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let extension = extensions[next.min(extensions.len() - 1)];
+            std::fs::create_dir_all(&incoming).expect("made");
+            let landed = incoming.join(format!(
+                "{track_id}-{}.{extension}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let bytes = if extension == "flac" {
+                crate::services::test_support::flac()
+            } else {
+                crate::services::test_support::mp3()
+            };
+            std::fs::write(&landed, bytes).expect("written");
+            landed.to_string_lossy().into_owned()
+        });
+    }
+
     async fn get(&self, id: &str, place: AcquisitionPlace) -> anyhow::Result<String> {
         self.service
             .execute_acquisition_to(
@@ -108,6 +134,7 @@ fn for_members(members: &[&str]) -> AcquisitionPlace {
     AcquisitionPlace {
         pool_members: Some(members.iter().map(|m| m.to_string()).collect()),
         flac_only: false,
+        ..Default::default()
     }
 }
 
@@ -209,6 +236,7 @@ async fn flac_request_rejects_mp3_and_fake_flac() {
     let flac_only = AcquisitionPlace {
         pool_members: Some(vec!["alex".into()]),
         flac_only: true,
+        ..Default::default()
     };
     family.lands("mp3", false);
     let mp3 = family.get("3", flac_only.clone()).await.expect_err("refused");
@@ -247,6 +275,7 @@ async fn a_flac_request_is_never_met_by_a_pool_flac_made_from_mp3() {
             AcquisitionPlace {
                 pool_members: Some(vec!["alex".into()]),
                 flac_only: true,
+                ..Default::default()
             },
         )
         .await
@@ -282,6 +311,7 @@ async fn a_flac_for_a_song_the_pool_has_as_mp3_replaces_it_for_everyone() {
             AcquisitionPlace {
                 pool_members: Some(vec!["alex".into()]),
                 flac_only: true,
+                ..Default::default()
             },
         )
         .await
@@ -323,6 +353,267 @@ async fn family_off_owner_heart_of_a_pooled_song_reaches_the_shared_library() {
     assert!(family.world.pool.store().get(&pooled).is_none());
 }
 
+// ---- A download with a sound check belongs to one person ----------------------------------------
+
+/// The worker draining `queue` over this family's download service, settling members' downloads in
+/// the pool, until the token is canceled.
+fn worker_over_queue(
+    family: &Family,
+    queue: Arc<crate::services::common::TrackAcquisitionQueue>,
+) -> CancellationToken {
+    use crate::services::common::AcquisitionWorker;
+    use crate::services::family::FamilyPlacement;
+    use crate::services::notifications::NotificationService;
+    use crate::services::soulseek::ExternalIdRegistry;
+
+    let worker = Arc::new(
+        AcquisitionWorker::new(
+            Arc::clone(&queue),
+            Arc::clone(&family.service) as Arc<dyn IDownloadService>,
+            Arc::new(ExternalIdRegistry::in_memory()),
+            Arc::new(NotificationService::new(
+                Vec::new(),
+                family.world.settings.clone(),
+                None,
+            )),
+            None,
+        )
+        .with_family(family.world.pool.clone() as Arc<dyn FamilyPlacement>),
+    );
+    let stopping = CancellationToken::new();
+    tokio::spawn(worker.run(stopping.clone()));
+    stopping
+}
+
+/// `user`'s heart of song "1", gated by their own gate, into their own library.
+fn member_heart(
+    queue: &crate::services::common::TrackAcquisitionQueue,
+    user: &str,
+) -> crate::services::common::Completion {
+    use octo_core::fingerprint::heart_gate::{HeardReading, HeartGate};
+    queue.enqueue_as(
+        Some(AcquisitionOrigin::Heart),
+        vec![HeartGate {
+            user: user.into(),
+            origin: AcquisitionOrigin::Heart,
+            r: None,
+            heard: None,
+            heard_seconds: None,
+            reading: HeardReading::NotHeard,
+            stand_in: None,
+        }],
+        &crate::services::common::AcquisitionTarget::Member(user.into()),
+        false,
+        "test",
+        "1",
+        true,
+        false,
+        true,
+        None,
+        true,
+        Some(user),
+        false,
+        None,
+    )
+}
+
+/// Two members' hearts for one song are two requests: the second waits behind the first, and when
+/// it runs its own gate judges the file that landed for the first. Passed, that file is credited
+/// to the second member and linked into their own library, with nothing downloaded again.
+#[tokio::test]
+async fn a_second_members_heart_takes_the_first_ones_file_its_own_gate_passes_with_nothing_downloaded() {
+    let family = family(World::new(None));
+    family.lands("mp3", false);
+    *family.backend.landed_verdict.lock() = Some(true);
+    // Both are queued before the worker runs, so the second waits behind the first.
+    let queue = Arc::new(crate::services::common::TrackAcquisitionQueue::new());
+    let alex = member_heart(&queue, "alex");
+    let sam = member_heart(&queue, "sam");
+    let stopping = worker_over_queue(&family, queue);
+    let alexs = alex.wait().await.expect("landed for alex");
+    let sams = sam.wait().await.expect("credited to sam");
+    assert_eq!(sams, alexs, "one file");
+    assert_eq!(family.backend.transfers(), 1, "nothing downloaded again");
+    assert_eq!(
+        *family.backend.judged.lock(),
+        std::slice::from_ref(&alexs),
+        "sam's own gate judged it"
+    );
+    assert!(sam.ledger().accepted("sam"));
+    for user in ["alex", "sam"] {
+        let link = family.world.pool.link_path(&alexs, user).expect("a link path");
+        assert!(std::fs::symlink_metadata(&link).is_ok(), "{user} has it");
+    }
+    stopping.cancel();
+}
+
+/// The same, with the second member's own gate refusing the first one's file: it downloads its own,
+/// and the first one's file is never linked for them.
+#[tokio::test]
+async fn a_second_members_heart_whose_gate_refuses_the_first_ones_file_downloads_its_own() {
+    let family = family(World::new(None));
+    family.lands("mp3", false);
+    *family.backend.landed_verdict.lock() = Some(false);
+    let queue = Arc::new(crate::services::common::TrackAcquisitionQueue::new());
+    let alex = member_heart(&queue, "alex");
+    let sam = member_heart(&queue, "sam");
+    let stopping = worker_over_queue(&family, queue);
+    let alexs = alex.wait().await.expect("landed for alex");
+    let sams = sam.wait().await.expect("sam's own");
+    assert_eq!(family.backend.transfers(), 2, "sam's own download");
+    assert_eq!(*family.backend.judged.lock(), std::slice::from_ref(&alexs));
+    assert_ne!(sams, alexs);
+    assert!(Path::new(&sams).is_file());
+    let sam_link = family.world.pool.link_path(&alexs, "sam").expect("a link path");
+    assert!(
+        std::fs::symlink_metadata(&sam_link).is_err()
+            || std::fs::canonicalize(&sam_link).ok() != std::fs::canonicalize(&alexs).ok(),
+        "alex's file is not sam's"
+    );
+    stopping.cancel();
+}
+
+/// The second member's own download betters the first one's file (a FLAC of the version they heard,
+/// against the first one's proven MP3): it is theirs alone, so the first member keeps their MP3,
+/// linked and on disk, and each file is recorded for its own member only.
+#[tokio::test]
+async fn a_second_members_own_better_copy_never_replaces_the_first_ones_proven_file() {
+    let family = family(World::new(None));
+    family.lands_each(&["mp3", "flac"]);
+    *family.backend.landed_verdict.lock() = Some(false);
+    let queue = Arc::new(crate::services::common::TrackAcquisitionQueue::new());
+    let alex = member_heart(&queue, "alex");
+    let sam = member_heart(&queue, "sam");
+    let stopping = worker_over_queue(&family, queue);
+    let alexs = alex.wait().await.expect("landed for alex");
+    let sams = sam.wait().await.expect("sam's own");
+    assert!(alexs.ends_with(".mp3"), "{alexs}");
+    assert!(sams.ends_with(".flac"), "{sams}");
+    assert_eq!(family.backend.transfers(), 2, "sam's own download");
+    assert!(Path::new(&alexs).is_file(), "alex's MP3 stays on disk");
+    let alex_link = family.world.pool.link_path(&alexs, "alex").expect("a link path");
+    assert_eq!(
+        std::fs::read(&alex_link).expect("alex's link is there"),
+        std::fs::read(&alexs).expect("alex's MP3"),
+        "alex's link still opens alex's MP3"
+    );
+    let refs = |path: &str| family.world.pool.store().get(path).expect("recorded").refs;
+    assert_eq!(refs(&alexs), ["alex"]);
+    assert_eq!(refs(&sams), ["sam"]);
+    stopping.cancel();
+}
+
+/// Another member's file of the song is in the pool from an earlier request of their own. A member's
+/// gated heart judges it first, as a file that landed for someone else: refused, the heart downloads
+/// its own and that file is never linked for them; passed, it is linked for them, with nothing
+/// downloaded.
+#[tokio::test]
+async fn a_gated_heart_judges_another_members_pool_file_before_taking_it() {
+    for passes in [false, true] {
+        let family = family(World::new(None));
+        let pooled = family.world.pool_file("Artist/Album/Song 1 (studio).mp3", 10);
+        family.world.pool.record(PoolFile {
+            path: pooled.clone(),
+            size: 10,
+            format: "mp3".into(),
+            outside_ids: vec!["test:1".into()],
+            isrc: None,
+            title: "Song 1".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            refs: vec!["sam".into()],
+            transcoded_from: None,
+        });
+        family.lands("mp3", false);
+        *family.backend.landed_verdict.lock() = Some(passes);
+        let queue = Arc::new(crate::services::common::TrackAcquisitionQueue::new());
+        let alex = member_heart(&queue, "alex");
+        let stopping = worker_over_queue(&family, queue);
+        let alexs = alex.wait().await.expect("alex's heart lands");
+        assert_eq!(
+            *family.backend.judged.lock(),
+            std::slice::from_ref(&pooled),
+            "alex's own gate judged sam's file (passes: {passes})"
+        );
+        let alex_link = family.world.pool.link_path(&pooled, "alex").expect("a link path");
+        let refs = family.world.pool.store().get(&pooled).expect("recorded").refs;
+        if passes {
+            assert_eq!(family.backend.transfers(), 0, "nothing downloaded");
+            assert_eq!(alexs, pooled);
+            assert!(std::fs::symlink_metadata(&alex_link).is_ok(), "alex has it");
+            assert!(refs.iter().any(|user| user == "alex"), "{refs:?}");
+            assert!(alex.ledger().accepted("alex"));
+        } else {
+            assert_eq!(family.backend.transfers(), 1, "alex's own download");
+            assert_ne!(alexs, pooled);
+            assert!(
+                std::fs::symlink_metadata(&alex_link).is_err(),
+                "sam's file is never alex's"
+            );
+            assert_eq!(refs, ["sam"]);
+        }
+        stopping.cancel();
+    }
+}
+
+/// `user`'s Wait for lossless play of song "1", into their own library: a play with no gate yet,
+/// whose download builds its gate inside.
+fn lossless_play(
+    queue: &crate::services::common::TrackAcquisitionQueue,
+    user: &str,
+) -> crate::services::common::Completion {
+    queue.enqueue_as(
+        Some(AcquisitionOrigin::Play),
+        Vec::new(),
+        &crate::services::common::AcquisitionTarget::Member(user.into()),
+        false,
+        "test",
+        "1",
+        false,
+        false,
+        true,
+        None,
+        true,
+        Some(user),
+        false,
+        None,
+    )
+}
+
+/// Two members' Wait for lossless plays of one song are two requests, the second waiting behind the
+/// first: its own check judges the first one's file, and refused, it downloads its own, and the
+/// first one's file is never linked for the second member.
+#[tokio::test]
+async fn two_members_lossless_plays_of_one_song_are_each_judged_for_their_own_person() {
+    let family = family(World::new(None));
+    family.lands("mp3", false);
+    *family.backend.landed_verdict.lock() = Some(false);
+    let queue = Arc::new(crate::services::common::TrackAcquisitionQueue::new());
+    let alex = lossless_play(&queue, "alex");
+    let sam = lossless_play(&queue, "sam");
+    assert_eq!(
+        queue.waiting_behind("test", "1"),
+        1,
+        "sam's play waits as its own"
+    );
+    let stopping = worker_over_queue(&family, queue);
+    let alexs = alex.wait().await.expect("landed for alex");
+    let sams = sam.wait().await.expect("sam's own");
+    assert_eq!(family.backend.transfers(), 2, "sam's own download");
+    assert_eq!(*family.backend.judged.lock(), std::slice::from_ref(&alexs));
+    assert_ne!(sams, alexs);
+    let sam_link = family.world.pool.link_path(&alexs, "sam").expect("a link path");
+    assert!(
+        std::fs::symlink_metadata(&sam_link).is_err(),
+        "alex's file is never linked for sam"
+    );
+    assert_eq!(
+        family.world.pool.store().get(&alexs).expect("recorded").refs,
+        ["alex"]
+    );
+    stopping.cancel();
+}
+
 #[tokio::test]
 async fn a_member_download_waits_while_the_pool_folder_has_no_marker() {
     let family = family(World::new(None));
@@ -339,4 +630,65 @@ async fn a_member_download_waits_while_the_pool_folder_has_no_marker() {
         .expect_err("refused");
     assert_eq!(refused.to_string(), crate::services::family::pool::POOL_NOT_READY);
     assert!(family.world.pool.store().list().is_empty(), "nothing placed");
+}
+
+// ---- a new disc beside a loose album --------------------------------------------------------
+
+/// A world filing every kind by `{Artist}/{Album}/Disc {Disc}/{Track:00} - {Title}`.
+fn disc_world() -> World {
+    let world = World::new(None);
+    let mut settings = world.settings.current().as_ref().clone();
+    settings.subsonic.folder_structure = octo_core::settings::FolderStructure::Custom;
+    settings.subsonic.folder_template = "{Artist}/{Album}/Disc {Disc}/{Track:00} - {Title}".into();
+    world.settings.set(settings);
+    world
+}
+
+/// An MP3 at `path`, tagged as the first track of `disc` of Pink Floyd's The Wall, of two.
+fn wall_track(path: &str, title: &str, disc: u32) {
+    std::fs::create_dir_all(Path::new(path).parent().expect("a folder")).expect("folders");
+    std::fs::write(path, crate::services::test_support::mp3()).expect("written");
+    let mut file = octo_media::tags::TagFile::open(Path::new(path)).expect("opens");
+    file.set_title(Some(title));
+    file.set_performers(&["Pink Floyd".to_string()]);
+    file.set_album(Some("The Wall"));
+    file.set_track(1);
+    file.set_disc(disc);
+    file.set_disc_count(2);
+    file.save().expect("saved");
+}
+
+/// A member's download of disc 2 of an album whose disc 1 lies loose in the pool lands loose
+/// beside it, so the pool album keeps one folder.
+#[tokio::test]
+async fn a_member_download_of_a_new_disc_lands_loose_beside_the_pools_album() {
+    let world = disc_world();
+    let pool = world.pool.pool_root_path();
+    wall_track(
+        &format!("{pool}/Pink Floyd/The Wall/01 - In the Flesh.mp3"),
+        "In the Flesh",
+        1,
+    );
+    let hey_you = Song {
+        title: "Hey You".into(),
+        artist: "Pink Floyd".into(),
+        album: "The Wall".into(),
+        track: Some(1),
+        disc_number: Some(2),
+        total_discs: Some(2),
+        external_provider: Some("test".into()),
+        external_id: Some("5".into()),
+        ..Default::default()
+    };
+    let family = family_with(world, &[("5", hey_you)], DownloadServices::default());
+    family.lands("mp3", false);
+
+    let path = family.get("5", for_members(&["alex"])).await.expect("landed");
+
+    assert_eq!(path, format!("{pool}/Pink Floyd/The Wall/01 - Hey You.mp3"));
+    assert!(Path::new(&format!("{pool}/Pink Floyd/The Wall/01 - In the Flesh.mp3")).is_file());
+    assert!(
+        !Path::new(&format!("{pool}/Pink Floyd/The Wall/Disc 2")).exists(),
+        "no disc folder"
+    );
 }

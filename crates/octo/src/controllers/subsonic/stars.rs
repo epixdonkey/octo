@@ -27,6 +27,7 @@ use super::caller_checks::{
 use crate::app::AppState;
 use crate::http::error::{AppError, AppResult};
 use crate::http::routes::RouteSet;
+use crate::services::common::heart_acquisition_coordinator::track_base_key;
 use crate::services::common::star_on_arrival::WaitingStar;
 use crate::services::common::{AcquisitionTarget, StarOnArrival};
 use crate::services::family::list_rules::{Edit, edit};
@@ -619,11 +620,20 @@ async fn star_outside_song(
             .hold_starred_song(&provider, &external_id, item_id, &credential, Some(who));
     }
     // Keyed by what the pipeline knows, labeled with the id the client starred so the
-    // app can find its row. Named from the routing, which is already in memory.
+    // app can find its row. Named from the routing, which a heart keeps in the registry (a
+    // decoded id is registered now, so what was heard of it is found).
     let routing = state
         .external_id_registry
-        .lookup(&external_id)
+        .resolve_song(&external_id, true)
         .map(|r| r.snapshot());
+    // A heart asks for the song again, so a Delete that kept it from downloading no longer does.
+    if let Some((artist, title)) = routing
+        .as_ref()
+        .and_then(|r| r.artist.as_deref().zip(r.title.as_deref()))
+        && state.library_action_journal.allow_song(artist, title) > 0
+    {
+        info!("A heart on '{artist} - {title}' lifts its Delete from disk, so it downloads again");
+    }
     state.acquisition_tracker.begin(
         &provider,
         &external_id,
@@ -835,6 +845,117 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
         })
         .filter(|(provider, external_id)| state.star_on_arrival.holds_song(provider, external_id))
         .collect();
+    // Hearts held for an answer, a proof or the person, from every client: the caller leaves
+    // each hold of the song, and a hold nobody is left in ends.
+    let in_holds: Vec<(String, String)> = outside
+        .iter()
+        .filter(|(key, _)| *key == "id")
+        .filter_map(|(_, id)| {
+            let (_, provider, external_id) = state.local_library.parse_song_id(id);
+            Some((provider?, external_id?))
+        })
+        .filter(|(provider, external_id)| {
+            !state
+                .soulseek_holds
+                .records_for(&track_base_key(provider, external_id))
+                .is_empty()
+        })
+        .collect();
+    if !in_holds.is_empty() {
+        // Nothing here reaches Navidrome, so the sign-in is checked before a heart is dropped.
+        if member.is_none() {
+            match refuse_unless_signed_in(&state, &call, &format).await {
+                Ok(None) => {}
+                Ok(Some(refused)) => return refused,
+                Err(error) => return error.into_response(),
+            }
+        }
+        if let Ok(who) = signed_in_user(&state, &call).await {
+            for (provider, external_id) in &in_holds {
+                state
+                    .heart_acquisition_coordinator
+                    .leave_holds(provider, external_id, &who);
+            }
+        }
+    }
+    // Hearted albums with held tracks: the caller leaves each, and a held track nobody is left in
+    // is deleted. An album comes under albumId, though some clients send it as id.
+    let is_album = |key: &str, id: &str| {
+        key == "albumId" || (key == "id" && routing_kind(&state, id) == Some(RoutingKind::Album))
+    };
+    let album_holds: Vec<(String, String)> = outside
+        .iter()
+        .filter(|(key, id)| is_album(key, id))
+        .map(|(_, id)| {
+            let provider = state
+                .local_library
+                .parse_song_id(id)
+                .1
+                .unwrap_or_else(|| SoulseekMetadataService::PROVIDER_NAME.to_string());
+            (provider, id.clone())
+        })
+        .filter(|(provider, id)| {
+            let album_key = crate::services::common::acquisition_tracker::key_of(provider, id);
+            state.soulseek_holds.snapshot().iter().any(|record| {
+                record
+                    .album_track
+                    .as_ref()
+                    .is_some_and(|track| track.album_key == album_key)
+                    || (record.kind == crate::services::common::HeldKind::Album && record.external_id == *id)
+            })
+        })
+        .collect();
+    if !album_holds.is_empty() {
+        if member.is_none() {
+            match refuse_unless_signed_in(&state, &call, &format).await {
+                Ok(None) => {}
+                Ok(Some(refused)) => return refused,
+                Err(error) => return error.into_response(),
+            }
+        }
+        if let Ok(who) = signed_in_user(&state, &call).await {
+            for (provider, album_id) in &album_holds {
+                state
+                    .heart_acquisition_coordinator
+                    .leave_album_holds(provider, album_id, &who);
+            }
+        }
+    }
+    // Every un-hearted outside song and album leaves the Lidarr follow its heart is on, held or
+    // not: a follow nobody's heart is on any more ends.
+    let followed: Vec<(String, String)> = outside
+        .iter()
+        .filter_map(|(key, id)| {
+            if is_album(key, id) {
+                let provider = state
+                    .local_library
+                    .parse_song_id(id)
+                    .1
+                    .unwrap_or_else(|| SoulseekMetadataService::PROVIDER_NAME.to_string());
+                return Some((provider, id.clone()));
+            }
+            if *key != "id" {
+                return None;
+            }
+            let (_, provider, external_id) = state.local_library.parse_song_id(id);
+            Some((provider?, external_id?))
+        })
+        .filter(|(provider, id)| state.lidarr_hearts.follows_heart(provider, id))
+        .collect();
+    if !followed.is_empty() {
+        if member.is_none() {
+            match refuse_unless_signed_in(&state, &call, &format).await {
+                Ok(None) => {}
+                Ok(Some(refused)) => return refused,
+                Err(error) => return error.into_response(),
+            }
+        }
+        if let Ok(who) = signed_in_user(&state, &call).await {
+            for (provider, id) in &followed {
+                state.lidarr_hearts.unhearted(provider, id, &who);
+            }
+        }
+    }
 
     // Whether the caller has one of these ids saved, so an unstar of a streaming favorite is
     // answered by Octo instead of relaying an id Navidrome has never seen.

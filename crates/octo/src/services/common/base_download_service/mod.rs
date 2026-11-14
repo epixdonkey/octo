@@ -22,6 +22,10 @@ mod test_support;
 mod placement_tests;
 
 #[cfg(test)]
+#[path = "placement_layout_tests.rs"]
+mod placement_layout_tests;
+
+#[cfg(test)]
 #[path = "tagging_tests.rs"]
 mod tagging_tests;
 
@@ -41,6 +45,10 @@ mod family_tests;
 #[path = "prefetch_tests.rs"]
 mod prefetch_tests;
 
+#[cfg(test)]
+#[path = "playlists_lock_tests.rs"]
+mod playlists_lock_tests;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -51,8 +59,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use octo_core::common::{PathHelper, SongIdentity, dotnet};
+use octo_core::common::layout::Field;
+use octo_core::common::{LayoutKind, PathHelper, SongIdentity, TagSnapshot, dotnet};
 use octo_core::fingerprint::VerificationResult;
+use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeardSource, HeartGate};
+use octo_core::fingerprint::verification::RecordingProof;
 use octo_core::models::domain::{Album, Song};
 use octo_core::models::download::{AcquisitionHeard, DownloadHistoryEntry, DownloadInfo, DownloadStatus};
 use octo_core::notifications::{NotificationEvent, NotificationEventType};
@@ -71,8 +82,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::services::common::acquisition_tracker::{acquisition_event_kinds, key_of};
 use crate::services::common::{
-    AcquisitionPlace, AcquisitionState, AcquisitionTracker, DownloadArrivals, DownloadConcurrency,
-    DownloadPicks,
+    AcquisitionHeld, AcquisitionPlace, AcquisitionState, AcquisitionTracker, AlbumGates, DownloadArrivals,
+    DownloadConcurrency, DownloadPicks, GateLedger, SoundDeny, acquisition_key,
 };
 use crate::services::cover_art::DownloadCoverResolver;
 use crate::services::family::FamilyPlacement;
@@ -85,14 +96,15 @@ use crate::services::library::{
     LibraryActionJournal, LibraryOwnership, OwnedCopy, OwnedDecision, ReplacementHandoff,
     ReplacementRejectedException, UpgradeAsk, UpgradeQueue, UpgradeSources,
 };
-use crate::services::local::{DownloadHistoryService, ILocalLibraryService};
+use crate::services::local::{DownloadHistoryService, ILocalLibraryService, KeptHeart};
 use crate::services::lyrics::LyricsSidecarWriter;
 use crate::services::metadata::DeezerMetadataService;
 use crate::services::notifications::NotificationService;
 use crate::services::prefetch::{AheadSidecar, PrefetchedFiles, write_sidecar};
 use crate::services::subsonic::NavidromeIdentityService;
 
-pub use placement::{LayoutChoice, Placement};
+pub(crate) use placement::{Filed, PLACEMENT, choose_loose, file_values, mapping_at, values_from_tags};
+pub use placement::{LayoutChoice, Placement, Placing};
 pub use tagging::{CatalogBlanks, MeterPreview};
 
 /// The name a download was asked for under, captured before anything corrects it.
@@ -102,6 +114,11 @@ pub struct RequestedIdentity {
     pub title: String,
     pub album: String,
     pub track: Option<i32>,
+    /// For a download asked for with no album: the release group's id and title its ISRC
+    /// picked, set once the pick has finished.
+    pub album_pick: Arc<OnceLock<(String, String)>>,
+    /// The download's layout and root, read once before identify.
+    pub placing: Arc<OnceLock<Placing>>,
 }
 
 impl RequestedIdentity {
@@ -111,6 +128,8 @@ impl RequestedIdentity {
             title: title.to_string(),
             album: album.to_string(),
             track,
+            album_pick: Arc::default(),
+            placing: Arc::default(),
         }
     }
 }
@@ -146,6 +165,9 @@ pub struct TrackDownload {
     /// The source a backend fetched the song from, when the format alone does not say: a FLAC can
     /// be Lidarr's as well as Soulseek's.
     pub fetched_from: Option<String>,
+    /// The YouTube video the song's file was made from, when a backend fetched it from one: a
+    /// copy fetched ahead keeps it, so a check of what played can read that video's channel.
+    pub fetched_video: Option<String>,
     /// The backend asked for the song to land without a notice of its own (a Lidarr album's songs
     /// that nobody hearted, and the songs of an album heart, which gets one for the album).
     pub muted: bool,
@@ -153,6 +175,67 @@ pub struct TrackDownload {
     pub flac_only: bool,
     /// A download ahead of a play, which leaves an album walk's queued files to the walk.
     pub ahead: bool,
+    /// The files a resumed hold held: checked first, as a fresh download's file is.
+    pub held_files: Vec<String>,
+    /// Those of `held_files` Lidarr brought, each with where its labels are read from.
+    pub held_lidarr: Vec<crate::services::common::soulseek_hold_store::HeldLidarrFile>,
+    /// Why the acquisition runs; None for one queued without an origin (the shipped checks).
+    pub origin: Option<AcquisitionOrigin>,
+    /// The gate of each heart or play that asked: a file is judged against each on its own.
+    pub gates: Vec<HeartGate>,
+    /// The request's gates as they stand now, so a heart or a play that joins while the download
+    /// runs is judged by its own gate.
+    pub live_gates: crate::services::common::SharedGates,
+    /// The acquisition's key, which finds each person's open heard-master round.
+    pub acquisition_key: String,
+    /// Where each gate's verdict on the file is written.
+    pub ledger: GateLedger,
+    /// Everyone who asked for the song, as the request had them when it started.
+    pub requested_by: Vec<String>,
+    /// What a replacement refuses by its original's sound.
+    pub deny: Option<SoundDeny>,
+    /// A person's keep: a file the hold kept lands as it is, or the very audio they heard, and
+    /// nothing is searched for.
+    pub keep_anyway: bool,
+    /// Whose keep it is: a file the keep lands counts as kept only for them.
+    pub keep_for: Vec<String>,
+    /// Other people of the hold judge the same held files on requests of their own: a held file
+    /// this download's gates refuse stays for them.
+    pub held_for_others: bool,
+}
+
+impl TrackDownload {
+    /// Every gate of the download now: its own (a play's built inside its acquisition among them)
+    /// with every gate of the request beside them, a request's newer gate for one person and origin
+    /// in place of the one it started with.
+    pub fn current_gates(&self) -> Vec<HeartGate> {
+        let mut gates = self.gates.clone();
+        if let Some(live) = self.live_gates.current() {
+            merge_gates(&mut gates, live);
+        }
+        gates
+    }
+
+    /// Takes in the gates of everyone who joined the request since the download started, keeping
+    /// every gate the download has already.
+    pub fn refresh_gates(&mut self) {
+        if let Some(live) = self.live_gates.current() {
+            merge_gates(&mut self.gates, live);
+        }
+    }
+}
+
+/// Adds each of `live` to `gates`: a gate of a person and origin `gates` has already takes that
+/// one's place, any other joins, and a gate `live` does not list stays.
+fn merge_gates(gates: &mut Vec<HeartGate>, live: Vec<HeartGate>) {
+    for gate in live {
+        match gates.iter_mut().find(|known| {
+            known.origin == gate.origin && dotnet::eq_ignore_case(known.user.trim(), gate.user.trim())
+        }) {
+            Some(known) => *known = gate,
+            None => gates.push(gate),
+        }
+    }
 }
 
 /// The source-specific parts of the download pipeline. Every call is handed the base, so a
@@ -214,6 +297,54 @@ pub trait DownloadBackend: Send + Sync + 'static {
 
     /// Called when the walk ends, however it ends: let go of whatever was prepared and not used.
     async fn finish_album(&self, _base: &BaseDownloadService, _prepared: &[String]) {}
+
+    /// Judges a song fetched ahead before a heart or a play keeps it, as its gates judge a fresh
+    /// download: true keeps it (the song carries the verdict it is tagged by); false passes it
+    /// over, and the download runs. The default keeps it, as every download always did.
+    async fn judge_ahead(
+        &self,
+        _base: &BaseDownloadService,
+        _download: &mut TrackDownload,
+        _path: &str,
+        _identity: HeardSource,
+    ) -> bool {
+        true
+    }
+
+    /// A song fetched ahead kept for a download nobody gates: each heart or play that joined it is
+    /// judged by its own gate, so it counts the copy as its own only when that gate passes it. The
+    /// default judges nothing.
+    async fn judge_ahead_joiners(&self, _download: &TrackDownload, _path: &str, _identity: HeardSource) {}
+
+    /// Whether `gate` proves the library copy at `path` is the version its person heard (an
+    /// album track's own recording, for a hearted album's walk). The default proves nothing.
+    async fn owned_passes(&self, _path: &str, _gate: &HeartGate) -> bool {
+        false
+    }
+
+    /// Judges a file of the song another person's request landed while this download waited behind
+    /// it, with this download's own gates, as a fresh file is judged, never moving or deleting it:
+    /// true when one passes it, false when none does, each gate's verdict written in its ledger.
+    /// None when no gate of this download can judge it, which leaves it to the checks every file of
+    /// the song already here meets. The default judges nothing.
+    async fn judge_landed(
+        &self,
+        _base: &BaseDownloadService,
+        _download: &mut TrackDownload,
+        _path: &str,
+    ) -> Option<bool> {
+        None
+    }
+}
+
+/// Whether a download is judged by its own people's gates: a heart's with a gate, and a play's,
+/// whose gate a backend builds inside its acquisition when it came with none.
+fn judged_by_own(place: &AcquisitionPlace) -> bool {
+    match place.origin {
+        Some(AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart) => !place.gates.is_empty(),
+        Some(AcquisitionOrigin::Play) => true,
+        _ => false,
+    }
 }
 
 /// The notice queue's review: ask one person about a download they can settle by listening. False
@@ -222,11 +353,20 @@ pub trait ReviewQueue: Send + Sync {
     fn add_review(&self, owner: &str, local_path: &str, song: &Song, verdict: &VerificationResult) -> bool;
 }
 
+/// Held by every change to playlist files: the library tidy's follows and its undo, and a
+/// download adding its song to a playlist, so neither writes over what the other just wrote.
+/// It is taken last, after the download lock or the music folder's gate, and nothing that holds
+/// it waits on either.
+pub(crate) static PLAYLISTS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// The two playlist sync calls a download makes.
 #[async_trait]
 pub trait PlaylistTrackSync: Send + Sync {
     fn get_playlist_id_for_track(&self, song_id: &str) -> Option<String>;
 
+    /// Adds the song to the playlist's file. Called holding [`PLAYLISTS`], so it never waits on
+    /// the download lock or the music folder's gate.
     async fn add_track_to_m3u(
         &self,
         playlist_id: &str,
@@ -276,6 +416,9 @@ pub struct DownloadServices {
     pub picks: Option<Arc<DownloadPicks>>,
     /// The music folder's one-writer gate: a placement waits while a library job holds it.
     pub write_gate: Option<LibraryWriteGate>,
+    /// Octo's follows of its Lidarr searches: a file placed under Lidarr's root folders for a
+    /// followed artist waits in the hold path until the follow ends.
+    pub lidarr_pending: Option<Arc<crate::services::lidarr::LidarrPendingAlbums>>,
     /// The family pool, where members' downloads land. `None`, or Family off, places every
     /// download in the shared library as always.
     pub family: Option<Arc<dyn FamilyPlacement>>,
@@ -283,6 +426,9 @@ pub struct DownloadServices {
     pub arrivals: Option<Arc<DownloadArrivals>>,
     /// The songs fetched ahead of their play, which a heart takes instead of downloading again.
     pub prefetched: Option<Arc<dyn PrefetchedFiles>>,
+    /// The gates of the album chains that run now: a walk of a hearted album files each track by
+    /// its own sound against its own recording.
+    pub album_gates: Option<Arc<AlbumGates>>,
 }
 
 /// Everything a single download is asked with beyond its provider and id: the optional
@@ -323,6 +469,74 @@ pub struct AheadBusy;
 /// Why a download that had to be a real FLAC copy failed: no FLAC came, or the one that came
 /// was made from lossy audio.
 pub const NO_REAL_FLAC: &str = "No real FLAC copy found";
+
+/// What a landed file was kept for: the people whose own gate passed it, the recording their gate
+/// judged it against and what they heard, and for a file kept as heard its own print. None when
+/// no gate judged it (the shipped checks kept it, as before).
+fn kept_heart(place: &AcquisitionPlace, song: &Song) -> Option<KeptHeart> {
+    let accepted: Vec<&HeartGate> = place
+        .gates
+        .iter()
+        .filter(|gate| place.ledger.accepted(&gate.user))
+        .collect();
+    let first = accepted.first()?;
+    let verification = song.verification.as_deref();
+    // A file kept anyway is the heard audio itself when its person's gate heard something: the
+    // keep lands nothing else for them.
+    let as_heard = verification.is_some_and(|verification| match verification.proof {
+        RecordingProof::AsHeard { .. } => true,
+        RecordingProof::KeptByYou => first.heard.is_some(),
+        _ => false,
+    });
+    let mut users: Vec<String> = Vec::new();
+    for gate in &accepted {
+        let user = gate.user.trim();
+        if !user.is_empty() && !users.iter().any(|known| dotnet::eq_ignore_case(known, user)) {
+            users.push(user.to_string());
+        }
+    }
+    Some(KeptHeart {
+        users,
+        recording: first.r.clone(),
+        heard: first.heard.clone(),
+        as_heard,
+        print: verification
+            .and_then(|verification| verification.fingerprint.clone())
+            .filter(|print| !print.is_empty()),
+        seconds: verification
+            .map(|verification| verification.duration_seconds)
+            .filter(|seconds| *seconds > 0),
+    })
+}
+
+/// Whether a gate of this place heard a copy fetched ahead, which a person's keep may take as the
+/// very audio they heard.
+fn heard_an_ahead_copy(place: &AcquisitionPlace) -> bool {
+    place.gates.iter().any(|gate| {
+        matches!(
+            gate.heard.as_ref().map(|heard| &heard.source),
+            Some(HeardSource::Copy { .. })
+        )
+    })
+}
+
+/// A file the person kept anyway. What its own check proved by sound stays proven; anything less
+/// is marked "kept by you, version not proven", claims no recording, no ISRC and no match, and is
+/// named as the request names it.
+fn kept_by_you(song: &mut Song) {
+    let mut verification = song.verification.take().map(|kept| *kept).unwrap_or_default();
+    if verification.proof != RecordingProof::Proven {
+        verification.proof = RecordingProof::KeptByYou;
+        verification.verdict = octo_core::fingerprint::VerificationVerdict::Inconclusive;
+        verification.recording_id = None;
+        verification.candidate_recording_id = None;
+        verification.r#match = None;
+        verification.tags_authoritative = false;
+        song.isrc = None;
+        song.music_brainz_recording_id = None;
+    }
+    song.verification = Some(Box::new(verification));
+}
 
 /// Whether a path names a FLAC file.
 fn is_flac_path(path: &str) -> bool {
@@ -393,15 +607,43 @@ pub struct BaseDownloadService {
 
     identifier: OnceLock<Arc<ReleaseIdentifier>>,
 
+    /// How long the catalog may take to list a song's album, when only that listing can say how
+    /// many discs the album has.
+    disc_count_wait: Mutex<Duration>,
+
     /// The cover lines written to the downloads log, for tests.
     #[cfg(test)]
     pub(crate) cover_steps: Mutex<Vec<(String, Option<String>)>>,
+    /// Run by a placement once its target is settled, before anything is made or moved, for tests.
+    #[cfg(test)]
+    pub(crate) settle_pause: Mutex<Option<SettlePause>>,
 }
+
+/// What a test runs once a placement has settled its target (the path it would move to).
+#[cfg(test)]
+pub(crate) type SettlePause = Arc<dyn Fn(String) -> BoxFuture<'static, ()> + Send + Sync>;
 
 impl BaseDownloadService {
     /// The finalize phase runs under the download lock, so past this it is logged with its stage
     /// timings. Nothing is cut short beyond the per-stage caps.
     const FINALIZE_BUDGET: Duration = Duration::from_secs(20);
+
+    /// How long the catalog may take to list an album for its disc count.
+    const DISC_COUNT_WAIT: Duration = Duration::from_secs(10);
+
+    /// Sets how long the catalog may take to list an album for its disc count.
+    pub fn set_disc_count_wait(&self, wait: Duration) {
+        *self.disc_count_wait.lock() = wait;
+    }
+
+    /// The test's pause after a placement settles its target, when one is set.
+    #[cfg(test)]
+    pub(crate) async fn after_settle(&self, target: &str) {
+        let pause = self.settle_pause.lock().clone();
+        if let Some(pause) = pause {
+            pause(target.to_string()).await;
+        }
+    }
 
     pub fn new(
         core: DownloadCore,
@@ -442,8 +684,11 @@ impl BaseDownloadService {
             album_walks: Mutex::new(HashMap::new()),
             download_lock: Semaphore::new(1),
             identifier: OnceLock::new(),
+            disc_count_wait: Mutex::new(Self::DISC_COUNT_WAIT),
             #[cfg(test)]
             cover_steps: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            settle_pause: Mutex::new(None),
         });
 
         for dir in [service.download_path(), service.cache_path.clone()] {
@@ -456,7 +701,36 @@ impl BaseDownloadService {
                 error!("Failed to create directory: {dir}: {e}");
             }
         }
+        service.recover_replacements_at_start();
         service
+    }
+
+    /// Puts right, once Octo starts, every replace of a library file a stop left half done, under
+    /// the gate's share and the placement lock as a placement holds them. Every placement does it
+    /// too before it moves a file, for a music folder found only later.
+    fn recover_replacements_at_start(&self) {
+        let staging = self.staging_folder();
+        if !placement::replacements_pending(&staging) {
+            return;
+        }
+        let gate = self.services.write_gate.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _share = match &gate {
+                        Some(gate) => Some(gate.write().await),
+                        None => None,
+                    };
+                    let _placing = PLACEMENT.lock().await;
+                    placement::recover_replacements(&staging);
+                });
+            }
+            Err(_) => {
+                if let Ok(_placing) = PLACEMENT.try_lock() {
+                    placement::recover_replacements(&staging);
+                }
+            }
+        }
     }
 
     // ---- what a backend reaches ----------------------------------------------------------
@@ -664,12 +938,92 @@ impl BaseDownloadService {
         }
     }
 
+    /// A file of the song already here becomes this download's, and its row closes on it. The
+    /// owner's copy is never the pool's: a member's copy (with Family on or off) moves into the
+    /// shared library, still one file, or None and the owner's copy is fetched as usual. A song
+    /// fetched ahead moves nothing: any copy on disk means it is there. Answers where it is now.
+    async fn already_here(
+        &self,
+        external_provider: &str,
+        external_id: &str,
+        path: String,
+        pool_members: &Option<Vec<String>>,
+        prefetch: bool,
+    ) -> Option<String> {
+        let existing = match (&self.services.family, pool_members) {
+            (Some(placement), None) if !prefetch => placement.for_owner(&path).await?,
+            _ => path,
+        };
+        info!("Song already downloaded: {existing}");
+        // Navidrome shows a member's song at their link, never in the pool.
+        let family = self.services.family.as_ref().filter(|f| f.pool_root().is_some());
+        let shown = family
+            .zip(pool_members.as_ref().and_then(|members| members.first()))
+            .and_then(|(family, first)| family.link_path_for(&existing, first))
+            .unwrap_or_else(|| existing.clone());
+        self.track(|t| t.already_in_library(external_provider, external_id, None, None, Some(&shown)));
+        Some(existing)
+    }
+
     async fn lock(&self, cancellation_token: &CancellationToken) -> anyhow::Result<SemaphorePermit<'_>> {
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => Err(OperationCanceled.into()),
             permit = self.download_lock.acquire() => Ok(permit.expect("the download lock is never closed")),
         }
+    }
+
+    /// The song's file already here for this download. A heart's counts only a file that is
+    /// theirs: one their own gate passed before, or the very library file one of them heard,
+    /// which is already theirs and is never downloaded again. Another person's version, or a file
+    /// nobody proved, is never theirs: their gate judges what is fetched instead. Every other
+    /// download, a play's among them (a play never downloads over a copy that is here), takes the
+    /// song's file as before.
+    async fn already_downloaded(
+        &self,
+        external_provider: &str,
+        external_id: &str,
+        place: &AcquisitionPlace,
+    ) -> Option<String> {
+        let personal = matches!(
+            place.origin,
+            Some(AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart)
+        ) && !place.gates.is_empty();
+        if !personal {
+            return self
+                .local_library
+                .get_local_path_for_external_song(external_provider, external_id)
+                .await;
+        }
+        let heard_file =
+            place
+                .gates
+                .iter()
+                .find_map(|gate| match gate.heard.as_ref().map(|heard| &heard.source) {
+                    Some(HeardSource::Library { path } | HeardSource::Acquired { path })
+                        if file_exists(path) =>
+                    {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                });
+        if heard_file.is_some() {
+            return heard_file;
+        }
+        self.local_library
+            .get_mappings()
+            .await
+            .into_iter()
+            .filter(|mapping| {
+                mapping.external_provider == external_provider
+                    && mapping.external_id == external_id
+                    && mapping
+                        .heart
+                        .as_ref()
+                        .is_some_and(|heart| place.gates.iter().any(|gate| heart.is_for(&gate.user)))
+            })
+            .map(|mapping| mapping.local_path)
+            .find(|path| file_exists(path))
     }
 
     #[allow(clippy::too_many_arguments)] // the locked half of one download, with all its inputs
@@ -698,36 +1052,34 @@ impl BaseDownloadService {
             anyhow::bail!("{}", crate::services::family::pool::POOL_NOT_READY);
         }
 
+        // A file the download may take as it is: a real FLAC one for a request that wants only that.
+        let takes = |path: &str| {
+            file_exists(path)
+                && (!flac_only || (is_flac_path(path) && !family.is_some_and(|f| f.made_from_lossy(path))))
+        };
+        // A file of the song that landed for someone else while this request waited behind theirs
+        // is this download's only once its own gates pass it (below).
+        let landed_first = judged_by_own(&options.place);
+
         // Check if already downloaded (skipped for cache mode, which checks the cache folder).
         // A replacement is always a fresh file: an existing one is what is being replaced.
         if !is_cache && options.replacement.is_none() {
-            let mut existing = self
-                .local_library
-                .get_local_path_for_external_song(external_provider, external_id)
+            let existing = self
+                .already_downloaded(external_provider, external_id, &options.place)
                 .await
-                .filter(|path| file_exists(path))
-                .filter(|path| {
-                    !flac_only || (is_flac_path(path) && !family.is_some_and(|f| f.made_from_lossy(path)))
-                });
-            // The owner's copy is never the pool's: a member's copy (with Family on or off) moves
-            // into the shared library, still one file, or the owner's copy is fetched as usual.
-            // A song fetched ahead moves nothing: any copy on disk means it is there.
-            if let Some(path) = existing.take() {
-                existing = match (&self.services.family, &pool_members) {
-                    (Some(placement), None) if !options.prefetch => placement.for_owner(&path).await,
-                    _ => Some(path),
-                };
-            }
-            if let Some(existing) = existing {
-                info!("Song already downloaded: {existing}");
-                // Navidrome shows a member's song at their link, never in the pool.
-                let shown = family
-                    .zip(pool_members.as_ref().and_then(|members| members.first()))
-                    .and_then(|(family, first)| family.link_path_for(&existing, first))
-                    .unwrap_or_else(|| existing.clone());
-                self.track(|t| {
-                    t.already_in_library(external_provider, external_id, None, None, Some(&shown))
-                });
+                .filter(|path| takes(path))
+                .filter(|path| !(landed_first && options.place.landed.contains(path)));
+            if let Some(path) = existing
+                && let Some(existing) = self
+                    .already_here(
+                        external_provider,
+                        external_id,
+                        path,
+                        &pool_members,
+                        options.prefetch,
+                    )
+                    .await
+            {
                 return Ok(existing);
             }
         } else if is_cache
@@ -803,6 +1155,8 @@ impl BaseDownloadService {
 
         // In Album mode, fetch the full album first to ensure AlbumArtist is correctly set.
         let mut song: Option<Song> = None;
+        // The album Album mode fetched, kept for the disc count a disc folder needs.
+        let mut listed: Option<Album> = None;
         if self.settings.current().subsonic.download_mode == DownloadMode::Album
             && let Some(temp) = self.metadata.get_song(external_provider, external_id).await
             && let Some(album_id) = temp.album_id.as_deref().filter(|id| !id.is_empty())
@@ -818,8 +1172,10 @@ impl BaseDownloadService {
             // Find the track in the album.
             song = album
                 .songs
-                .into_iter()
-                .find(|s| s.external_id.as_deref() == Some(external_id));
+                .iter()
+                .find(|s| s.external_id.as_deref() == Some(external_id))
+                .cloned();
+            listed = Some(album);
         }
 
         // Fallback to individual song fetch if not in Album mode or album fetch failed.
@@ -854,6 +1210,70 @@ impl BaseDownloadService {
             )
         });
 
+        let new_download = |song: Song| TrackDownload {
+            track_id: external_id.to_string(),
+            song,
+            suppress_notify: silence,
+            source_override: options.source_override,
+            upgrade_search: options.upgrade_search,
+            replacing_path: options.replacement.as_ref().map(|r| r.original_path.clone()),
+            fetched_from: None,
+            fetched_video: None,
+            muted: false,
+            flac_only,
+            ahead: options.prefetch,
+            held_files: options.place.held_files.clone(),
+            held_lidarr: options.place.held_lidarr.clone(),
+            origin: options.place.origin,
+            gates: options.place.gates.clone(),
+            live_gates: options.place.live_gates.clone(),
+            acquisition_key: acquisition_key(external_provider, external_id, flac_only),
+            ledger: options.place.ledger.clone(),
+            requested_by: options.requested_by.clone().unwrap_or_default(),
+            deny: options.place.deny.clone(),
+            keep_anyway: options.place.keep_anyway,
+            keep_for: options.place.keep_for.clone(),
+            held_for_others: options.place.held_for_others,
+        };
+
+        // A file of the song that landed for someone else while this request waited behind theirs
+        // is judged by this download's own gates first: one they pass is this download's, and
+        // nothing is downloaded again; one they refuse is never taken as this song's copy below,
+        // and the download fetches its own.
+        let mut passed_over: Vec<String> = Vec::new();
+        if landed_first && !is_cache && options.replacement.is_none() && !options.upgrade_search {
+            for path in options.place.landed.iter().filter(|path| takes(path)) {
+                let mut judged = new_download(song.clone());
+                let passes = self.backend.judge_landed(self, &mut judged, path).await;
+                if passes == Some(false) {
+                    info!(
+                        "'{} - {}' landed for someone else at {path}, and this download's own check does not pass it; it fetches its own",
+                        song.artist, song.title
+                    );
+                    passed_over.push(path.clone());
+                    continue;
+                }
+                if passes == Some(true) {
+                    info!(
+                        "'{} - {}' landed for someone else at {path}, and this download's own check passes it; nothing is downloaded again",
+                        song.artist, song.title
+                    );
+                }
+                if let Some(existing) = self
+                    .already_here(
+                        external_provider,
+                        external_id,
+                        path.clone(),
+                        &pool_members,
+                        options.prefetch,
+                    )
+                    .await
+                {
+                    return Ok(existing);
+                }
+            }
+        }
+
         // Never a second copy of a song already in the library; a lossy one is queued for a
         // higher quality copy instead. Not for a replacement or a Better quality search, which
         // exist to download a song that is already there.
@@ -872,6 +1292,7 @@ impl BaseDownloadService {
                 )
                 .await
                 .filter(|owned| !flac_only || owned.lossless || options.prefetch)
+                .filter(|owned| !passed_over.contains(&owned.absolute_path))
         {
             let decision = LibraryOwnership::decide(
                 Some(&owned),
@@ -919,15 +1340,38 @@ impl BaseDownloadService {
         }
 
         // A song a family member already has on disk is never downloaded again: another member
-        // gets a link to the same file, and the shared library takes the file over.
-        if !is_cache
-            && options.replacement.is_none()
-            && !options.upgrade_search
-            && let Some(family) = family
-            && let Some(found) = family
+        // gets a link to the same file, and the shared library takes the file over. A download
+        // judged by its own people's gates takes that file only as it takes one that landed for
+        // someone else: their gates judge it first, and one they refuse is passed over.
+        let family_file = match family {
+            Some(family) if !is_cache && options.replacement.is_none() && !options.upgrade_search => family
                 .find_song(external_provider, external_id, &song)
                 .await
                 .filter(|found| !flac_only || found.is_real_flac())
+                .filter(|found| !passed_over.contains(&found.path)),
+            _ => None,
+        };
+        let family_file = match family_file {
+            Some(found) if landed_first => {
+                let passes = self
+                    .backend
+                    .judge_landed(self, &mut new_download(song.clone()), &found.path)
+                    .await;
+                if passes == Some(false) {
+                    info!(
+                        "'{} - {}' is on disk for the family at {}, and this download's own check does not pass it; it fetches its own",
+                        song.artist, song.title, found.path
+                    );
+                    passed_over.push(found.path.clone());
+                    None
+                } else {
+                    Some(found)
+                }
+            }
+            found => found,
+        };
+        if let Some(family) = family
+            && let Some(found) = family_file
             && let Some(path) = match &pool_members {
                 Some(_) => Some(found.path.clone()),
                 None if options.prefetch => Some(found.path.clone()),
@@ -1003,17 +1447,53 @@ impl BaseDownloadService {
         // Snapshot before anything can correct it: with NameFromMatch off this is still what
         // names the file, which is how every existing library was built.
         let requested = RequestedIdentity::new(&song.artist, &song.title, &song.album, song.track);
+        self.start_album_pick(&song, &requested);
 
         // A song fetched ahead earlier is taken from its folder instead of downloaded again, with
-        // what its download learned, and finalized exactly as a fresh download.
-        let promoted = if options.prefetch || options.replacement.is_some() || options.upgrade_search {
+        // what its download learned, and finalized exactly as a fresh download. A person's keep
+        // takes it only when it is the very copy they heard.
+        let promoted = if options.prefetch
+            || options.replacement.is_some()
+            || options.upgrade_search
+            || (options.place.keep_anyway && !heard_an_ahead_copy(&options.place))
+        {
             None
         } else {
             self.promote_ahead(external_provider, external_id, &mut song)
         };
 
-        let (transferred, fetched_from, muted) = match promoted {
-            Some((landed, fetched_from)) => (Ok(landed), fetched_from, false),
+        // A heart's or a play's gates judge a song fetched ahead before it is kept; one they pass
+        // over is gone, and the download runs.
+        let gated = matches!(
+            options.place.origin,
+            Some(AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart | AcquisitionOrigin::Play)
+        ) && !options.place.gates.is_empty();
+        let promoted = match promoted {
+            Some((landed, fetched_from, identity)) if gated => {
+                let mut judged = new_download(song.clone());
+                if self
+                    .backend
+                    .judge_ahead(self, &mut judged, &landed, identity)
+                    .await
+                {
+                    song = judged.song;
+                    Some((landed, fetched_from))
+                } else {
+                    let _ = std::fs::remove_file(&landed);
+                    None
+                }
+            }
+            Some((landed, fetched_from, identity)) => {
+                self.backend
+                    .judge_ahead_joiners(&new_download(song.clone()), &landed, identity)
+                    .await;
+                Some((landed, fetched_from))
+            }
+            None => None,
+        };
+
+        let (transferred, fetched_from, fetched_video, muted) = match promoted {
+            Some((landed, fetched_from)) => (Ok(landed), fetched_from, None, false),
             None => {
                 // Parallel only once slskd has proven it files each download in its own folder;
                 // until then the lock is held through the transfer exactly as before. The
@@ -1031,18 +1511,7 @@ impl BaseDownloadService {
                         .await
                         .ok();
                 }
-                let mut download = TrackDownload {
-                    track_id: external_id.to_string(),
-                    song,
-                    suppress_notify: silence,
-                    source_override: options.source_override,
-                    upgrade_search: options.upgrade_search,
-                    replacing_path: options.replacement.as_ref().map(|r| r.original_path.clone()),
-                    fetched_from: None,
-                    muted: false,
-                    flac_only,
-                    ahead: options.prefetch,
-                };
+                let mut download = new_download(song);
                 let transferred = self
                     .backend
                     .download_track(self, &mut download, cancellation_token)
@@ -1051,11 +1520,12 @@ impl BaseDownloadService {
                 let TrackDownload {
                     song: downloaded,
                     fetched_from,
+                    fetched_video,
                     muted,
                     ..
                 } = download;
                 song = downloaded;
-                (transferred, fetched_from, muted)
+                (transferred, fetched_from, fetched_video, muted)
             }
         };
         // The transfer's check may have named another album holding the same recording; the
@@ -1065,6 +1535,9 @@ impl BaseDownloadService {
         }
         let mut landed_path = transferred?;
         Self::ensure_on_disk(Some(&landed_path))?;
+        if options.place.keep_anyway {
+            kept_by_you(&mut song);
+        }
         // Placing, tagging and registering touch the library and the mapping file, and those stay
         // one at a time.
         if permit.is_none() {
@@ -1108,6 +1581,17 @@ impl BaseDownloadService {
         // since nothing may read a file while it moves.
         let loudness = self.start_loudness(&landed_path);
 
+        // One layout and one root for the whole download, so the album folder identify looks in
+        // for a sibling is the one placement files into, whatever the settings say meanwhile.
+        let placing_root = pool_members
+            .as_ref()
+            .and(family)
+            .and_then(|family| family.pool_root());
+        let _ = requested.placing.set(Placing {
+            walk: options.album_context.is_some(),
+            ..self.placing_for(placing_root.as_deref())
+        });
+
         // Identify before the file is placed: the album the chooser settles on names the folder
         // (#50) and its main artist names the artist folder (#49). Reads only; nothing is written
         // to the file until it sits where it will stay.
@@ -1125,6 +1609,14 @@ impl BaseDownloadService {
             ));
         }
         self.apply_loudness(&mut song, loudness, &landed_path).await;
+        self.learn_disc_count(
+            &mut song,
+            &requested,
+            external_provider,
+            external_id,
+            listed.as_ref(),
+        )
+        .await;
         let identified = [
             (!dotnet::is_blank(&song.album)).then(|| match song.year.filter(|y| *y > 0) {
                 Some(year) => format!("on {} ({year})", song.album),
@@ -1162,17 +1654,73 @@ impl BaseDownloadService {
             .and(family)
             .and_then(|family| family.pool_root());
         let ahead_folder = options.ahead_folder.as_deref().filter(|_| options.prefetch);
+        // The people a file held for a Lidarr follow waits for: those whose own gate it went
+        // through, else whoever asked.
+        let asked: Vec<&str> = if options.place.gates.is_empty() {
+            options
+                .requested_by
+                .iter()
+                .flatten()
+                .map(|user| user.trim())
+                .collect()
+        } else {
+            options.place.gates.iter().map(|gate| gate.user.trim()).collect()
+        };
+        let mut waiting_for_it: Vec<String> = Vec::new();
+        for user in asked {
+            if !user.is_empty()
+                && !waiting_for_it
+                    .iter()
+                    .any(|known| dotnet::eq_ignore_case(known, user))
+            {
+                waiting_for_it.push(user.to_string());
+            }
+        }
         let mut placement = match (&options.replacement, &pool_root, ahead_folder) {
             (_, _, Some(folder)) => Placement::new(
                 self.place_ahead(&landed_path, folder, external_provider, external_id)?,
                 false,
             ),
-            (None, None, None) => self.place_in_library(&song, &requested, &landed_path).await,
-            (None, Some(root), None) => self.place_in_root(&song, &requested, &landed_path, root).await,
+            (None, None, None) => {
+                self.place_or_hold(
+                    &song,
+                    &requested,
+                    &landed_path,
+                    None,
+                    options.source_override,
+                    &waiting_for_it,
+                )
+                .await
+            }
+            (None, Some(root), None) => {
+                self.place_or_hold(
+                    &song,
+                    &requested,
+                    &landed_path,
+                    Some(root),
+                    options.source_override,
+                    &waiting_for_it,
+                )
+                .await
+            }
             (Some(_), _, None) => self.stage_replacement(&landed_path)?,
         };
+        if let Some(why) = placement.failed.as_deref() {
+            // Kept where it landed, the file would sit where no scan looks and be swept a day
+            // later, recorded as in the library: the download fails instead, and the next source
+            // runs.
+            anyhow::bail!("The song could not be filed in the library: {why}");
+        }
         let mut local_path = placement.path.clone();
         song.local_path = Some(local_path.clone());
+        song.layout_values = placement.values.clone().map(Box::new);
+        // The album's facts from the file of the folder the song joined that placement read
+        // under its lock (a tidy rename or a family pool promotion can have made that folder
+        // since identify looked); the values it was named from already carry them. A walk's
+        // placement takes none: the walk keeps the facts it settled on itself.
+        if let Some(sibling) = placement.pinned.as_ref() {
+            self.pin_to_folder(&mut song, sibling);
+        }
         // Again after placement: identification takes seconds, and placement hands back the old
         // path when the file is missing rather than failing.
         Self::ensure_on_disk(Some(&local_path))?;
@@ -1192,6 +1740,21 @@ impl BaseDownloadService {
         let cover = self
             .write_metadata_replacing(&local_path, &mut song, replacing.as_deref())
             .await;
+        // The tags the names came from, as written, so the File layout task sees a later edit:
+        // read back from the file the way the task reads it, since the writer leaves some of
+        // them otherwise than the song says (an album artist it fills in, a release type in
+        // several values, a disc count only beside a disc number).
+        if let Some(mut values) = song.layout_values.take() {
+            let written = octo_media::tags::TagFile::open(&local_path)
+                .ok()
+                .map(|file| crate::services::common::album_identity::LayoutTags::read(&file));
+            values.tags = Some(
+                written
+                    .map(|tags| tags.snapshot())
+                    .unwrap_or_else(|| TagSnapshot::of_song(&song)),
+            );
+            song.layout_values = Some(values);
+        }
         if ahead_folder.is_some() {
             return Ok(self.keep_ahead(
                 external_provider,
@@ -1199,7 +1762,7 @@ impl BaseDownloadService {
                 song_id,
                 &local_path,
                 song,
-                fetched_from.as_deref(),
+                (fetched_from.as_deref(), fetched_video.as_deref()),
             ));
         }
         if let Some(replacement) = &options.replacement {
@@ -1272,6 +1835,8 @@ impl BaseDownloadService {
             && let Some(playlist_id) = playlists.get_playlist_id_for_track(song_id)
         {
             info!("Track {song_id} belongs to playlist {playlist_id}, adding to M3U");
+            // A tidy rewriting playlist files finishes first, so neither change is lost.
+            let _playlists = PLAYLISTS.lock().await;
             if let Err(e) = playlists
                 .add_track_to_m3u(&playlist_id, &song, &local_path, false)
                 .await
@@ -1283,14 +1848,24 @@ impl BaseDownloadService {
         // Only register and scan if NOT in cache mode.
         if !is_cache {
             self.local_library
-                .register_downloaded_song(&song, &local_path)
+                .register_downloaded_song_as(&song, &local_path, kept_heart(&options.place, &song))
                 .await?;
             // A pool file is recorded and linked for every member who asked (their libraries
-            // are scanned one by one); Navidrome shows it at the first member's link.
+            // are scanned one by one); Navidrome shows it at the first member's link. One judged
+            // by its own people's checks, or kept by its person, is theirs alone: it never
+            // replaces anyone else's copy of the song.
+            let personal = judged_by_own(&options.place) || options.place.keep_anyway;
             let pooled = match (family, &pool_members, &pool_root) {
                 (Some(family), Some(members), Some(_)) => Some(
                     family
-                        .placed(&local_path, &song, external_provider, external_id, members)
+                        .placed(
+                            &local_path,
+                            &song,
+                            external_provider,
+                            external_id,
+                            members,
+                            personal,
+                        )
                         .await
                         .unwrap_or_else(|| local_path.clone()),
                 ),
@@ -1374,6 +1949,88 @@ impl BaseDownloadService {
         Ok(local_path)
     }
 
+    /// How many discs the song's album has, for a layout that names `{Disc}`, when identification
+    /// left it unknown: the most discs the album Album mode fetched lists, else the most one
+    /// listing of the song's catalog album lists, waited for at most [`Self::DISC_COUNT_WAIT`].
+    /// Taken only from a listing of the album the song is filed under (its title's key is the
+    /// album's), and written to the song, so DISCTOTAL carries it. A listing that does not come
+    /// leaves the count unknown.
+    async fn learn_disc_count(
+        &self,
+        song: &mut Song,
+        requested: &RequestedIdentity,
+        provider: &str,
+        external_id: &str,
+        listed: Option<&Album>,
+    ) {
+        if song.total_discs.is_some_and(|count| count > 0) || dotnet::is_blank(&song.album) {
+            return;
+        }
+        let layout = self.layout_of(requested);
+        if ![LayoutKind::Album, LayoutKind::Single, LayoutKind::Compilation]
+            .into_iter()
+            .any(|kind| layout.template(kind).uses(Field::Disc))
+        {
+            return;
+        }
+        let fetched;
+        let album = match listed {
+            Some(album) => Some(album),
+            None => {
+                let Some(album_id) = song
+                    .album_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| self.backend.extract_external_id_from_album_id(id))
+                    .filter(|id| !id.is_empty())
+                else {
+                    return;
+                };
+                let wait = *self.disc_count_wait.lock();
+                fetched = match tokio::time::timeout(wait, self.metadata.get_album(provider, &album_id)).await
+                {
+                    Ok(album) => album,
+                    Err(_) => {
+                        info!(
+                            "The catalog did not list '{}' within {}s, so its disc count stays unknown",
+                            song.album,
+                            wait.as_secs()
+                        );
+                        None
+                    }
+                };
+                fetched.as_ref()
+            }
+        };
+        let Some(album) =
+            album.filter(|album| SongIdentity::key(&album.title) == SongIdentity::key(&song.album))
+        else {
+            return;
+        };
+        let Some(count) = album
+            .songs
+            .iter()
+            .filter_map(|listed| listed.disc_number)
+            .filter(|disc| *disc > 0)
+            .max()
+        else {
+            return;
+        };
+        song.total_discs = Some(count);
+        if song.disc_number.is_none() {
+            song.disc_number = album
+                .songs
+                .iter()
+                .find(|listed| listed.external_id.as_deref() == Some(external_id))
+                .and_then(|listed| listed.disc_number)
+                .filter(|disc| *disc > 0);
+        }
+        debug!(
+            "'{}' has {count} disc(s), as its catalog listing says",
+            song.album
+        );
+    }
+
     /// Takes a song fetched ahead into a staging folder of its own under the incoming folder (a
     /// copy, when the song is playing now), and gives the song back what its download learned.
     /// The staged path and the source that brought it, or None when there is no such song (or
@@ -1383,7 +2040,7 @@ impl BaseDownloadService {
         external_provider: &str,
         external_id: &str,
         song: &mut Song,
-    ) -> Option<(String, Option<String>)> {
+    ) -> Option<(String, Option<String>, HeardSource)> {
         let prefetched = self.services.prefetched.as_ref()?;
         if !prefetched.has(external_provider, external_id) {
             return None;
@@ -1421,14 +2078,23 @@ impl BaseDownloadService {
                 None,
             )
         });
+        // The copy's own identity, as a heard copy of it is recorded: the same entry under the same
+        // key, made ready from the same file.
+        let identity = HeardSource::Copy {
+            key: format!("{external_provider}:{external_id}"),
+            ready_at: taken.sidecar.ready_at,
+            source_file: taken.sidecar.source_file.clone(),
+        };
         Some((
             taken.path.to_string_lossy().into_owned(),
             taken.sidecar.fetched_from.clone(),
+            identity,
         ))
     }
 
-    /// The end of a download ahead: its facts beside the file in the folder, the folder's index
-    /// told, and no record left behind, so a heart waiting on it takes the file from there.
+    /// The end of a download ahead: its facts beside the file in the folder (with the source it
+    /// came from and, for YouTube, its video), the folder's index told, and no record left behind,
+    /// so a heart waiting on it takes the file from there.
     fn keep_ahead(
         &self,
         external_provider: &str,
@@ -1436,7 +2102,7 @@ impl BaseDownloadService {
         song_id: &str,
         local_path: &str,
         song: Song,
-        fetched_from: Option<&str>,
+        (fetched_from, fetched_video): (Option<&str>, Option<&str>),
     ) -> String {
         let path = Path::new(local_path);
         if let Some(seconds) = octo_media::tags::TagFile::open(local_path)
@@ -1446,14 +2112,17 @@ impl BaseDownloadService {
         {
             self.metadata.remember_file_length(external_id, seconds);
         }
-        let sidecar = AheadSidecar::of(
-            external_provider,
-            external_id,
-            path,
-            &song,
-            fetched_from,
-            Utc::now(),
-        );
+        let sidecar = AheadSidecar {
+            video_id: fetched_video.map(str::to_string),
+            ..AheadSidecar::of(
+                external_provider,
+                external_id,
+                path,
+                &song,
+                fetched_from,
+                Utc::now(),
+            )
+        };
         if let Err(e) = write_sidecar(path, &sidecar) {
             warn!("Could not write what was learned beside {local_path}: {e}");
         }
@@ -1663,6 +2332,13 @@ impl BaseDownloadService {
             .cloned()
             .collect();
 
+        // Tracks a hearted album already holds wait where they are: no walk fetches them again.
+        let askers = requested_by.clone().unwrap_or_default();
+        if let Some(gates) = &self.services.album_gates {
+            tracks_to_download
+                .retain(|track| !gates.settled(&provider, album_external_id, &askers, external_id_of(track)));
+        }
+
         info!(
             "Found {} additional tracks to download for album '{}'",
             tracks_to_download.len(),
@@ -1724,10 +2400,27 @@ impl BaseDownloadService {
                 .try_collect()
                 .await
                 .unwrap_or_default();
-            let owned: HashMap<String, OwnedCopy> = found
+            let mut owned: HashMap<String, OwnedCopy> = found
                 .into_iter()
                 .filter_map(|(id, copy)| copy.map(|copy| (id, copy)))
                 .collect();
+            // A hearted album's track counts a library copy as its own only when each person's
+            // track gate proves it is the recording that track must be; otherwise it is fetched.
+            if let Some(album_gates) = &self.services.album_gates {
+                let mut unproven = Vec::new();
+                for (id, copy) in &owned {
+                    let gates = album_gates.track_gates(&provider, album_external_id, &askers, id);
+                    for gate in &gates {
+                        if !self.backend.owned_passes(&copy.absolute_path, gate).await {
+                            unproven.push(id.clone());
+                            break;
+                        }
+                    }
+                }
+                for id in unproven {
+                    owned.remove(&id);
+                }
+            }
             let can_be_lossless = self.source_can_be_lossless(source_override);
             let may_upgrade = self.upgrade_allowed(requested_by.as_deref());
             for track in tracks_to_download.iter() {
@@ -1777,6 +2470,7 @@ impl BaseDownloadService {
             suppress_summary,
             requested_by: &requested_by,
             cancellation_token,
+            album_external_id,
         };
 
         // Tracks whose file came from one peer's folder of the album, already queued in one
@@ -1845,19 +2539,53 @@ impl BaseDownloadService {
         Ok(failed == 0)
     }
 
+    /// The library copy a walk's track counts as already had: any copy for a walk nobody gates;
+    /// for a hearted album's track, only when each gated person's own copy is proven by their
+    /// track's gate to be the recording it must be. None when the track is to be fetched.
+    async fn walk_owned_copy(&self, provider: &str, track_id: &str, gates: &[HeartGate]) -> Option<String> {
+        if gates.is_empty() {
+            return self
+                .local_library
+                .get_local_path_for_external_song(provider, track_id)
+                .await
+                .filter(|path| file_exists(path));
+        }
+        let mut first = None;
+        for gate in gates {
+            let theirs = self
+                .local_library
+                .get_local_path_for_external_song_as(Some(&gate.user), provider, track_id)
+                .await
+                .filter(|path| file_exists(path))?;
+            if !self.backend.owned_passes(&theirs, gate).await {
+                debug!(
+                    "Track {track_id} has a copy in the library ({theirs}) nothing proves is the recording {} hearted; it is fetched",
+                    gate.user
+                );
+                return None;
+            }
+            first.get_or_insert(theirs);
+        }
+        first
+    }
+
     /// One track of the walk. The counters are shared by both lanes, so they move atomically.
     async fn walk_track(&self, track: &Song, walk: &Walk<'_>) {
         let provider = self.provider_name();
         let track_id = external_id_of(track);
+        // Each person whose heart of the album is gated judges the track's file against the
+        // track's own recording, by the album's rule.
+        let askers = walk.requested_by.clone().unwrap_or_default();
+        let gates = self
+            .services
+            .album_gates
+            .as_ref()
+            .map(|gates| gates.track_gates(provider, walk.album_external_id, &askers, track_id))
+            .unwrap_or_default();
         let attempt: anyhow::Result<()> = async {
             self.backend.ensure_routing_registered(track);
 
-            if let Some(existing) = self
-                .local_library
-                .get_local_path_for_external_song(provider, track_id)
-                .await
-                .filter(|path| file_exists(path))
-            {
+            if let Some(existing) = self.walk_owned_copy(provider, track_id, &gates).await {
                 debug!("Track {track_id} already downloaded, skipping");
                 self.track(|t| {
                     t.already_in_library(
@@ -1910,6 +2638,11 @@ impl BaseDownloadService {
                         source_override: walk.source_override,
                         requested_by: walk.requested_by.clone(),
                         album_context: Some(Arc::clone(walk.context)),
+                        place: AcquisitionPlace {
+                            origin: gates.first().map(|gate| gate.origin),
+                            gates: gates.clone(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
                     walk.cancellation_token,
@@ -1928,6 +2661,18 @@ impl BaseDownloadService {
         }
         .await;
         if let Err(e) = attempt {
+            // Held in the one hold path for the album's hearts: their chain files it, and no later
+            // walk of the album fetches it again.
+            if let Some(held) = e.downcast_ref::<AcquisitionHeld>()
+                && let Some(album_gates) = &self.services.album_gates
+            {
+                info!(
+                    "Track {track_id} '{}' waits in the hold path: {}",
+                    track.title, held.line
+                );
+                album_gates.held(provider, walk.album_external_id, &askers, track_id, held.clone());
+                return;
+            }
             warn!("Failed to download track {track_id} '{}': {e:#}", track.title);
             walk.counters.failed.fetch_add(1, Ordering::SeqCst);
             // Same rule as the summary: a source with another after it stays quiet, and the next
@@ -2223,6 +2968,8 @@ struct Walk<'a> {
     suppress_summary: bool,
     requested_by: &'a Option<Vec<String>>,
     cancellation_token: &'a CancellationToken,
+    /// The album's id, which its hearts' gates are kept under.
+    album_external_id: &'a str,
 }
 
 #[derive(Default)]
@@ -2270,6 +3017,12 @@ pub(crate) fn get_extension(path: &str) -> &str {
 
 #[async_trait]
 impl IDownloadService for BaseDownloadService {
+    fn held_root(&self) -> Option<std::path::PathBuf> {
+        let download_path = self.download_path();
+        (!download_path.trim().is_empty())
+            .then(|| crate::services::common::soulseek_hold_store::held_root(Path::new(&download_path)))
+    }
+
     async fn download_song(
         &self,
         external_provider: &str,
@@ -2447,6 +3200,7 @@ impl IDownloadService for BaseDownloadService {
                     place: AcquisitionPlace {
                         pool_members: None,
                         flac_only: true,
+                        ..Default::default()
                     },
                     prefetch: true,
                     ahead_folder: Some(folder.to_path_buf()),
@@ -2472,6 +3226,17 @@ impl IDownloadService for BaseDownloadService {
             .lock()
             .values()
             .any(|info| info.status == DownloadStatus::InProgress)
+    }
+
+    async fn place_held(
+        &self,
+        held: &crate::services::lidarr::HeldPlacement,
+    ) -> crate::services::i_download_service::HeldEnd {
+        self.place_held_file(held).await
+    }
+
+    async fn drop_held(&self, held: &crate::services::lidarr::HeldPlacement, users: &[String]) -> bool {
+        self.drop_held_copy(held, users).await
     }
 
     async fn get_local_path_if_exists(&self, external_provider: &str, external_id: &str) -> Option<String> {
