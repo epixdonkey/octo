@@ -53,7 +53,10 @@ struct LiveStation {
 
 /// A YouTube video id: 11 characters of the URL-safe base64 alphabet YouTube ids are made of.
 fn is_video_id(id: &str) -> bool {
-    id.len() == 11 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    id.len() == 11
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Whether `host` is a YouTube page host: `youtu.be` or any `…youtube.com` subdomain
@@ -88,8 +91,7 @@ pub(crate) fn you_tube_video_id(stream_url: &str) -> Option<String> {
     } else if path == "watch" {
         query.split('&').find_map(|pair| pair.strip_prefix("v="))
     } else {
-        path.strip_prefix("live/")
-            .or_else(|| path.strip_prefix("embed/"))
+        path.strip_prefix("live/").or_else(|| path.strip_prefix("embed/"))
     }?;
     is_video_id(id).then(|| id.to_string())
 }
@@ -100,8 +102,7 @@ pub(crate) fn you_tube_video_id(stream_url: &str) -> Option<String> {
 /// body that does not parse passes through unchanged too: the rewrite is an enhancement,
 /// never a new failure mode for the list.
 pub(super) fn rewrite_live_station_urls(relay: RelayResponse, call: &SubsonicCall) -> RelayResponse {
-    let live_url =
-        |id: &str| format!("{}://{}/radio/live/{id}", call.scheme(), call.host());
+    let live_url = |id: &str| format!("{}://{}/radio/live/{id}", call.scheme(), call.host());
     let rewritten = if call.format.eq_ignore_ascii_case("json") {
         rewrite_json(&relay.body, &live_url)
     } else {
@@ -234,7 +235,10 @@ pub async fn live_station_stream(
         }
         Err(refused) => {
             warn!("Live radio source refused for {station_id}: shim status {refused}");
-            short(StatusCode::BAD_GATEWAY, "The live radio source could not be opened")
+            short(
+                StatusCode::BAD_GATEWAY,
+                "The live radio source could not be opened",
+            )
         }
     }
 }
@@ -333,9 +337,7 @@ impl Stream for LiveBody {
     type Item = std::io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.audio
-            .poll_next_unpin(cx)
-            .map_err(std::io::Error::other)
+        self.audio.poll_next_unpin(cx).map_err(std::io::Error::other)
     }
 }
 

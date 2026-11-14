@@ -136,10 +136,7 @@ pub fn routes() -> RouteSet {
         )
         // The live station's stream, in the radio machine's shape: an endless MP3 forwarded
         // from the shim's /live/stream, the station row found in Navidrome by the id.
-        .route_with_head(
-            "/radio/live/{station-id}",
-            get(live_radio::live_station_stream),
-        )
+        .route_with_head("/radio/live/{station-id}", get(live_radio::live_station_stream))
         .subsonic("search3", get(search::search3).post(search::search3))
         .subsonic("search2", get(search::search3).post(search::search3))
         .subsonic(
