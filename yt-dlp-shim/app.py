@@ -31,6 +31,12 @@ Endpoints:
       flat-memory regardless of song length, and so cancellation is
       honored immediately (the upstream connection closes when the
       caller disconnects).
+
+  GET /live/stream?id=<videoId>[&abr=<64..320>][&name=<station>]
+      The 24/7 live variant for Octo's live radio stations: resolves the
+      channel's HLS manifest, then one long-lived ffmpeg transcodes it to
+      an endless MP3 CBR pipe. Self-heals by re-resolving and restarting
+      ffmpeg when the manifest expires; killed when the caller hangs up.
 """
 from __future__ import annotations
 
@@ -139,9 +145,10 @@ _URL_CACHE_TTL = int(os.environ.get("URL_CACHE_TTL", "3600"))  # 1 hour, well un
 _INFLIGHT_LOCK = threading.Lock()
 _INFLIGHT: "dict[str, threading.Lock]" = {}
 
-# What /health reports: /stream bodies being sent now, and yt-dlp processes running now.
+# What /health reports: /stream bodies being sent now, yt-dlp processes running now,
+# and /live/stream transcode pipes being sent now.
 _COUNTS_LOCK = threading.Lock()
-_COUNTS = {"active_streams": 0, "ytdlp_running": 0}
+_COUNTS = {"active_streams": 0, "ytdlp_running": 0, "live_streams": 0}
 
 
 def _count(name: str, change: int) -> None:
@@ -450,11 +457,14 @@ def _run(args: list[str], timeout: int = 20, label: str = "ytdlp",
 
 @app.get("/health")
 def health():
-    """Up, plus how busy: /stream bodies being sent now, yt-dlp processes running now, and how
-    many yt-dlp may run at once. Octo's family load view reads these."""
+    """Up, plus how busy: /stream bodies being sent now, yt-dlp processes running now,
+    /live/stream transcode pipes being sent now, and how many yt-dlp may run at once.
+    Octo's family load view reads these."""
     with _COUNTS_LOCK:
-        active, running = _COUNTS["active_streams"], _COUNTS["ytdlp_running"]
-    return jsonify(ok=True, active_streams=active, ytdlp_running=running, ytdlp_limit=_GATE.total)
+        active, running, live = (
+            _COUNTS["active_streams"], _COUNTS["ytdlp_running"], _COUNTS["live_streams"])
+    return jsonify(ok=True, active_streams=active, ytdlp_running=running,
+                   live_streams=live, ytdlp_limit=_GATE.total)
 
 
 def _is_bg() -> bool:
@@ -1560,6 +1570,116 @@ def stream():
         upstream.close()
         return Response(iter(()), headers=headers, status=response_status)
     return Response(generator(), headers=headers, status=response_status)
+
+
+# The live transcode pipe: how much ffmpeg stdout is read per yield (the /stream chunk size),
+# and the wait before each re-resolve attempt after ffmpeg died (manifest expired, 403, ...).
+# After the last wait one more restart is tried; when that dies too the answer closes quietly.
+_LIVE_CHUNK_BYTES = 64 * 1024
+_LIVE_RETRY_BACKOFF_SEC = (2.0, 5.0, 10.0, 30.0, 60.0)
+
+
+def _live_ffmpeg_args(manifest_url: str, abr: int) -> list[str]:
+    """One long-lived HLS→MP3 CBR transcode writing to stdout (the PoC's measured command).
+
+    ffmpeg follows the live playlist's window itself, so the process is started once per
+    listener and never re-read the manifest: it ends only when the manifest expires, which
+    is the death the retry ladder around it heals."""
+    return [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", manifest_url,
+        "-ac", "2", "-ar", "44100", "-b:a", f"{abr}k",
+        "-f", "mp3", "-",
+    ]
+
+
+@app.get("/live/stream")
+def live_stream():
+    """A YouTube live channel as an endless MP3 (Octo's live radio stations).
+
+    Resolve goes through the same TieredGate as every yt-dlp run. The ffmpeg pipe itself
+    is deliberately OUTSIDE the gate and WITHOUT any timeout: a 24/7 channel is open for
+    hours by design, and the only thing that should end it is the caller hanging up (the
+    generator's finally kills the process) or the channel dying (the retry ladder
+    re-resolves and restarts, sending no bytes between attempts, and closes quietly when
+    the attempts run out). Loudness is never measured here: ebur128 on an endless stream
+    can only end in its 120 s timeout, and a live channel has no one track to normalize.
+    No Content-Length and no icy-metaint: the body is endless and per-track ICY metadata
+    does not exist on a live channel, so we consciously send neither.
+    """
+    video_id = request.args.get("id", "").strip()
+    if not video_id:
+        abort(400, "missing id")
+    abr = _arg_int("abr", 192, 64, 320)
+    name = request.args.get("name", "").strip()
+    headers = {
+        "Content-Type": "audio/mpeg",
+        "Cache-Control": "no-store, no-transform",
+        "Accept-Ranges": "none",
+        "icy-br": str(abr),
+    }
+    if name:
+        headers["icy-name"] = name
+    # Flask routes HEAD here too. Answer it with the contract's headers and no body,
+    # before anything resolves or spawns: an iterated-but-unsent body would start an
+    # ffmpeg nobody listens to.
+    if request.method == "HEAD":
+        return Response(b"", headers=headers)
+
+    manifest = _resolve_url(video_id)
+    if not manifest:
+        return jsonify(error="no_audio_url"), 502
+
+    @stream_with_context
+    def generator():
+        # The manifest this attempt feeds ffmpeg with. Re-resolves replace it; the
+        # cached URL is evicted first or _resolve_url would hand back the dead one
+        # until its TTL ends.
+        current = {"manifest": manifest, "proc": None}
+        _count("live_streams", 1)
+        try:
+            attempts = len(_LIVE_RETRY_BACKOFF_SEC) + 1
+            for attempt in range(attempts):
+                if attempt:
+                    time.sleep(_LIVE_RETRY_BACKOFF_SEC[attempt - 1])
+                    _url_cache_evict(video_id)
+                    # Mid-answer there is no way to say busy (the headers are long
+                    # gone), so a full gate is just one more failed attempt.
+                    try:
+                        current["manifest"] = _resolve_url(video_id)
+                    except GateFull:
+                        current["manifest"] = None
+                stream_url = current["manifest"]
+                if not stream_url:
+                    log.warning("live %s: re-resolve gave no manifest (attempt %d/%d)",
+                                video_id, attempt + 1, attempts)
+                    continue
+                proc = subprocess.Popen(
+                    _live_ffmpeg_args(stream_url, abr),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                current["proc"] = proc
+                while True:
+                    chunk = proc.stdout.read(_LIVE_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    yield chunk
+                code = proc.wait()
+                current["proc"] = None
+                if attempt + 1 < attempts:
+                    log.warning("live %s: ffmpeg died (rc=%s), restarting (attempt %d/%d)",
+                                video_id, code, attempt + 1, attempts)
+            # Attempts exhausted: close quietly. The client has its bytes and the
+            # connection simply ends.
+        finally:
+            proc = current["proc"]
+            if proc is not None:
+                proc.kill()
+                proc.wait()
+            _count("live_streams", -1)
+
+    return Response(generator(), headers=headers)
 
 
 @app.get("/download")
