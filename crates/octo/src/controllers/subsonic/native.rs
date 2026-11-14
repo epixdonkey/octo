@@ -22,8 +22,8 @@ use octo_subsonic::subsonic_response_builder::{IdRegistry, genres_with_source, s
 use serde_json::{Value, json};
 
 use super::action_helpers::{
-    error_object, file_reply, int_try_parse, is_octo_playlist_id, materialize_station, native_username,
-    playlist_stations, queue_refresh_if_stale, written_body,
+    error_object, file_reply, int_try_parse, is_octo_playlist_id, materialize_station,
+    native_bearer_username, native_username, playlist_stations, queue_refresh_if_stale, written_body,
 };
 use super::playlists::to_node;
 use crate::app::AppState;
@@ -260,9 +260,14 @@ async fn try_serve_native_radio(
         *response.status_mut() = StatusCode::from_u16(raw.status).unwrap_or(StatusCode::BAD_GATEWAY);
         return Ok(Some(response));
     }
+    // The family caller comes from the bearer the page above validated, never from the
+    // request's `u` parameter — see [`native_family_identity`].
+    let family_caller = match native_family_identity(state, request) {
+        Ok(caller) => caller,
+        Err(refused) => return Ok(Some(*refused)),
+    };
     let username = native_username(state, request.parameters, request.headers);
     let stations = playlist_stations(state, &username);
-    let family_caller = native_family_caller(state, &username);
     let unchanged = || {
         file_reply(
             &raw.body,
@@ -361,13 +366,13 @@ async fn try_serve_native_radio(
 }
 
 /// The family caller of a native request whose bearer Navidrome has taken (the relayed page
-/// above already checked it): the user the request named — a member with their abilities,
-/// anyone else as the owner or an account outside the family — or, when nobody was named,
-/// the owner. That last stand-in is the single-owner shape the personal playlists overlay
-/// already documents for native requests that name no one (its service account acts for the
-/// owner); the family keeps the same rule, so a native create that named nobody founds in
-/// the owner's name. An account outside the family sees no family playlists (`may_view` is
-/// false for it).
+/// above already checked it): the user the bearer names — a member with their abilities,
+/// anyone else as the owner or an account outside the family — or, when the bearer names
+/// nobody, the owner. That last stand-in is the single-owner shape the personal playlists
+/// overlay already documents for native requests that name no one (its service account acts
+/// for the owner); the family keeps the same rule, so a native create whose bearer named
+/// nobody founds in the owner's name. An account outside the family sees no family
+/// playlists (`may_view` is false for it).
 fn native_family_caller(state: &AppState, username: &str) -> FamilyCaller {
     if let Some(member) = state.family_store.member(username) {
         return FamilyCaller::member(&member.username, member.preset, member.abilities());
@@ -377,6 +382,35 @@ fn native_family_caller(state: &AppState, username: &str) -> FamilyCaller {
         return FamilyCaller::unmanaged(&state.family_store.owner(), true);
     }
     FamilyCaller::unmanaged(named, state.family_store.is_owner(named))
+}
+
+/// The family caller of a native request, and the refusal when its `u` parameter names
+/// someone else than the bearer does. The identity comes from the bearer alone — the sign-in
+/// Octo watched pass through, else the JWT payload's own name claim, worth trusting only
+/// after Navidrome took the token's signature and expiry (the relayed page above, the
+/// create's probe) — because a query parameter is anyone's to write: with `u` first, a
+/// holder of any valid sign-in could found, read or answer as the family member the
+/// parameter named, a door REST keeps shut (its checked sign-in verifies the whole
+/// credential against Navidrome). A `u` that disagrees with a bearer who names an account
+/// is refused; one that names nobody the bearer says otherwise about is simply ignored —
+/// it never overrides the identity, and a bearer that names nobody keeps the owner
+/// stand-in above (in production a bearerless or refused sign-in never reaches this far:
+/// the relayed page, the create's probe, pass Navidrome's own refusal through first).
+fn native_family_identity(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+) -> Result<FamilyCaller, Box<Response>> {
+    let bearer = native_bearer_username(state, request.headers);
+    if let Some(named) = request.parameters.get("u").filter(|u| !u.is_empty())
+        && !bearer.is_empty()
+        && named != &bearer
+    {
+        return Err(Box::new(error_object(
+            StatusCode::FORBIDDEN,
+            "The sign-in does not name this account",
+        )));
+    }
+    Ok(native_family_caller(state, &bearer))
 }
 
 /// `POST /api/playlist` whose body's `name` starts with the Family page's playlist prefix:
@@ -418,8 +452,10 @@ async fn native_family_create(
     if let Some(refusal) = native_bearer_refusal(state, request).await? {
         return Ok(Some(refusal));
     }
-    let username = native_username(state, request.parameters, request.headers);
-    let caller = native_family_caller(state, &username);
+    let caller = match native_family_identity(state, request) {
+        Ok(caller) => caller,
+        Err(refused) => return Ok(Some(*refused)),
+    };
     Ok(Some(
         match super::playlists::found_family_playlist(state, &caller, &rest, &songs).await {
             Ok(playlist) => {

@@ -547,6 +547,60 @@ async fn a_native_prefixed_create_is_refused_outside_the_family() {
     assert!(f.state.family_playlists.list().is_empty(), "nothing was made");
 }
 
+// ---- the identity the family trusts ----
+
+/// The family surfaces take their caller from the bearer the probe or the relayed page had
+/// Navidrome take, never from the request's `u` parameter: a valid sign-in of an account
+/// outside the family cannot found, list or read the family as the owner by adding `?u=` —
+/// every surface refuses the pair, with no word of the family in the refusal — while a `u`
+/// that names the bearer's own account changes nothing.
+#[tokio::test]
+async fn the_family_caller_comes_from_the_bearer_never_the_u_parameter() {
+    let f = prefixed().await;
+    let id = f.playlist(vec![library("s-clean", SHARED_SCOPE, None)]);
+
+    // A create that would found a family playlist as the owner by parameter alone.
+    let reply = f
+        .native(
+            Method::POST,
+            "/api/playlist?u=winters",
+            r##"{"name":"#family Spoofed"}"##,
+            "guest",
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text());
+    assert!(
+        !reply.text().contains("#family"),
+        "no word of the prefix for a sign-in that names no one: {}",
+        reply.text()
+    );
+    assert!(
+        f.state
+            .family_playlists
+            .list()
+            .iter()
+            .all(|made| made.name != "Spoofed"),
+        "nothing was made"
+    );
+
+    // The list, the detail and the tracks answer none of the family for the mismatched pair.
+    for uri in [
+        "/api/playlist?u=winters".to_string(),
+        format!("/api/playlist/{id}?u=winters"),
+        format!("/api/playlist/{id}/tracks?u=winters"),
+    ] {
+        let reply = f.native(Method::GET, &uri, "", "guest").await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{uri}: {}", reply.text());
+    }
+
+    // A `u` that names the bearer's own account changes nothing.
+    let reply = f.native(Method::GET, "/api/playlist?u=alex", "", "alex").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let rows = reply.json();
+    let row = native_row(&rows, &id).expect("the family row beside the member's own");
+    assert_eq!(row["ownerName"], "Family");
+}
+
 // ---- the detail and the tracks ----
 
 /// The native detail of a family playlist serves its object; an `of` id nobody holds, or one

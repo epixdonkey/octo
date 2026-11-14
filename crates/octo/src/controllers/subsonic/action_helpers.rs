@@ -994,6 +994,14 @@ pub fn native_username(state: &AppState, parameters: &Parameters, headers: &Head
     if let Some(username) = parameters.get("u").filter(|u| !u.is_empty()) {
         return username.clone();
     }
+    native_bearer_username(state, headers)
+}
+
+/// Who the Navidrome JWT a native request carries is, with no say from the request's
+/// parameters: the sign-in Octo watched pass through, else the token's own claims. Empty
+/// when the token names nobody. The family surfaces take their caller from here alone — a
+/// parameter is anyone's to write, and the bearer is the thing Navidrome actually checked.
+pub(crate) fn native_bearer_username(state: &AppState, headers: &HeaderMap) -> String {
     let first = |name: &str| {
         headers
             .get(name)
