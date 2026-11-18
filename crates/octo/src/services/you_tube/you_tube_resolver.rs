@@ -979,6 +979,38 @@ impl YouTubeResolver {
         })
     }
 
+    /// Opens the shim's `/live/stream` for a YouTube live channel: an endless MP3 CBR body
+    /// (one shim-side ffmpeg per listener, killed when this response is dropped). Err carries
+    /// the shim's HTTP status, or 0 when it did not answer at all.
+    pub async fn open_live_stream(
+        &self,
+        video_id: &str,
+        bitrate_kbps: i32,
+        name: Option<&str>,
+    ) -> Result<reqwest::Response, u16> {
+        let mut url = format!(
+            "{}/live/stream?id={}&abr={bitrate_kbps}",
+            self.base_url,
+            escape(video_id)
+        );
+        if let Some(name) = name.filter(|name| !name.is_empty()) {
+            url.push_str(&format!("&name={}", escape(name)));
+        }
+        let resp = match self.stream_client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!("shim /live/stream failed for {video_id}: {e}");
+                return Err(0);
+            }
+        };
+        let status = resp.status().as_u16();
+        if status != 200 {
+            warn!("shim /live/stream HTTP {status} for {video_id}");
+            return Err(status);
+        }
+        Ok(resp)
+    }
+
     /// A `/stream` of `video_id` from a URL the shim resolves now for this request alone
     /// (`fresh=1`), on its background lane (`bg=1`), at exactly the audio format `itag` when
     /// given. `range_header` goes on as [`Self::open_stream`] passes it. Only an answer with
