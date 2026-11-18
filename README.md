@@ -16,6 +16,8 @@ Search any song and play it right away. Keep the ones you love as files on your 
 
 </div>
 
+> **This fork** (epixdonkey) rides behind upstream: every release of `winters27/octo` lands here whole, and the fork adds only what upstream has not built. Its stations: YouTube live channels as radio stations; YouTube Music rows in search; family playlists behind a prefix; the download doors on a playlist (a star, a `[download]` tag, the owner's own FLAC list); streaming favorites for the owner; a source badge and snapshot fills on held rows. Playlists are upstream's own held mechanism — the fork's parallel store is retired, and an old `personal-playlists.json` migrates onto `octo-playlists/` at first start. Images build from `dev` as `ghcr.io/epixdonkey/octo*`.
+
 ---
 
 Octo gives a home server what a streaming app has: search that reaches past your own library, songs that play the moment you pick them, and radio that learns what you like. When a song is worth keeping, Octo downloads the best copy it can find, tags it and files it in your library, where it stays with no subscription.
