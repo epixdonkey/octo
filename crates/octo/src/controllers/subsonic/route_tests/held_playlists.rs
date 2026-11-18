@@ -386,6 +386,19 @@ impl Nd {
         };
         match (method, parts.len()) {
             ("GET", 1) => ResponseTemplate::new(200).set_body_json(Self::native_row(&self.playlists[at])),
+            ("PUT", 1) => {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                let changed = self.tick();
+                let playlist = &mut self.playlists[at];
+                if let Some(name) = body["name"].as_str() {
+                    playlist.name = name.to_string();
+                }
+                if let Some(comment) = body["comment"].as_str() {
+                    playlist.comment = comment.to_string();
+                }
+                playlist.changed = changed;
+                ResponseTemplate::new(200).set_body_json(json!({}))
+            }
             ("DELETE", 1) => {
                 self.playlists.remove(at);
                 ResponseTemplate::new(200).set_body_json(json!({}))
@@ -1614,4 +1627,122 @@ async fn t19_a_members_request_a_copy_playlist_still_turns_adds_into_requests() 
     assert_eq!(asked["status"], "ok", "{asked}");
     assert!(f.held("drequestaaaaaaaaaaaaaa").is_none());
     assert!(f.tracks("drequestaaaaaaaaaaaaaa").is_empty());
+}
+
+// ---- The explicit download doors (R-5 operation 4) ----------------------------------------
+
+/// The fixture with a soulseek the heart's chain can reach (it refuses every call, which is
+/// the point: the chain queues the fetch, and no worker runs in tests to drain it).
+pub(super) async fn download_fixture() -> Fixture {
+    fixture_with(false, |settings| {
+        settings.soulseek.base_url = Some(format!(
+            "http://{}",
+            crate::services::test_support::refused_address()
+        ));
+    })
+    .await
+}
+
+/// One outside song the registry knows, as a position a held playlist streams.
+pub(super) fn registry_song(f: &Fixture, title: &str) -> String {
+    f.state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("K3KHA".into()),
+        title: Some(title.into()),
+        duration: Some(619),
+        ..Default::default()
+    })
+}
+
+/// The comment a playlist keeps in Navidrome.
+pub(super) fn stored_comment(f: &Fixture, id: &str) -> String {
+    f.nd.0
+        .lock()
+        .playlists
+        .iter()
+        .find(|p| p.id == id)
+        .map(|p| p.comment.clone())
+        .unwrap_or_default()
+}
+
+/// A star on a held playlist is the explicit "download the missing ones" (R-5 operation 4):
+/// only its still-streaming entry is queued, straight through the heart's queue — the entries
+/// with a library file are left alone — and the star itself changes nothing the playlist holds.
+/// Octo answers it alone (nothing of it reaches Navidrome), and the unstar path fetches
+/// nothing.
+#[tokio::test]
+async fn t50_a_star_on_a_held_playlist_fetches_only_its_still_streaming_entry() {
+    let f = download_fixture().await;
+    let missing = registry_song(&f, "Lost in Sound");
+    held_road_with(&f, &missing).await;
+
+    let reply = f.json("winters", &format!("star?id={ROAD}")).await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    until("the streamed entry is fetched", || {
+        f.state.track_acquisition_queue.is_in_flight("soulseek", &missing)
+    })
+    .await;
+    assert_eq!(
+        f.held(ROAD).unwrap(),
+        ["s-a", "s-b", missing.as_str()],
+        "the star changes nothing the playlist holds"
+    );
+    assert_eq!(f.tracks(ROAD), ["s-a", "s-b"]);
+}
+
+/// An unstar of a held playlist fetches nothing: the download door is the star's alone.
+#[tokio::test]
+async fn t51_an_unstar_of_a_held_playlist_fetches_nothing() {
+    let f = download_fixture().await;
+    let missing = registry_song(&f, "Lost in Sound");
+    held_road_with(&f, &missing).await;
+
+    let reply = f.json("winters", &format!("unstar?id={ROAD}")).await;
+    assert_eq!(reply["status"], "ok", "{reply}");
+    assert!(
+        f.state.track_acquisition_queue.is_idle(),
+        "an unstar fetches nothing"
+    );
+}
+
+/// A `[download]` tag in a held playlist's comment (the REST door) is the explicit "download
+/// the missing ones" (R-5 operation 4): only the still-streaming entry is queued, the tag
+/// itself never stays in the comment Navidrome keeps, and the edit changes no positions.
+#[tokio::test]
+async fn t52_a_download_tag_on_a_held_playlist_fetches_only_its_still_streaming_entry() {
+    let f = download_fixture().await;
+    let missing = registry_song(&f, "Lost in Sound");
+    held_road_with(&f, &missing).await;
+
+    let reply = f
+        .json(
+            "winters",
+            &format!("updatePlaylist?playlistId={ROAD}&comment=please%20%5Bdownload%5D"),
+        )
+        .await;
+
+    assert_eq!(reply["status"], "ok", "{reply}");
+    until("the tag fetches the streamed entry", || {
+        f.state.track_acquisition_queue.is_in_flight("soulseek", &missing)
+    })
+    .await;
+    assert_eq!(
+        stored_comment(&f, ROAD),
+        "please",
+        "the tag is read off the comment, not kept in it"
+    );
+    assert_eq!(f.held(ROAD).unwrap(), ["s-a", "s-b", missing.as_str()]);
+    assert_eq!(f.tracks(ROAD), ["s-a", "s-b"]);
+}
+
+/// ROAD holding `missing` after s-a and s-b.
+pub(super) async fn held_road_with(f: &Fixture, missing: &str) {
+    let added = f
+        .json(
+            "winters",
+            &format!("updatePlaylist?playlistId={ROAD}&songIdToAdd={missing}"),
+        )
+        .await;
+    assert_eq!(added["status"], "ok", "{added}");
+    assert_eq!(f.held(ROAD).unwrap(), ["s-a", "s-b", missing]);
 }

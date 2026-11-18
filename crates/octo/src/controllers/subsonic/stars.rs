@@ -40,6 +40,7 @@ use crate::services::last_fm::LastFmRadioTrackResolver;
 use crate::services::last_fm::last_fm_radio_track_resolver::ScrobbleDetails;
 use crate::services::library::{IgnoredRating, RatingActionRequest, RatingIgnored};
 use crate::services::listening::{self, AlbumLookup, Play as ListeningPlay};
+use crate::services::playlists::held_playlists::streams;
 use crate::services::soulseek::SoulseekMetadataService;
 use crate::services::subsonic::RelayError;
 use octo_core::family::abilities::RequestQuality;
@@ -147,6 +148,34 @@ pub async fn star(State(state): State<AppState>, req: Request) -> AppResult {
         return Ok(builder
             .create_error(&format, 0, "Playlist functionality is not enabled")
             .into_response());
+    }
+
+    // A star on a held playlist is the explicit "download the missing ones" (R-5 op. 4): only
+    // its still-streaming entries, straight through the heart's queue, which binds each entry
+    // to its file when the download lands. Nothing of this reaches Navidrome, so the sign-in is
+    // checked first; the unstar path never fetches.
+    let (held_stars, ids): (Vec<String>, Vec<String>) =
+        ids.into_iter().partition(|id| state.held_playlists.contains(id));
+    if !held_stars.is_empty() {
+        if let Some(refused) = refuse_unless_signed_in(&state, &call, &format).await? {
+            return Ok(refused);
+        }
+        let who = signed_in_user(&state, &call).await?;
+        let requested_by = requester_for(&state, Some(&who));
+        for playlist_id in &held_stars {
+            let Some(playlist) = state.held_playlists.view_of(playlist_id) else {
+                continue;
+            };
+            info!(
+                "A star on held playlist '{}' starts its {} missing download(s)",
+                playlist_id,
+                playlist.entries.iter().filter(|entry| streams(entry)).count()
+            );
+            super::held::queue_missing(&state, &playlist, requested_by.as_deref());
+        }
+        if ids.is_empty() {
+            return Ok(builder.create_response(&format, "starred").into_response());
+        }
     }
 
     let sources = state

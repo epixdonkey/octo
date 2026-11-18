@@ -1628,6 +1628,7 @@ async fn try_serve_native_held(
     let method = request.method;
     match (parts.len(), tracks) {
         (1, _) if method == Method::GET => native_read(state, request, &id).await,
+        (1, _) if method == Method::PUT => native_download_tag(state, request, &id).await,
         (1, _) if method == Method::DELETE => native_delete_playlist(state, request, &id).await.map(Some),
         (2, true) if method == Method::GET => native_tracks(state, request, &id).await,
         (2, true) if method == Method::POST => native_add(state, request, &id).await,
@@ -1675,6 +1676,42 @@ async fn native_read(
         headers,
         "application/json",
     )))
+}
+
+/// `PUT api/playlist/{id}` whose body's `comment` carries the `[download]` tag (R-5 op. 4): the
+/// held playlist's still-streaming entries are fetched through the heart's coordinator once
+/// Navidrome took the edit (its 2xx is the owner check: only the owner may edit a playlist).
+/// The tag stays in Navidrome's comment — the relay sends the caller's own body as it came, and
+/// rewriting it is not this door's to do — but the fetch is the same the REST door queues. None
+/// for any other edit: the faithful relay.
+async fn native_download_tag(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    id: &str,
+) -> Result<Option<Response>, AppError> {
+    if !held::held_now(state, id) {
+        return Ok(None);
+    }
+    let body: Value = serde_json::from_slice(request.body).unwrap_or(Value::Null);
+    if !body
+        .get("comment")
+        .and_then(Value::as_str)
+        .is_some_and(held::comment_asks_to_download)
+    {
+        return Ok(None);
+    }
+    let raw = request
+        .proxy
+        .relay_raw(request.endpoint, request.parameters)
+        .await?;
+    if (200..300).contains(&raw.status)
+        && let Some(playlist) = state.held_playlists.view_of(id)
+    {
+        let viewer = native_username(state, request.parameters, request.headers);
+        let requested_by = super::caller_checks::requester_for(state, Some(viewer.as_str()));
+        held::queue_missing(state, &playlist, requested_by.as_deref());
+    }
+    Ok(Some(relayed_raw(state, raw)))
 }
 
 /// `GET api/playlist/{id}/tracks` of a held playlist: the caller's own read first (the sign-in

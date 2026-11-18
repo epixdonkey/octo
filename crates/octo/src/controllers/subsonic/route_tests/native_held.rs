@@ -7,8 +7,8 @@ use axum::http::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::held_playlists::{
-    ALEX_MIX, Fixture, KID_LIST, OUTSIDE, OUTSIDE_ALBUM, OUTSIDE_EXPLICIT, ROAD, SMART, fixture,
-    fixture_with, native_token,
+    ALEX_MIX, Fixture, KID_LIST, OUTSIDE, OUTSIDE_ALBUM, OUTSIDE_EXPLICIT, ROAD, SMART, download_fixture,
+    fixture, fixture_with, native_token,
 };
 use super::{Reply, send};
 
@@ -214,4 +214,42 @@ async fn t48_a_native_add_to_a_members_request_a_copy_playlist_makes_a_request_a
     assert_eq!(asked.status, StatusCode::OK, "{}", asked.body);
     assert!(f.tracks("frequestaaaaaaaaaaaaaa").is_empty());
     assert!(f.held("frequestaaaaaaaaaaaaaa").is_none());
+}
+
+/// The same `[download]` tag through the native door (a PUT on the playlist's metadata, R-5
+/// operation 4): the still-streaming entry is fetched once Navidrome took the edit, and a PUT
+/// without the tag is the faithful relay alone.
+#[tokio::test]
+async fn t53_a_native_put_with_the_download_tag_fetches_the_still_streaming_entry() {
+    let f = download_fixture().await;
+    let missing = super::held_playlists::registry_song(&f, "Lost in Sound");
+    super::held_playlists::held_road_with(&f, &missing).await;
+
+    let plain = native(
+        &f,
+        "winters",
+        Method::PUT,
+        &format!("/api/playlist/{ROAD}"),
+        Some(json!({"comment": "just words"})),
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::OK, "{}", plain.body);
+    assert!(
+        f.state.track_acquisition_queue.is_idle(),
+        "a comment without the tag fetches nothing"
+    );
+
+    let tagged = native(
+        &f,
+        "winters",
+        Method::PUT,
+        &format!("/api/playlist/{ROAD}"),
+        Some(json!({"comment": "please [download]"})),
+    )
+    .await;
+    assert_eq!(tagged.status, StatusCode::OK, "{}", tagged.body);
+    super::until("the tag fetches the streamed entry", || {
+        f.state.track_acquisition_queue.is_in_flight("soulseek", &missing)
+    })
+    .await;
 }

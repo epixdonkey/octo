@@ -26,11 +26,13 @@ use octo_subsonic::SubsonicReply;
 use octo_subsonic::subsonic_request_parser::Parameters;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::action_helpers::{SubsonicCall, is_successful_subsonic_response};
+use super::caller_checks::requester_for;
 use super::playlists::{PlaylistChange, RowMarks, listed_rows, outside_song_json, signed_in};
 use crate::app::AppState;
+use crate::services::common::AcquisitionTarget;
 use crate::services::family::audio_gate::ExplicitMark;
 use crate::services::family::family_playlists::{self, Serve};
 use crate::services::family::hooks::caller_for;
@@ -236,6 +238,56 @@ pub(crate) fn held_now(state: &AppState, id: &str) -> bool {
 /// kept aside by the gone check, or keeps a `Replaced` record.
 pub(crate) fn has_part(state: &AppState, id: &str) -> bool {
     state.held_playlists.has_part(id)
+}
+
+// ---------------------------------------------------------------------------------------
+// The explicit download doors (R-5 operation 4)
+// ---------------------------------------------------------------------------------------
+
+/// The comment tag that asks for a held playlist's still-streaming entries to be fetched.
+pub(crate) const DOWNLOAD_TAG: &str = "[download]";
+
+/// Whether `comment` asks for the playlist's still-streaming entries to be fetched.
+pub(crate) fn comment_asks_to_download(comment: &str) -> bool {
+    comment.contains(DOWNLOAD_TAG)
+}
+
+/// The comment as it is kept: the tag is a command, not words, so it is read off and never
+/// stored.
+fn comment_without_tag(comment: &str) -> String {
+    comment.replace(DOWNLOAD_TAG, "").trim().to_string()
+}
+
+/// Queues a held playlist's still-streaming entries through the heart's coordinator: the
+/// explicit "download the missing ones" of R-5 operation 4 (a star on the playlist, or the
+/// `[download]` comment tag), straight to the queue — no request playlist, no family request.
+/// Entries with a library file are left alone, and nothing is bound here: the acquisition
+/// tracker's ended rows bind the entries to their files themselves (the held binder), so this
+/// one door only queues.
+pub(crate) fn queue_missing(state: &AppState, playlist: &HeldView, requested_by: Option<&str>) {
+    for (provider, external_id) in fetchable(&playlist.entries) {
+        info!(
+            "Playlist '{}': fetching its missing song {provider}:{external_id}",
+            playlist.id
+        );
+        state.heart_acquisition_coordinator.queue_track_for(
+            provider,
+            external_id,
+            requested_by,
+            AcquisitionTarget::Shared,
+        );
+    }
+}
+
+/// The still-streaming entries' `(provider, external id)` pairs: the one shape the explicit
+/// download doors queue. Entries with a library file are left alone, and one with no provider
+/// to fetch by is skipped, not guessed at.
+fn fetchable(entries: &[HeldEntry]) -> Vec<(&str, &str)> {
+    entries
+        .iter()
+        .filter(|entry| streams(entry))
+        .filter_map(|entry| Some((entry.provider.as_deref()?, entry.external_id.as_deref()?)))
+        .collect()
 }
 
 /// The playlist as its caller's own `getPlaylist` shows it.
@@ -696,9 +748,22 @@ async fn update(state: &AppState, call: &SubsonicCall, id: &str) -> Response {
     {
         return answer;
     }
+    // A `[download]` tag in the comment is the explicit "download the missing ones" (R-5 op. 4):
+    // after the change, the playlist's still-streaming entries are queued through the heart's
+    // coordinator. The tag is a command, not words, so the comment Navidrome keeps is read off
+    // it first.
+    let asks_to_download = call.param("comment").is_some_and(comment_asks_to_download);
     let meta: Vec<(String, String)> = ["name", "comment", "public"]
         .iter()
-        .filter_map(|key| call.param(key).map(|value| (key.to_string(), value.to_string())))
+        .filter_map(|key| {
+            let value = call.param(key)?;
+            let kept = if *key == "comment" {
+                comment_without_tag(value)
+            } else {
+                value.to_string()
+            };
+            Some((key.to_string(), kept))
+        })
         .collect();
     let fields = (!meta.is_empty()).then(|| {
         let mut pairs = auth_pairs(call);
@@ -719,6 +784,22 @@ async fn update(state: &AppState, call: &SubsonicCall, id: &str) -> Response {
         view: CallerList::of(state, call, id),
     };
     match state.held_playlists.update(request).await {
+        Ok(UpdateOutcome::Held {
+            view: Some(playlist),
+            skipped,
+        }) => {
+            if asks_to_download {
+                let requested_by = requester_for(state, Some(view.owner.as_str()));
+                queue_missing(state, &playlist, requested_by.as_deref());
+            }
+            with_skipped(
+                state
+                    .subsonic_response_builder
+                    .create_response(format, "updatePlaylist"),
+                format,
+                &skipped,
+            )
+        }
         Ok(UpdateOutcome::Held { skipped, .. }) => with_skipped(
             state
                 .subsonic_response_builder
@@ -1163,5 +1244,32 @@ mod tests {
             song: json!({"id": "s-a"}),
         }];
         assert_eq!(visible_rows(&state, None, "p", rows).len(), 1);
+    }
+
+    /// Only the still-streaming entries are queued: an entry with a library file is left alone,
+    /// and one with no provider to fetch by is skipped, not guessed at.
+    #[test]
+    fn queue_missing_fetches_only_the_still_streaming_entries() {
+        let streamed = entry(None, Some("ext-deezer-song-1"), "Glory");
+        let mut bound = entry(None, Some("ext-deezer-song-2"), "Bound");
+        bound.library_id = Some("s-glory".into());
+        let mut unfetchable = entry(None, Some("lost-id"), "Lost");
+        unfetchable.provider = None;
+        unfetchable.external_id = None;
+        let binding = [streamed, bound, unfetchable];
+        let pairs = fetchable(&binding);
+        assert_eq!(pairs, [("deezer", "1")]);
+    }
+
+    /// The tag is read off the comment wherever it sits, and the words around it stay.
+    #[test]
+    fn the_download_tag_is_read_off_the_comment_not_kept() {
+        assert!(comment_asks_to_download("please [download]"));
+        assert!(comment_asks_to_download("[download]"));
+        assert!(!comment_asks_to_download("downloads"));
+        assert_eq!(comment_without_tag("[download] please"), "please");
+        assert_eq!(comment_without_tag("please [download]"), "please");
+        assert_eq!(comment_without_tag("[download]"), "");
+        assert_eq!(comment_without_tag("no tag"), "no tag");
     }
 }
