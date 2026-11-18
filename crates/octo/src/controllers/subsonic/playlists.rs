@@ -52,8 +52,9 @@ use crate::services::subsonic::SubsonicResponseBuilderExt;
 use octo_core::family::abilities::RequestQuality;
 use tracing::info;
 
-/// How many songs of a family playlist are read at once.
-const FAMILY_SONGS_AT_ONCE: usize = 8;
+/// How many songs of a family playlist are read at once — REST's `served_entries` and the
+/// native tracks read alike.
+pub(crate) const FAMILY_SONGS_AT_ONCE: usize = 8;
 
 pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Response {
     let caller = family_caller(req.extensions()).cloned();
@@ -804,6 +805,85 @@ fn field_attributes(fields: &serde_json::Map<String, Value>) -> Vec<(String, Str
         .collect()
 }
 
+/// One family playlist's row in Navidrome's native shape: the REST row ([`family_playlist_fields`],
+/// the fields' source of truth) in the native API's casing — `ownerName`, `createdAt`,
+/// `updatedAt` — with the convention keys every native playlist row carries (the station
+/// row's own shape, minus a station's expiry).
+fn native_family_row(playlist: &FamilyPlaylist, viewer: &FamilyCaller, count: usize, seconds: i64) -> Value {
+    let fields = family_playlist_fields(playlist, viewer, count, seconds);
+    let mut row = serde_json::Map::new();
+    for (name, value) in fields {
+        let name = match name.as_str() {
+            "owner" => "ownerName",
+            "created" => "createdAt",
+            "changed" => "updatedAt",
+            other => other,
+        };
+        row.insert(name.to_string(), value);
+    }
+    row.insert("path".into(), json!(""));
+    row.insert("smartPlaylist".into(), json!(false));
+    Value::Object(row)
+}
+
+/// One family playlist's native row with the counts this viewer is shown — the shape the
+/// native list, detail and prefixed-create answers carry.
+pub(crate) async fn native_family_row_for(
+    state: &AppState,
+    playlist: &FamilyPlaylist,
+    viewer: &FamilyCaller,
+) -> Value {
+    let (count, seconds) = family_playlist_totals(state, playlist, viewer).await;
+    native_family_row(playlist, viewer, count, seconds)
+}
+
+/// The family playlists as native playlist rows for this caller: none while Family is off or
+/// for an account outside the family — the same rule the REST `getPlaylists` answer's
+/// [`family_rows`] serves by.
+pub(crate) async fn native_family_rows(state: &AppState, caller: &FamilyCaller) -> Vec<Value> {
+    if !state.settings.current().family.enabled {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for playlist in family_playlists::visible_playlists(&state.family_playlists, caller) {
+        rows.push(native_family_row_for(state, &playlist, caller).await);
+    }
+    rows
+}
+
+/// The entries a native family playlist serves its viewer, in order: `shown_entries`, with a
+/// kid profile's explicit songs left out — the same songs the answer rules leave in the REST
+/// `getPlaylist` answer, so the row's counts and its tracks agree. Each entry keeps its serve
+/// decision, so the native side reads the library song as the caller or the outside version
+/// as it says.
+pub(crate) async fn native_family_songs(
+    state: &AppState,
+    playlist: &FamilyPlaylist,
+    viewer: &FamilyCaller,
+) -> Vec<ShownEntry> {
+    let shown = family_playlists::shown_entries(playlist, viewer);
+    if !kid_filter::is_kid(viewer) {
+        return shown;
+    }
+    let unrated = state.settings.current().family.kid_unrated_is_explicit;
+    let index = &state.library_index;
+    let mut kept = Vec::new();
+    for entry in shown {
+        let explicit = match &entry.serve {
+            Serve::Library { id, .. } => kid_filter::song_is_explicit(index, id, None, unrated),
+            Serve::Outside(outside) => {
+                let stored = playlist.entries.get(entry.stored);
+                let (_, mark) = outside_facts(state, stored, outside).await;
+                mark.blocks_clean_only(unrated)
+            }
+        };
+        if !explicit {
+            kept.push(entry);
+        }
+    }
+    kept
+}
+
 /// The JSON merge: `subsonic-response.{container}.{row}` made an array if it was not one, and
 /// the rows appended. None when the body is not the object it should be.
 pub(super) fn merge_json(
@@ -1306,6 +1386,14 @@ async fn mutate(state: AppState, req: Request, id_key: &str, _fallback: &str, fa
             .create_error(format, 70, "Octo's generated playlists are read-only")
             .into_response();
     }
+    // The endpoint is the path's last segment, without `.view`.
+    let path = call.path();
+    let endpoint = path.split('/').next_back().unwrap_or("").replace(".view", "");
+    // A playlist named with the Family page's prefix, made in any Subsonic app: it becomes a
+    // family playlist here, before the held routes or Navidrome could take the create.
+    if let Some(answer) = prefixed_family_create(&state, &call).await {
+        return answer;
+    }
     // Playlist changes. Octo's own ids, refused above, are never anyone's upkeep playlist; the
     // held routes refuse songs found online for the upkeep playlists first, then hold, convert or
     // relay the change under the playlist's lock.
@@ -1314,9 +1402,6 @@ async fn mutate(state: AppState, req: Request, id_key: &str, _fallback: &str, fa
     {
         return super::held::route(state, call, id, change).await;
     }
-    // The endpoint is the path's last segment, without `.view`.
-    let path = call.path();
-    let endpoint = path.split('/').next_back().unwrap_or("").replace(".view", "");
     match call
         .proxy
         .relay_safe(&format!("rest/{endpoint}"), &call.parameters)
@@ -1331,7 +1416,7 @@ async fn mutate(state: AppState, req: Request, id_key: &str, _fallback: &str, fa
 }
 
 /// Whether `id` is a family playlist's while Family is on.
-fn is_family_playlist_id(state: &AppState, id: &str) -> bool {
+pub(crate) fn is_family_playlist_id(state: &AppState, id: &str) -> bool {
     id.starts_with("of") && is_octo_playlist_id(id, state.settings.current().family.enabled)
 }
 
@@ -1420,8 +1505,20 @@ async fn family_playlist(state: &AppState, call: &SubsonicCall, id: &str) -> Res
     let Some(playlist) = family_playlists::find(&state.family_playlists, caller, id) else {
         return playlist_error(state, call, PlaylistError::NotFound);
     };
+    family_playlist_answer(state, call, &playlist, caller).await
+}
 
-    let shown = family_playlists::shown_entries(&playlist, caller);
+/// One family playlist as `caller`'s answer: its row fields plus the songs the caller is
+/// served (see [`served_entries`]), counted and timed as `getPlaylist` does. Both the
+/// `getPlaylist` answer and a prefixed `createPlaylist`'s answer are this shape, so an app
+/// that just made a family playlist shows it at once, among the family's.
+async fn family_playlist_answer(
+    state: &AppState,
+    call: &SubsonicCall,
+    playlist: &FamilyPlaylist,
+    caller: &FamilyCaller,
+) -> Response {
+    let shown = family_playlists::shown_entries(playlist, caller);
     let entries: Vec<Value> = served_entries(state, call, shown, false)
         .await
         .unwrap_or_default()
@@ -1434,7 +1531,7 @@ async fn family_playlist(state: &AppState, call: &SubsonicCall, id: &str) -> Res
         .iter()
         .map(|song| song.get("duration").and_then(Value::as_i64).unwrap_or(0))
         .sum();
-    let fields = family_playlist_fields(&playlist, caller, entries.len(), seconds);
+    let fields = family_playlist_fields(playlist, caller, entries.len(), seconds);
     state
         .subsonic_response_builder
         .create_chart_playlist_response(&call.format, fields, &entries)
@@ -1778,6 +1875,135 @@ async fn new_entry(state: &AppState, id: &str) -> Option<NewEntry> {
         duration,
         explicit_status,
     })
+}
+
+/// `createPlaylist` whose playlist `name` starts with the Family page's playlist prefix: the
+/// playlist becomes a family playlist named the rest after the prefix, its `songId`s going in
+/// with their maker, so any Subsonic app can found a shared playlist and no panel is needed.
+/// Only a founding create is captured — `createPlaylist` with a `playlistId` replaces an
+/// existing playlist's songs (an edit, not a birth) and `updatePlaylist` never founds one —
+/// and the caller is checked before any answer of Octo's own is made (the blank-name answer
+/// names the prefix, a server setting), then must be family with playlists-editing rights,
+/// as any family change asks. `None` when the call is none of this: the caller's own create,
+/// untouched.
+async fn prefixed_family_create(state: &AppState, call: &SubsonicCall) -> Option<Response> {
+    let family = &state.settings.current().family;
+    if !family.enabled {
+        return None;
+    }
+    let prefix = family.playlist_prefix_as_set()?;
+    let founding = playlist_change(call) == Some(PlaylistChange::Create)
+        && call.param("playlistId").is_none()
+        && call.param("id").is_none();
+    if !founding {
+        return None;
+    }
+    let rest = call
+        .param("name")
+        .and_then(|name| name.strip_prefix(prefix))?
+        .trim()
+        .to_string();
+    // Who is asking, before anything is answered with Octo's own words: the same checked
+    // sign-in every family playlist change goes through. The blank-name answer below names
+    // the prefix, a server setting, so it is said to a checked caller alone (as family_mutate
+    // checks first: nothing is said in anyone's name until then).
+    let caller = match checked_caller(state, call).await {
+        Ok(caller) => caller,
+        Err(answer) => return Some(answer),
+    };
+    let songs: Vec<String> = call
+        .incoming
+        .parameter_values("songId")
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect();
+    match found_family_playlist(state, &caller, &rest, &songs).await {
+        Ok(playlist) => Some(family_playlist_answer(state, call, &playlist, &caller).await),
+        Err(refused) => Some(family_error(state, call, refused.code, &refused.message)),
+    }
+}
+
+/// What a prefixed family create was refused with: the Subsonic error's code and message. The
+/// native front answers the same refusal in its own shape, so both protocols say one thing.
+pub(crate) struct RefusedCreate {
+    pub code: i32,
+    pub message: String,
+}
+
+/// A [`PlaylistError`] as a prefixed create's refusal.
+fn refused_create(error: PlaylistError) -> RefusedCreate {
+    let code = match error {
+        PlaylistError::NotFound => 70,
+        PlaylistError::NotAllowed(_) => 50,
+        PlaylistError::BlankName => 10,
+        // An add past a cap of songs found online, or one whose save failed: a soft refusal,
+        // answered like a change that raced (upstream's own mapping).
+        PlaylistError::Changed | PlaylistError::Refused(_) => 0,
+    };
+    RefusedCreate {
+        code,
+        message: error.message().to_string(),
+    }
+}
+
+/// The one heart of a prefixed family create, which REST's `createPlaylist` and the native
+/// `POST /api/playlist` both beat through, so the two protocols cannot drift: the blank-name
+/// refusal that names the prefix, the playlist's making, the songs that came with the call
+/// (their order kept), the log line. The protocol fronts decide whether a create is theirs
+/// (the prefix, a founding create) and who is asking (each its own checked sign-in); nothing
+/// is answered here before the caller was checked.
+pub(crate) async fn found_family_playlist(
+    state: &AppState,
+    caller: &FamilyCaller,
+    rest: &str,
+    songs: &[String],
+) -> Result<FamilyPlaylist, RefusedCreate> {
+    let prefix = state
+        .settings
+        .current()
+        .family
+        .playlist_prefix_as_set()
+        .unwrap_or_default()
+        .to_string();
+    if rest.is_empty() {
+        return Err(RefusedCreate {
+            code: 10,
+            message: format!("Type a name after {prefix} to make a family playlist."),
+        });
+    }
+    let made = match family_playlists::create(&state.family_playlists, caller, rest, false, Utc::now()) {
+        Ok(playlist) => playlist,
+        Err(error) => return Err(refused_create(error)),
+    };
+    // The songs asked for at the founding, in the order the call named them: a library song
+    // or an outside id alike, as any addition to a family playlist takes them.
+    let mut entries = Vec::new();
+    for song in songs {
+        if let Some(entry) = new_entry(state, song).await {
+            entries.push(entry);
+        }
+    }
+    if !entries.is_empty() {
+        let requests = state.family_playlist_requests.get();
+        if let Err(error) = family_playlists::add(
+            &state.family_playlists,
+            requests.as_ref(),
+            caller,
+            &made.id,
+            entries,
+            Utc::now(),
+        ) {
+            return Err(refused_create(error));
+        }
+    }
+    info!(
+        "FAMILY {} made '{rest}' from a playlist named with {prefix}",
+        caller.user
+    );
+    Ok(family_playlists::find(&state.family_playlists, caller, &made.id).unwrap_or(made))
 }
 
 /// The outside id a library song was downloaded from: from Octo's record of downloaded songs,
