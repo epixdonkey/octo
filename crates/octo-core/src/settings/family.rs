@@ -46,6 +46,11 @@ pub struct FamilySettings {
     pub radio_streams_per_person: u32,
     /// Whether managers may manage the family from away from home.
     pub manage_from_away: bool,
+    /// A playlist created by any Subsonic app whose name starts with this prefix becomes a
+    /// family playlist named the rest after it (blank, or spaces only, turns the capture
+    /// off). Environment variable: FAMILY__PLAYLIST_PREFIX (docker-compose maps
+    /// PLAYLIST_PREFIX).
+    pub playlist_prefix: String,
 }
 
 impl Default for FamilySettings {
@@ -64,6 +69,7 @@ impl Default for FamilySettings {
             fast_pull_factor: 8,
             radio_streams_per_person: 2,
             manage_from_away: true,
+            playlist_prefix: String::new(),
         }
     }
 }
@@ -100,6 +106,14 @@ impl FamilySettings {
     pub fn members_path_is_auto(&self) -> bool {
         let path = self.members_path.trim();
         path.is_empty() || path.eq_ignore_ascii_case(MEMBERS_NEXT_TO_MUSIC)
+    }
+
+    /// The prefix a playlist's name must start with for its creation to become a family
+    /// playlist: the setting exactly as written (a trailing space is meaningful), or none
+    /// while the setting is blank or spaces only, which turns the capture off.
+    pub fn playlist_prefix_as_set(&self) -> Option<&str> {
+        let prefix = self.playlist_prefix.as_str();
+        (!prefix.trim().is_empty()).then_some(prefix)
     }
 
     /// The members folder without trailing slashes: `<music_root>/.octo-family` for `Auto`,
@@ -143,6 +157,9 @@ mod tests {
         assert_eq!(s.invite_days, 7);
         assert_eq!((s.fast_pull_factor, s.radio_streams_per_person), (8, 2));
         assert!(s.manage_from_away);
+        // The playlist capture is off until a prefix is set.
+        assert_eq!(s.playlist_prefix, "");
+        assert!(s.playlist_prefix_as_set().is_none());
         // Only the machine itself is a trusted proxy until the owner says otherwise.
         let trusted = s.trusted_proxy_list();
         assert_eq!(trusted.len(), 2);
@@ -180,11 +197,47 @@ mod tests {
         tree.set("Family:Enabled", Some("true".into()));
         tree.set("Family:MembersPath", Some("/srv/members/".into()));
         tree.set("Family:TrustedProxies", Some("127.0.0.1, 172.18.0.0/16".into()));
+        tree.set("Family:PlaylistPrefix", Some("#family".into()));
         let (settings, warnings) = AppSettings::bind(&tree);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(settings.family.enabled);
         assert!(!settings.family.members_path_is_auto());
         assert_eq!(settings.family.members_path_in("/music"), "/srv/members");
         assert_eq!(settings.family.trusted_proxy_list().len(), 2);
+        assert_eq!(settings.family.playlist_prefix_as_set(), Some("#family"));
+    }
+
+    #[test]
+    fn a_blank_playlist_prefix_keeps_the_capture_off() {
+        for blank in ["", " ", "\t"] {
+            let s = FamilySettings {
+                playlist_prefix: blank.into(),
+                ..Default::default()
+            };
+            assert!(s.playlist_prefix_as_set().is_none(), "{blank:?}");
+        }
+        // The prefix is matched exactly as written, spaces included: a trailing space is a
+        // way to keep `#familyRoad` from matching.
+        let s = FamilySettings {
+            playlist_prefix: "#family ".into(),
+            ..Default::default()
+        };
+        assert_eq!(s.playlist_prefix_as_set(), Some("#family "));
+    }
+
+    #[test]
+    fn the_playlist_prefix_binds_from_the_environment_in_every_spelling() {
+        // The binder matches keys ignoring case and underscores: the documented spelling,
+        // and the one docker-compose writes into the container, are the same setting.
+        for name in ["FAMILY__PLAYLIST_PREFIX", "Family__PlaylistPrefix"] {
+            let tree = crate::config::ConfigTree::from_env_vars([(name, "#family")]);
+            let (settings, warnings) = AppSettings::bind(&tree);
+            assert!(warnings.is_empty(), "{name}: {warnings:?}");
+            assert_eq!(
+                settings.family.playlist_prefix_as_set(),
+                Some("#family"),
+                "{name}"
+            );
+        }
     }
 }
