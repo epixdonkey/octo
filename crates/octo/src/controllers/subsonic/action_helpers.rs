@@ -1028,6 +1028,37 @@ pub(crate) fn native_bearer_username(state: &AppState, headers: &HeaderMap) -> S
     jwt_username(token.as_deref()).unwrap_or_default()
 }
 
+/// The keys a relayed call keeps the caller's sign-in under.
+const AUTH_KEYS: [&str; 8] = ["u", "p", "t", "s", "v", "c", "apiKey", "jwt"];
+
+/// The auth a relay of Octo's own making goes out with: the caller's own sign-in keys when
+/// the request carried any, else this server's own service identity (the scan auth) as the
+/// stand-in. The one helper of its kind: every fork station that relays under the caller's
+/// sign-in goes through this door, so the list and the stand-in cannot drift apart.
+pub(crate) fn auth_of(state: &AppState, parameters: &Parameters) -> Vec<(String, String)> {
+    let own: Vec<(String, String)> = parameters
+        .iter()
+        .filter(|(key, _)| AUTH_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key)))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if !own.is_empty() {
+        return own;
+    }
+    match state.navidrome_identity.get_scan_auth() {
+        Some((user, token, salt)) => [
+            ("u", user),
+            ("t", token),
+            ("s", salt),
+            ("v", "1.16.1".to_string()),
+            ("c", "octo".to_string()),
+        ]
+        .into_iter()
+        .map(|(key, value): (&str, String)| (key.to_string(), value))
+        .collect(),
+        None => Vec::new(),
+    }
+}
+
 /// The first of the JWT payload's name claims: a claim that is not a string gives no name at
 /// all.
 fn jwt_username(token: Option<&str>) -> Option<String> {

@@ -21,9 +21,7 @@ use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
-use octo_subsonic::Parameters;
-
-use super::action_helpers::{SubsonicCall, is_successful_subsonic_response};
+use super::action_helpers::{SubsonicCall, auth_of, is_successful_subsonic_response};
 use crate::app::AppState;
 use crate::services::subsonic::RelayResponse;
 
@@ -268,39 +266,6 @@ fn latin1_safe(name: &str) -> String {
             }
         })
         .collect()
-}
-
-/// The keys a relayed call keeps the caller's sign-in under. The personal playlists' own
-/// `auth_of` (not yet ported) works from the same list; when that station lands, the two
-/// merge into one.
-const AUTH_KEYS: [&str; 8] = ["u", "p", "t", "s", "v", "c", "apiKey", "jwt"];
-
-/// The auth a live station's relay goes out with: the caller's own sign-in keys when the
-/// request carried any, else this server's own service identity (the scan auth) as the
-/// stand-in. This is `personal_playlists.rs`'s `auth_of` verbatim, kept local until that
-/// station is ported.
-fn auth_of(state: &AppState, parameters: &Parameters) -> Vec<(String, String)> {
-    let own: Vec<(String, String)> = parameters
-        .iter()
-        .filter(|(key, _)| AUTH_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key)))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    if !own.is_empty() {
-        return own;
-    }
-    match state.navidrome_identity.get_scan_auth() {
-        Some((user, token, salt)) => [
-            ("u", user),
-            ("t", token),
-            ("s", salt),
-            ("v", "1.16.1".to_string()),
-            ("c", "octo".to_string()),
-        ]
-        .into_iter()
-        .map(|(key, value): (&str, String)| (key.to_string(), value))
-        .collect(),
-        None => Vec::new(),
-    }
 }
 
 /// The station row behind one id: the cached answer, else one relay of
