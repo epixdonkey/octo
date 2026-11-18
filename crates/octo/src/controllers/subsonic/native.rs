@@ -21,6 +21,7 @@ use octo_core::soulseek::{RoutingKind, StreamFacts};
 use octo_subsonic::Parameters;
 use octo_subsonic::subsonic_model_mapper::album_key;
 use octo_subsonic::subsonic_response_builder::IdRegistry;
+use octo_subsonic::subsonic_response_builder::{genres_with_source, source_genre_for};
 use serde_json::{Value, json};
 
 use super::action_helpers::{
@@ -596,8 +597,37 @@ fn native_song_object(state: &AppState, song: &Song) -> Value {
     if let Some(year) = song.year.filter(|year| *year > 0) {
         fields.insert("year".into(), year.into());
     }
-    if let Some(genre) = song.genre.as_deref().filter(|genre| !genre.is_empty()) {
-        fields.insert("genre".into(), genre.into());
+    // The source badge (option A): an outside discovery row's origin doubles as a genre, the
+    // one field every client renders (Feishin's Genre column reads `genres`). The same rule
+    // the Subsonic serializer applies, through the same mapping: only the three discovery
+    // labels map — a radio row's source label does not — and the row's own genres keep their
+    // place with the source appended after them, never twice.
+    let source_genre = if song.is_local {
+        None
+    } else {
+        song.suggested_by
+            .as_deref()
+            .filter(|by| !by.is_empty())
+            .and_then(source_genre_for)
+    };
+    match source_genre {
+        Some(source) => {
+            let (genre, genres) = genres_with_source(song.genre.as_deref(), source);
+            fields.insert("genre".into(), genre.into());
+            fields.insert("genres".into(), Value::Array(genres));
+        }
+        None => {
+            if let Some(genre) = song.genre.as_deref().filter(|genre| !genre.is_empty()) {
+                fields.insert("genre".into(), genre.into());
+            }
+        }
+    }
+    // Which service a discovery row came from (a YouTube Music song, a YouTube Music video, or
+    // a plain YouTube hit), under the same name the Subsonic serializer gives it
+    // (`octoSuggestedBy`, the badge the radio answers made a convention): a video and a song
+    // are two different rows, and the choice between the services belongs to the user.
+    if let Some(by) = song.suggested_by.as_deref().filter(|by| !by.is_empty()) {
+        fields.insert("octoSuggestedBy".into(), by.into());
     }
     object
 }

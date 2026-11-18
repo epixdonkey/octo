@@ -15,6 +15,11 @@ Endpoints:
       With a hint it picks the closest-length of several flat candidates
       (cheap, no per-video extraction), then resolves the winner's URL.
 
+  GET /search/list?q=<query>[&limit=<1..10>]
+      The multi-hit variant for Octo's discovery fallback: a flat-playlist
+      ytsearch returning {"hits": [{video_id, title, duration, channel}]},
+      no URL resolution and no ranking (the caller ranks).
+
   GET /facts?id=<videoId>
       The stream /stream would send for a video: format id (itag), exact
       size in bytes, container and bit rate. /search carries the same fields
@@ -900,6 +905,38 @@ def meta():
                 _META_CACHE.popitem(last=False)
         _meta_db_put(key, payload)  # persist so it survives restarts, for both modes
     return jsonify(**payload, rank=_RANK)
+
+
+@app.get("/search/list")
+def search_list():
+    """Multi-hit search for Octo's discovery fallback (D11): a flat-playlist
+    `ytsearch{limit}` run, NO url resolution, NO length ranking of its own (the caller ranks,
+    in its version-aware dedup) and no cache. A blank `q` is a 400; a failed yt-dlp run is a
+    502; no hits is an empty list."""
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify(error="missing q"), 400
+    limit = _arg_int("limit", 5, 1, 10)
+    out = _run(
+        [f"ytsearch{limit}:{q}", "--flat-playlist", "--print", "%(.{id,title,duration,channel})j"],
+        timeout=20,
+        label="search-list",
+        bg=_is_bg(),
+    )
+    if out is None:
+        return jsonify(error="search_failed"), 502
+    hits = []
+    for ln in out.strip().split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            data = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if data.get("id"):
+            hits.append(_payload_from(data))
+    return jsonify(hits=hits)
 
 
 def _resolve_url(video_id: str, bg: bool = False) -> Optional[str]:

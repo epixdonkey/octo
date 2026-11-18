@@ -1394,6 +1394,9 @@ impl Acquisition {
             music_metadata,
             Some(integrations.last_fm.clone()),
             Some(settings.clone()),
+            clients.you_tube_music.clone(),
+            stores.you_tube_resolver.clone(),
+            stores.external_id_registry.clone(),
         ));
         Acquisition {
             download_service,
@@ -1908,6 +1911,9 @@ struct MetadataClients {
     cover_art_archive: Arc<CoverArtArchiveLookup>,
     /// The covers the charts named for their songs, served first by the aggregator.
     artwork_hints: Arc<ArtworkHints>,
+    /// `YouTubeMusicClient`: the one client both the external search and the radio's YouTube
+    /// Music source use (D14), so the two spend one shim.
+    you_tube_music: Arc<YouTubeMusicClient>,
 }
 
 impl MetadataClients {
@@ -1969,6 +1975,7 @@ impl MetadataClients {
             cover_art_aggregator: Arc::new(CoverArtAggregator::new(sources)),
             cover_art_archive: Arc::new(CoverArtArchiveLookup::new()),
             artwork_hints,
+            you_tube_music: Arc::new(YouTubeMusicClient::new(settings)),
         }
     }
 }
@@ -2598,6 +2605,7 @@ struct Radio {
 }
 
 impl Radio {
+    #[allow(clippy::too_many_arguments)]
     fn build(
         settings: &Arc<SettingsStore>,
         config_dir: &Path,
@@ -2610,6 +2618,7 @@ impl Radio {
         deezer: &Arc<DeezerMetadataService>,
         acquisition: &Acquisition,
         music_brainz: &Arc<MusicBrainzClient>,
+        you_tube_music: Arc<YouTubeMusicClient>,
     ) -> Radio {
         // Where radio's state files go: Octo:StateDirectory when set (tests point it at their own
         // folder), else beside the settings.
@@ -2655,10 +2664,7 @@ impl Radio {
         });
         let source_list: Vec<Arc<dyn IRadioSource>> = vec![
             Arc::new(LastFmRadioSource::new(integrations.last_fm.clone())),
-            Arc::new(YouTubeMusicRadioSource::new(
-                Arc::new(YouTubeMusicClient::new(settings)),
-                settings.clone(),
-            )),
+            Arc::new(YouTubeMusicRadioSource::new(you_tube_music, settings.clone())),
             Arc::new(ListenBrainzRadioSource::new(listen_brainz, settings.clone())),
             Arc::new(SoundsAlikeRadioSource::new(sonic_store.clone(), settings.clone())),
         ];
@@ -3615,6 +3621,7 @@ impl AppState {
             &clients.deezer_metadata,
             &acquisition,
             &clients.music_brainz,
+            clients.you_tube_music.clone(),
         );
         radio.register_workers(&workers);
         let prefetch = prefetch_service(
@@ -4179,6 +4186,7 @@ impl AppState {
             &clients.deezer_metadata,
             &acquisition,
             &clients.music_brainz,
+            clients.you_tube_music.clone(),
         );
         let prefetch = prefetch_service(
             &settings,
