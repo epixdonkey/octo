@@ -1746,3 +1746,42 @@ pub(super) async fn held_road_with(f: &Fixture, missing: &str) {
     assert_eq!(added["status"], "ok", "{added}");
     assert_eq!(f.held(ROAD).unwrap(), ["s-a", "s-b", missing]);
 }
+
+/// What the owner puts on their own "Request a copy in FLAC" playlist is fetched straight away
+/// through the heart's queue (R-5 operation 3, D15 — not a family request): the outside song
+/// they add, and never a library song, and the playlist empties afterwards, as the fetch is
+/// the record.
+#[tokio::test]
+async fn t54_what_the_owner_puts_on_their_flac_playlist_is_fetched_straight_away() {
+    let f = download_fixture().await;
+    let missing = registry_song(&f, "Lost in Sound");
+    let name = crate::services::library::library_action_playlist_provisioner::REQUEST_FLAC_PLAYLIST;
+    f.nd.0
+        .lock()
+        .add("dflacaaaaaaaaaaaaaaa", name, "winters", false, false, &["s-a"]);
+
+    let reply = f
+        .json(
+            "winters",
+            &format!("updatePlaylist?playlistId=dflacaaaaaaaaaaaaaaa&songIdToAdd={missing}"),
+        )
+        .await;
+
+    assert_eq!(reply["status"], "ok", "{reply}");
+    until("the outside song put on the playlist is fetched", || {
+        f.state.track_acquisition_queue.is_in_flight("soulseek", &missing)
+    })
+    .await;
+    assert!(
+        !f.state.track_acquisition_queue.is_in_flight("soulseek", "s-a"),
+        "a library song needs no fetch"
+    );
+    assert!(
+        f.tracks("dflacaaaaaaaaaaaaaaa").is_empty(),
+        "the playlist empties, the fetch is the record"
+    );
+    assert!(
+        f.held("dflacaaaaaaaaaaaaaaa").is_none(),
+        "the FLAC playlist never becomes held"
+    );
+}
