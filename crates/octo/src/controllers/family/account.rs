@@ -252,6 +252,9 @@ pub async fn session(State(state): State<AppState>, web: Web) -> Response {
         "approver": approver,
         "owner": signed.actor.is_owner(),
         "familyEnabled": settings.family.enabled,
+        // The prefix every member's page shows next to the family playlists, so anyone can
+        // found one from an app; blank means the capture is off. Managers alone may set it.
+        "playlistPrefix": settings.family.playlist_prefix.clone(),
         "place": web.place,
         "manageFromAway": settings.family.manage_from_away,
         "membersPath": members_path,
