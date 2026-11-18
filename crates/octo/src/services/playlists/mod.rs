@@ -7,6 +7,7 @@ pub mod entries;
 pub mod folder_store;
 pub mod held_playlists;
 pub mod held_store;
+pub mod legacy_migration;
 pub mod merge;
 pub mod same_take;
 pub mod seed_index;

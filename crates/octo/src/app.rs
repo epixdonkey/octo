@@ -150,6 +150,7 @@ use crate::services::playlists::held_playlists::{
     AdminNavidrome, AppHeldLibrary, HeldParts, HeldPlaylists, HeldSlot, HeldTiming,
 };
 use crate::services::playlists::held_store::HeldStore;
+use crate::services::playlists::legacy_migration;
 use crate::services::playlists::seed_index::SeedIndex;
 use crate::services::prefetch::converted_copies::ConvertedCopies;
 use crate::services::prefetch::{
@@ -2495,8 +2496,13 @@ fn start_held(
         PlaylistCaps::PERSON,
         PlaylistCaps::SERVER,
     ));
+    let store = HeldStore::new(dir.as_deref());
+    // The fork's old `personal-playlists.json` (beside `octo-playlists/`) moves onto the store
+    // before the held playlists are built from it: the moved playlists are held from the first
+    // answer on, their files carry the store's own revision, and a missing old file is silence.
+    legacy_migration::migrate_personal_playlists(&store, dir.as_deref().and_then(Path::parent));
     let held = HeldPlaylists::start(HeldParts {
-        store: HeldStore::new(dir),
+        store,
         navidrome: Arc::new(AdminNavidrome {
             api: Arc::clone(&navidrome.navidrome_playlist_api),
         }),
