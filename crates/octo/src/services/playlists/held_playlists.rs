@@ -511,6 +511,12 @@ pub fn snapshot_song(entry: &HeldEntry) -> Option<Song> {
             Some("clean") => Some(3),
             _ => None,
         },
+        // The discovery label the entry's seed kept, so the row badges its source as the
+        // discovery answer it was added from did.
+        suggested_by: entry
+            .seed
+            .as_ref()
+            .and_then(|seed| seed.suggested_by.clone()),
         ..Song::default()
     })
 }

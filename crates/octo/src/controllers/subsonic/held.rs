@@ -466,6 +466,18 @@ pub(crate) struct ServedRow {
     pub song: Value,
 }
 
+/// The discovery label a held entry's seed kept, as the row's genre badge reads it: the seed
+/// is the durable copy of the routing that minted the entry's id, so an entry added from a
+/// discovery row badges its source even after the registry evicted the routing. `None` when
+/// the entry keeps no seed (an `ext-` id) or its seed carries no label.
+fn held_seed_source(entry: &HeldEntry) -> Option<&str> {
+    entry
+        .seed
+        .as_ref()
+        .and_then(|seed| seed.suggested_by.as_deref())
+        .filter(|by| !by.is_empty())
+}
+
 /// The held entries as the caller is served them (the service's `walk`): a library entry
 /// takes the next unused song Navidrome described to the caller with that id, else its outside
 /// fallback; a streamed entry is its snapshot, else the catalog; an entry with neither is left
@@ -496,7 +508,10 @@ pub(crate) async fn served_rows(
                 let held = &entries[entry];
                 let song = match held_playlists::snapshot_song(held).filter(|song| song.id == id) {
                     Some(song) => Some(snapshot_json(state, &song, held)),
-                    None => outside_song_json(state, &id).await,
+                    None => {
+                        outside_song_json(state, &id, held_seed_source(held))
+                            .await
+                    }
                 };
                 if let Some(song) = song {
                     rows.push(ServedRow { entry, id, song });
@@ -1233,6 +1248,31 @@ mod tests {
         assert_eq!(rows[2].entry, 2);
         assert_eq!(rows[1].song["coverArt"], "cover-1");
         assert_eq!(rows[1].song["isExternal"], true);
+    }
+
+    /// A held row badges its discovery source where the routing's own seed kept one: the
+    /// snapshot path (a streamed entry) carries the label as `octoSuggestedBy` and the genre
+    /// badge the discovery answer gave it, and the seed's label is what the catalog path is
+    /// handed when the snapshot cannot serve.
+    #[tokio::test]
+    async fn a_held_row_badges_the_source_its_seed_kept() {
+        let mut streamed = entry(None, Some("ext-deezer-song-2"), "Streamed");
+        streamed.seed = Some(std::sync::Arc::new(octo_core::soulseek::SoulseekRouting {
+            suggested_by: Some("YouTube Music (song)".into()),
+            ..Default::default()
+        }));
+        let state = AppState::for_tests(Default::default());
+        let rows = served_rows(&state, &[streamed], &[]).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].song["octoSuggestedBy"], "YouTube Music (song)");
+        assert_eq!(rows[0].song["genre"], "YouTube Music");
+        assert_eq!(rows[0].song["genres"][0]["name"], "YouTube Music");
+        // An entry with no seed has no label to hand the catalog path, and one with a seed
+        // that keeps none has neither.
+        assert_eq!(held_seed_source(&entry(None, Some("ext-deezer-song-9"), "Lost")), None);
+        let mut unlabeled = entry(None, Some("ext-deezer-song-8"), "Unlabeled");
+        unlabeled.seed = Some(std::sync::Arc::new(octo_core::soulseek::SoulseekRouting::default()));
+        assert_eq!(held_seed_source(&unlabeled), None);
     }
 
     #[tokio::test]
