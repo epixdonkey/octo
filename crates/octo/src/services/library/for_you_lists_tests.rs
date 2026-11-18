@@ -548,6 +548,7 @@ fn service_with(
         Some(dir.path().join("generated-playlists.json")),
         SubsonicProxyService::new(store.clone()),
         store,
+        Arc::new(crate::services::family::SavedStore::in_memory()),
     )
     .with_for_you(ForYouServices {
         builder: Arc::new(NewReleasesBuilder::new(upstream.deezer(), Arc::clone(&registry))),

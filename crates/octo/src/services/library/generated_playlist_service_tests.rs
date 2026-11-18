@@ -10,6 +10,8 @@ use tempfile::TempDir;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+use crate::services::family::{SavedSong, SavedStore};
+
 use super::*;
 
 /// A stand-in Navidrome that records the calls it gets.
@@ -170,6 +172,7 @@ fn service(fixture: &Fixture, settings: GeneratedPlaylistSettings) -> Arc<Genera
         Some(fixture.dir.path().join("generated-playlists.json")),
         SubsonicProxyService::new(store.clone()),
         store,
+        Arc::new(SavedStore::in_memory()),
     ))
 }
 
@@ -719,6 +722,7 @@ fn country_service(
             Some(fixture.dir.path().join("generated-playlists.json")),
             SubsonicProxyService::new(store.clone()),
             store,
+            Arc::new(SavedStore::in_memory()),
         )
         .with_countries(library),
     )
@@ -936,6 +940,7 @@ fn service_with_last_fm(
             Some(fixture.dir.path().join("generated-playlists.json")),
             SubsonicProxyService::new(store.clone()),
             store,
+            Arc::new(SavedStore::in_memory()),
         )
         .with_last_fm(last_fm),
     )
@@ -1136,4 +1141,163 @@ async fn artist_mixes_survive_a_restart_and_keep_when_they_began() {
         .collect();
     assert_eq!(names, ["Bad Bunny Mix", "Rosalía Mix"]);
     assert_eq!(walks(&fixture), 1);
+}
+
+// ---------------------------------------------------------------------------------------
+// Liked Songs with the listener's saved outside songs
+// ---------------------------------------------------------------------------------------
+
+/// A stand-in Navidrome whose getStarred2 answers the hearts it was given, as
+/// (id, starred) rows.
+struct HeartedNavidrome {
+    hearts: Vec<(String, String)>,
+}
+
+impl Respond for HeartedNavidrome {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let path = request.url.path().trim_matches('/').to_string();
+        let body = match path.as_str() {
+            "rest/getStarred2" => {
+                let rows = self
+                    .hearts
+                    .iter()
+                    .map(|(id, starred)| {
+                        format!(r#"{{"id":"{id}","title":"Heart {id}","starred":"{starred}"}}"#)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                ok(&format!(r#""starred2":{{"song":[{rows}]}}"#))
+            }
+            _ => ok(""),
+        };
+        ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/json")
+            .set_body_string(body)
+    }
+}
+
+/// A service over the hearted stand-in whose saved store the test fills itself. The stand-in's
+/// server is returned too: it must outlive the reads the test then makes.
+async fn liked_service(
+    hearts: Vec<(String, String)>,
+    max: i32,
+) -> (Arc<GeneratedPlaylistService>, Arc<SavedStore>, MockServer) {
+    let server = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(HeartedNavidrome { hearts })
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let store = Arc::new(SettingsStore::for_tests(AppSettings {
+        subsonic: SubsonicSettings {
+            url: Some(server.uri()),
+            ..Default::default()
+        },
+        generated_playlists: GeneratedPlaylistSettings {
+            enabled: true,
+            liked_songs: true,
+            liked_songs_max: max,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let saved = Arc::new(SavedStore::in_memory());
+    let service = Arc::new(GeneratedPlaylistService::new(
+        Some(dir.path().join("generated-playlists.json")),
+        SubsonicProxyService::new(store.clone()),
+        store,
+        saved.clone(),
+    ));
+    (service, saved, server)
+}
+
+fn heart_at(second: usize) -> String {
+    format!("2026-01-01T00:{:02}:{:02}.000Z", second / 60, second % 60)
+}
+
+/// The saved songs are appended before the sort and the limit: a save newer than every heart
+/// sits first and the limit drops the oldest hearts, never the save.
+#[tokio::test]
+async fn liked_songs_sort_the_saved_song_in_where_the_limit_cannot_eat_it() {
+    // Sixty hearts, each a second apart, all older than the save; the limit is the floor of 50.
+    let hearts: Vec<(String, String)> = (0..60).map(|i| (format!("lib{i}"), heart_at(i))).collect();
+    let (service, saved, _server) = liked_service(hearts, 50).await;
+    let moment = chrono::Utc::now();
+    saved.add(
+        "alice",
+        SavedSong {
+            id: "saved-1".into(),
+            title: "Teardrop".into(),
+            artist: "Massive Attack".into(),
+            album: "Mezzanine".into(),
+            cover_art: "saved-1".into(),
+            duration: 330,
+            explicit: 0,
+            saved: moment,
+        },
+    );
+
+    let songs = service.liked_songs("alice", &auth()).await.expect("liked");
+
+    assert_eq!(songs.len(), 50, "the limit holds: 60 hearts + 1 save");
+    let ids: Vec<&str> = songs
+        .iter()
+        .map(|song| song.get("id").and_then(Node::as_str).unwrap_or(""))
+        .collect();
+    let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    assert_eq!(unique.len(), 50, "one row per id: {ids:?}");
+    assert_eq!(ids[0], "saved-1", "the newest row first: {ids:?}");
+    assert!(
+        !ids.contains(&"lib0"),
+        "the oldest heart is what the limit drops: {ids:?}"
+    );
+    let saved_row = &songs[0];
+    assert_eq!(
+        saved_row.get("starred").and_then(Node::as_str),
+        Some(
+            moment
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                .as_str()
+        ),
+        "starred at the save moment"
+    );
+    assert!(
+        matches!(saved_row.get("isExternal"), Some(Node::Bool(true))),
+        "marked the way overlay leaves alone"
+    );
+}
+
+/// An id the listener saved that Navidrome hearted as well keeps one row — Navidrome's — so
+/// nothing is listed twice.
+#[tokio::test]
+async fn liked_songs_list_an_id_navidrome_hearted_and_the_listener_saved_once() {
+    let (service, saved, _server) = liked_service(vec![("dup-1".into(), heart_at(30))], 50).await;
+    saved.add(
+        "alice",
+        SavedSong {
+            id: "dup-1".into(),
+            title: "Teardrop".into(),
+            artist: "Massive Attack".into(),
+            album: "Mezzanine".into(),
+            cover_art: "dup-1".into(),
+            duration: 330,
+            explicit: 0,
+            saved: chrono::Utc::now(),
+        },
+    );
+
+    let songs = service.liked_songs("alice", &auth()).await.expect("liked");
+
+    assert_eq!(songs.len(), 1, "one row for one id");
+    let row = &songs[0];
+    assert_eq!(row.get("id").and_then(Node::as_str), Some("dup-1"));
+    assert_eq!(
+        row.get("starred").and_then(Node::as_str),
+        Some(heart_at(30).as_str()),
+        "Navidrome's heart keeps the row"
+    );
+    assert!(
+        row.get("isExternal").is_none(),
+        "the row is Navidrome's, not the save's"
+    );
 }

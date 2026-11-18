@@ -158,6 +158,7 @@ async fn a_list_switched_off_in_the_dashboard_is_gone_from_the_very_next_get_pla
             Some(directory.path().join("generated-playlists.json")),
             SubsonicProxyService::new(Arc::clone(&store)),
             Arc::clone(&store),
+            Arc::new(crate::services::family::SavedStore::in_memory()),
         )
         .with_for_you(ForYouServices {
             builder: Arc::new(NewReleasesBuilder::new(

@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, SecondsFormat, TimeDelta, Utc};
 use indexmap::IndexMap;
 use octo_core::common::{SingleFlight, dotnet};
 use octo_core::json::dom::Node;
@@ -51,7 +51,7 @@ pub use octo_core::library::generated_playlist_service::GeneratedPlaylist;
 
 use super::artist_country::CountryLibrary;
 use super::for_you_lists::{CatalogSeed, Entry, NewReleasesBuilder, mint};
-use crate::services::family::{FamilyStore, kid_filter};
+use crate::services::family::{FamilyStore, SavedStore, kid_filter};
 use crate::services::framework::{DotnetDictionary, MemoryCache};
 use crate::services::last_fm::{LastFmService, OperationCanceled};
 use crate::services::state_file;
@@ -117,6 +117,9 @@ pub struct GeneratedPlaylistService {
     listener_songs: Mutex<HashMap<String, Arc<HashSet<String>>>>,
     /// The family, whose kid profiles get clean lists.
     family: Option<Arc<FamilyStore>>,
+    /// The saved outside songs (`family-saved.json`), which join Liked Songs beside Navidrome's
+    /// hearts.
+    saved: Arc<SavedStore>,
     /// Last.fm, for the artists like each artist mix's own. None: artist mixes are the artist's
     /// own songs.
     last_fm: Option<Arc<LastFmService>>,
@@ -129,11 +132,13 @@ pub struct ForYouServices {
 }
 
 impl GeneratedPlaylistService {
-    /// Loads the counts from `state_path` (None or blank keeps them in memory only).
+    /// Loads the counts from `state_path` (None or blank keeps them in memory only). The saved
+    /// store is the one behind `family-saved.json`, whose songs join Liked Songs.
     pub fn new(
         state_path: Option<PathBuf>,
         proxy: SubsonicProxyService,
         settings: Arc<SettingsStore>,
+        saved: Arc<SavedStore>,
     ) -> Self {
         let state_path = state_path.filter(|path| !dotnet::is_blank(&path.to_string_lossy()));
         let service = GeneratedPlaylistService {
@@ -150,6 +155,7 @@ impl GeneratedPlaylistService {
             countries: None,
             listener_songs: Mutex::new(HashMap::new()),
             family: None,
+            saved,
             last_fm: None,
         };
         service.load();
@@ -1261,8 +1267,10 @@ impl GeneratedPlaylistService {
     }
 
     /// Liked Songs' songs: the listener's hearted songs, newest heart first (then by id), at most
-    /// the setting's number. None when Navidrome did not answer, or for a caller without a
-    /// username.
+    /// the setting's number, with the songs they saved as streaming favorites beside Navidrome's
+    /// hearts (a heart with every download source off saves instead of fetching, and read_starred
+    /// relays straight to Navidrome, so those never arrive here on their own). None when
+    /// Navidrome did not answer, or for a caller without a username.
     pub async fn liked_songs(&self, username: &str, auth: &IndexMap<String, String>) -> Option<Vec<Node>> {
         if dotnet::is_blank(username) {
             return None;
@@ -1277,6 +1285,7 @@ impl GeneratedPlaylistService {
             None => self.read_starred(username, auth).await?.1,
         };
         let mut songs: Vec<Node> = songs.as_ref().clone();
+        self.append_saved_songs(username, &mut songs);
         let text = |song: &Node, key: &str| song.get(key).and_then(Node::as_str).unwrap_or("").to_string();
         songs.sort_by(|a, b| {
             text(b, "starred")
@@ -1285,6 +1294,33 @@ impl GeneratedPlaylistService {
         });
         songs.truncate(max);
         Some(songs)
+    }
+
+    /// The listener's saved outside songs join the hearts, one node each: id, title, artist,
+    /// album, duration and the moment it was saved as `starred`, marked `isExternal` the way
+    /// the builder marks every outside song so [`Self::overlay`] leaves their own marks alone.
+    /// A heart whose library copy Navidrome already holds wins the row, so nothing is listed
+    /// twice.
+    fn append_saved_songs(&self, username: &str, songs: &mut Vec<Node>) {
+        let known: std::collections::HashSet<String> = songs
+            .iter()
+            .filter_map(|song| song.get("id").and_then(Node::as_str).map(str::to_string))
+            .collect();
+        for saved in self.saved.list(username) {
+            if known.contains(&saved.id) {
+                continue;
+            }
+            songs.push(Node::from_value(&serde_json::json!({
+                "id": saved.id,
+                "title": saved.title,
+                "artist": saved.artist,
+                "album": saved.album,
+                "duration": saved.duration,
+                "coverArt": saved.cover_art,
+                "starred": saved.saved.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "isExternal": true,
+            })));
+        }
     }
 
     /// The listener hearted or unhearted something: their hearts are read again next time.
