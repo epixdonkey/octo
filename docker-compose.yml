@@ -15,7 +15,7 @@ services:
   # ghcr.io), build octo-source, at the end of this file. Octo is written in Rust; the
   # environment below and the config folder are the ones the C# Octo read, unchanged.
   octo:
-    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.11.15}
+    image: ghcr.io/epixdonkey/octo:${OCTO_IMAGE_TAG:-dev}
     container_name: octo
     restart: unless-stopped
     logging: *logging
@@ -396,6 +396,11 @@ services:
       # folder, so it needs no volume of its own and stays out of your library. Off until
       # you turn it on here or on the dashboard.
       Family__Enabled: ${FAMILY_ENABLED:-false}
+      # A playlist made in any Subsonic app whose name starts with this prefix becomes a
+      # family playlist the whole family sees (its name is the rest after the prefix; e.g.
+      # "#family Road trip" makes "Road trip"). Blank, the default, leaves createPlaylist
+      # alone; the Family page's playlists tab sets the same setting without a restart.
+      Family__PlaylistPrefix: ${PLAYLIST_PREFIX:-}
       # ----- Logging -----
       # The two lines for every request and those for every call Octo makes to another
       # service are left out (Warning), so the log holds Octo's own lines and costs less
@@ -426,7 +431,7 @@ services:
   # Pulled, not built, like Octo, and at the same tag, so the two always match.
   # Without access to ghcr.io, build it from this folder with yt-dlp-shim-source (below).
   yt-dlp-shim:
-    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.11.15}
+    image: ghcr.io/epixdonkey/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-dev}
     container_name: yt-dlp-shim
     restart: unless-stopped
     logging: *logging
@@ -487,7 +492,7 @@ services:
   # Pulled, not built, like the shim: compiling it (Rust and FFmpeg) takes minutes and more
   # memory than a small machine has. octo-sonic-source (below) builds it from this folder.
   octo-sonic:
-    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.11.15}
+    image: ghcr.io/epixdonkey/octo-sonic:${OCTO_IMAGE_TAG:-dev}
     container_name: octo-sonic
     restart: unless-stopped
     logging: *logging
@@ -681,7 +686,7 @@ services:
   # nothing, which is what an older update helper runs; that keeps even the update to this
   # release from compiling anything.
   octo-source:
-    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.11.15}
+    image: ghcr.io/epixdonkey/octo:${OCTO_IMAGE_TAG:-dev}
     build:
       context: .
       args:
@@ -690,11 +695,11 @@ services:
         PLACES_REFRESH: ${PLACES_REFRESH:-}
     profiles: ["source"]
   yt-dlp-shim-source:
-    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.11.15}
+    image: ghcr.io/epixdonkey/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-dev}
     build: ./yt-dlp-shim
     profiles: ["source"]
   octo-sonic-source:
-    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.11.15}
+    image: ghcr.io/epixdonkey/octo-sonic:${OCTO_IMAGE_TAG:-dev}
     build: ./sonic
     profiles: ["source"]
 
