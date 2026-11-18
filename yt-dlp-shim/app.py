@@ -274,6 +274,45 @@ def _run_with_client(args: list[str], label: str, bg: bool, timeout: int = 15) -
         _PLAYER_CLIENT_RESTING_UNTIL = time.time() + _PLAYER_CLIENT_REST_SEC
     return fallback or out
 
+
+# The fast profile's skip segments, for stream resolves only (D7): the watch page's configs and
+# initial data, translated subtitles and DASH formats are nothing a resolve needs, and skipping
+# them cuts the time to the URL. The watch page itself is deliberately NOT skipped: YouTube
+# requires it for the challenge/consent context, and player_skip=webpage made every resolve
+# hit the "confirm you're not a bot" wall (SOAK-1b) — on datacenter and home IPs alike.
+# Kept in ONE --extractor-args together with the player client, because a second
+# --extractor-args on the command line would overwrite the client choice.
+_FAST_SKIP_ARGS = "player_skip=configs,initial_data;skip=translated_subs,dash"
+
+
+def _fast_args() -> list[str]:
+    """The stream-resolve run's --extractor-args: the skips always, the player client while it
+    is not resting, in one argument (_client_args' pattern)."""
+    if not _PLAYER_CLIENT or time.time() < _PLAYER_CLIENT_RESTING_UNTIL:
+        return ["--extractor-args", f"youtube:{_FAST_SKIP_ARGS}"]
+    return ["--extractor-args", f"youtube:player_client={_PLAYER_CLIENT};{_FAST_SKIP_ARGS}"]
+
+
+def _run_fast(args: list[str], label: str, bg: bool, timeout: int = 15) -> Optional[str]:
+    """A format-selecting run on the fast profile — stream resolves only. The replacement run
+    after the client gives no URL keeps the skip segments alone (_run_with_client's fallback
+    pattern); nothing but /stream's resolve ever runs on this profile, and the ytsearch* runs
+    keep their own, unchanged shape."""
+    global _PLAYER_CLIENT_RESTING_UNTIL
+    client_in = bool(_PLAYER_CLIENT) and time.time() >= _PLAYER_CLIENT_RESTING_UNTIL
+    out = _run([*_fast_args(), *args], timeout=timeout, label=label, bg=bg)
+    if not client_in or (out and stream_info.split_run(out)[2]):
+        return out
+    fallback = _run(
+        ["--extractor-args", f"youtube:{_FAST_SKIP_ARGS}", *args],
+        timeout=timeout, label=f"{label}-default", bg=bg,
+    )
+    if fallback and stream_info.split_run(fallback)[2]:
+        log.warning("player client %s gave no URL where yt-dlp's own did; leaving it out for %ds",
+                    _PLAYER_CLIENT, _PLAYER_CLIENT_REST_SEC)
+        _PLAYER_CLIENT_RESTING_UNTIL = time.time() + _PLAYER_CLIENT_REST_SEC
+    return fallback or out
+
 # What each video's stream is (itag, size, container, bit rate), learned in the same run that
 # picked its URL. A video's format and size do not change, so these outlive the URL itself.
 _FACTS_LOCK = threading.Lock()
@@ -968,8 +1007,11 @@ def _resolve_url(video_id: str, bg: bool = False) -> Optional[str]:
         cached = _url_cache_get(video_id)
         if cached:
             return cached
-        # The same URL `-g` printed, plus the picked format's facts from the same run.
-        out = _run_with_client(
+        # The same URL `-g` printed, plus the picked format's facts from the same run. On the
+        # fast profile (D7): the resolve needs neither the page's configs nor translated
+        # subtitles, and the skips cut the time to the URL. The watch page itself is still
+        # fetched — YouTube demands it before handing out formats (SOAK-1b).
+        out = _run_fast(
             [
                 "-f", _AUDIO_FORMAT,
                 "--print", stream_info.FORMAT_PRINT,
