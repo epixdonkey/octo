@@ -1822,11 +1822,7 @@ async fn library_song_json(call: &SubsonicCall, id: &str) -> Option<Value> {
 /// family playlist's row, a position whose seed keeps none). The badge itself is the
 /// serializer's one rule (`convert_song_to_json`), applied exactly as a search answer applies
 /// it.
-pub(super) async fn outside_song_json(
-    state: &AppState,
-    id: &str,
-    source: Option<&str>,
-) -> Option<Value> {
+pub(super) async fn outside_song_json(state: &AppState, id: &str, source: Option<&str>) -> Option<Value> {
     let (external, provider, external_id) = state.local_library.parse_song_id(id);
     if !external {
         return None;

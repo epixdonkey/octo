@@ -450,20 +450,14 @@ impl HeldStore {
     /// held playlist and `Replaced` record is searched; the first match wins.
     pub fn recover_snapshot(&self, external_id: &str) -> Option<SongSnapshot> {
         let by_id = |entry: &HeldEntry| {
-            entry.external_id.as_deref() == Some(external_id)
-                || entry.seed_id.as_deref() == Some(external_id)
+            entry.external_id.as_deref() == Some(external_id) || entry.seed_id.as_deref() == Some(external_id)
         };
         let inner = self.lock();
         inner
             .playlists
             .values()
             .flat_map(|playlist| playlist.entries.iter())
-            .chain(
-                inner
-                    .replaced
-                    .values()
-                    .flat_map(|record| record.entries.iter()),
-            )
+            .chain(inner.replaced.values().flat_map(|record| record.entries.iter()))
             .find(|entry| by_id(entry))?
             .song
             .clone()

@@ -2223,7 +2223,10 @@ async fn the_catalog_track_search_answers_its_rows_lookups() {
 struct HeldSnapshots(HashMap<String, crate::services::playlists::held_store::SongSnapshot>);
 
 impl HeldSongSnapshots for HeldSnapshots {
-    fn recover_snapshot(&self, external_id: &str) -> Option<crate::services::playlists::held_store::SongSnapshot> {
+    fn recover_snapshot(
+        &self,
+        external_id: &str,
+    ) -> Option<crate::services::playlists::held_store::SongSnapshot> {
         self.0.get(external_id).cloned()
     }
 }
@@ -2268,11 +2271,7 @@ async fn get_song_fills_its_missing_fields_from_a_held_snapshot() {
         .into_iter()
         .collect(),
     ))));
-    let song = h
-        .service
-        .get_song("soulseek", &held_id)
-        .await
-        .expect("the song");
+    let song = h.service.get_song("soulseek", &held_id).await.expect("the song");
     assert_eq!(song.title, "Cloudbusting");
     assert_eq!(song.artist, "Kate Bush");
     assert_eq!(song.album, "Hounds of Love");
@@ -2284,11 +2283,7 @@ async fn get_song_fills_its_missing_fields_from_a_held_snapshot() {
     assert_eq!(song.isrc.as_deref(), Some("GBAAA8500031"));
 
     // A song no playlist holds answers from the routing alone.
-    let plain = h
-        .service
-        .get_song("soulseek", &plain_id)
-        .await
-        .expect("the song");
+    let plain = h.service.get_song("soulseek", &plain_id).await.expect("the song");
     assert_eq!(plain.album, "");
     assert_eq!(plain.duration, None);
     assert_eq!(plain.year, None);

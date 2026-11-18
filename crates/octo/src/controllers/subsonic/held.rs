@@ -508,10 +508,7 @@ pub(crate) async fn served_rows(
                 let held = &entries[entry];
                 let song = match held_playlists::snapshot_song(held).filter(|song| song.id == id) {
                     Some(song) => Some(snapshot_json(state, &song, held)),
-                    None => {
-                        outside_song_json(state, &id, held_seed_source(held))
-                            .await
-                    }
+                    None => outside_song_json(state, &id, held_seed_source(held)).await,
                 };
                 if let Some(song) = song {
                     rows.push(ServedRow { entry, id, song });
@@ -1269,9 +1266,14 @@ mod tests {
         assert_eq!(rows[0].song["genres"][0]["name"], "YouTube Music");
         // An entry with no seed has no label to hand the catalog path, and one with a seed
         // that keeps none has neither.
-        assert_eq!(held_seed_source(&entry(None, Some("ext-deezer-song-9"), "Lost")), None);
+        assert_eq!(
+            held_seed_source(&entry(None, Some("ext-deezer-song-9"), "Lost")),
+            None
+        );
         let mut unlabeled = entry(None, Some("ext-deezer-song-8"), "Unlabeled");
-        unlabeled.seed = Some(std::sync::Arc::new(octo_core::soulseek::SoulseekRouting::default()));
+        unlabeled.seed = Some(std::sync::Arc::new(
+            octo_core::soulseek::SoulseekRouting::default(),
+        ));
         assert_eq!(held_seed_source(&unlabeled), None);
     }
 
