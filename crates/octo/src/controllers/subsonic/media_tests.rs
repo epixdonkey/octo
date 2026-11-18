@@ -2441,3 +2441,51 @@ mod api_key_charts {
         assert_eq!(fixture.token_infos().await, 0);
     }
 }
+
+/// `/rest/download?id=<outside>&save=1` (R-5 operation 3): the fetch is queued beside the
+/// stream, and the answer is the very bytes the plain download streams — `save` changes what is
+/// queued, never what is answered.
+#[tokio::test]
+async fn a_save_one_download_fetches_the_outside_song_and_still_streams_it() {
+    let navidrome = ping_ok().await;
+    let bytes: &'static [u8] = &[7, 7, 7];
+    let downloads = Arc::new(FakeStreams::streaming("soulseek", "track-id", bytes, "audio/mp4"));
+    let library = Arc::new(FakeLibrary::with_external(
+        "external-track",
+        "soulseek",
+        "track-id",
+    ));
+    let state = state_with(playback_settings(&navidrome.uri(), false, false), |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = library.clone();
+    });
+    let app = app(&state);
+
+    let plain = get(
+        &app,
+        "/rest/download?id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=octo",
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::OK, "{}", plain.text());
+    assert_eq!(plain.body.as_ref(), bytes);
+    assert!(
+        state.track_acquisition_queue.is_idle(),
+        "a plain download queues nothing"
+    );
+
+    let saved = get(
+        &app,
+        "/rest/download?id=external-track&save=1&u=alice&t=good&s=salt&v=1.16.1&c=octo",
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.text());
+    assert_eq!(
+        saved.body.as_ref(),
+        bytes,
+        "the answer is the stream's own bytes, save or not"
+    );
+    crate::services::common::test_fakes::until(|| {
+        state.track_acquisition_queue.is_in_flight("soulseek", "track-id")
+    })
+    .await;
+}
