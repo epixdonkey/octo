@@ -46,7 +46,7 @@ use super::caps::{CapRefusal, PlaylistCaps};
 use super::entries::{self, BuildContext, Built};
 use super::held_store::{
     Creating, HeldEntry, HeldPlaylist, HeldStore, PendingWrite, PlaylistState, ReplacedRecord, SaveError,
-    WritePhase, kept_ids, seeds, store_mutex_held,
+    SongSnapshot, WritePhase, kept_ids, seeds, store_mutex_held,
 };
 use super::merge::{self, RawRow};
 use super::same_take::{phone_match, same_take};
@@ -59,6 +59,7 @@ use crate::services::library::navidrome_playlist_api::{PlaylistInfo, SongFacts, 
 use crate::services::library::{NavidromePlaylistApi, NavidromeSongPathResolver};
 use crate::services::local::{DownloadHistoryService, ILocalLibraryService, ParsedExternalId};
 use crate::services::soulseek::ExternalIdRegistry;
+use crate::services::soulseek::soulseek_metadata_service::HeldSongSnapshots;
 
 pub const NOT_OWNER: &str = "Only the playlist's owner can change it.";
 pub const MADE_BY_RULES: &str = "This playlist is made by Navidrome's rules, so songs can't be added to it.";
@@ -1102,6 +1103,15 @@ fn call_states(write: &PendingWrite) -> Option<(Vec<String>, Vec<String>, Pendin
     after.phase = WritePhase::Adding;
     after.done = to - write.prefix;
     Some((write.target[..from].to_vec(), write.target[..to].to_vec(), after))
+}
+
+/// The held store's own snapshots, as the Soulseek service's getSong reads them: a held
+/// position keeps the whole song as it was found, so an answer the routing alone cannot
+/// finish is filled from one.
+impl HeldSongSnapshots for HeldPlaylists {
+    fn recover_snapshot(&self, external_id: &str) -> Option<SongSnapshot> {
+        self.store.recover_snapshot(external_id)
+    }
 }
 
 impl HeldPlaylists {

@@ -45,6 +45,20 @@ pub trait LastFmTrackLengths: Send + Sync {
     async fn track_duration(&self, artist: &str, title: &str) -> Option<i32>;
 }
 
+/// The one member of the held playlist service a getSong answer reads: the snapshot a held
+/// entry kept for an outside id. A seam rather than the service, like
+/// [`LastFmTrackLengths`]: the held playlist service starts after this one, so it is told
+/// where the snapshots live once it exists. Implemented by `HeldPlaylists`; tests substitute
+/// a fake.
+pub trait HeldSongSnapshots: Send + Sync {
+    /// The song's kept snapshot for the id the registry resolved it by, when a held playlist
+    /// or a `Replaced` record holds one.
+    fn recover_snapshot(
+        &self,
+        external_id: &str,
+    ) -> Option<crate::services::playlists::held_store::SongSnapshot>;
+}
+
 /// Music metadata service for the YouTube-first / Soulseek-on-star architecture.
 ///
 /// Radio queue creation is YouTube-only and lightweight: one yt-dlp search per
@@ -74,6 +88,10 @@ struct Inner {
     deezer: Arc<DeezerMetadataService>,
     cover_art: Arc<CoverArtAggregator>,
     last_fm: Option<Arc<dyn LastFmTrackLengths>>,
+    /// Where held entries' kept snapshots live, once the held playlist service (which starts
+    /// after this one) told the service: a getSong answer's missing fields are filled from a
+    /// held entry's snapshot. None until then, and in tests that wire none.
+    held: Mutex<Option<Arc<dyn HeldSongSnapshots>>>,
 
     /// Ids with a lookup queued or running, so several clients loading one station
     /// at once do not each look its songs up again.
@@ -345,6 +363,7 @@ impl SoulseekMetadataService {
                 deezer,
                 cover_art,
                 last_fm,
+                held: Mutex::new(None),
                 length_lookups: Mutex::new(HashSet::new()),
                 last_length_warm: Mutex::new(None),
                 last_rows_finish: Mutex::new(None),
@@ -364,6 +383,13 @@ impl SoulseekMetadataService {
         if let Some(finish) = finish {
             finish.await;
         }
+    }
+
+    /// Tells the service where held entries' kept snapshots live: the held playlist service
+    /// starts after this one, so it says so once it exists. `None` (also the start state)
+    /// leaves getSong answering from the routing alone.
+    pub fn set_held_snapshots(&self, held: Option<Arc<dyn HeldSongSnapshots>>) {
+        *self.inner.held.lock() = held;
     }
 
     /// The most recent background length lookup, for a test to wait on (`LastLengthWarm`).
@@ -1872,7 +1898,7 @@ impl IMusicMetadataService for SoulseekMetadataService {
             .resolve_song(external_id, false)?
             .snapshot();
 
-        Some(Song {
+        let mut song = Song {
             id: external_id.to_string(),
             title: routing.title.clone().unwrap_or_default(),
             artist: routing.artist.clone().unwrap_or_default(),
@@ -1890,7 +1916,41 @@ impl IMusicMetadataService for SoulseekMetadataService {
             external_provider: Some(Self::PROVIDER_NAME.to_string()),
             external_id: Some(external_id.to_string()),
             ..Default::default()
-        })
+        };
+        // The held playlists' snapshots: a position a playlist holds keeps the whole song as
+        // it was found, so after a restart (or an eviction) getSong still answers with the
+        // fields the routing alone never had. Never over the routing's own words: it only
+        // fills what is missing.
+        if let Some(snapshot) = self
+            .inner
+            .held
+            .lock()
+            .clone()
+            .and_then(|held| held.recover_snapshot(external_id))
+        {
+            if song.year.is_none() {
+                song.year = snapshot.year;
+            }
+            if song.genre.as_deref().is_none_or(str::is_empty) {
+                song.genre = snapshot.genre;
+            }
+            if song.isrc.as_deref().is_none_or(str::is_empty) {
+                song.isrc = snapshot.isrcs.first().cloned();
+            }
+            if song.album.trim().is_empty() {
+                song.album = snapshot.album;
+            }
+            if song.duration.is_none() {
+                song.duration = snapshot.seconds;
+            }
+            if song.track.is_none() {
+                song.track = snapshot.track;
+            }
+            if song.disc_number.is_none() {
+                song.disc_number = snapshot.disc;
+            }
+        }
+        Some(song)
     }
 
     async fn get_album(&self, external_provider: &str, external_id: &str) -> Option<Album> {

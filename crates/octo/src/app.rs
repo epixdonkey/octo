@@ -166,8 +166,8 @@ use crate::services::sonic::{
 use crate::services::soulseek::soulseek_download_service::{SoulseekDownloadParts, SoulseekDownloadService};
 use crate::services::soulseek::soulseek_metadata_service::LastFmTrackLengths;
 use crate::services::soulseek::{
-    ExternalIdRegistry, ISlskdShares, ISoulseekLink, RadioQueueStore, RejectedPeerRegistry, SoulseekClient,
-    SoulseekLink, SoulseekMetadataService, SoulseekPortCheck, SoulseekShareSwitch, SoulseekSharing,
+    ExternalIdRegistry, HeldSongSnapshots, ISlskdShares, ISoulseekLink, RadioQueueStore, RejectedPeerRegistry,
+    SoulseekClient, SoulseekLink, SoulseekMetadataService, SoulseekPortCheck, SoulseekShareSwitch, SoulseekSharing,
     SoulseekStartupValidator,
 };
 use crate::services::spotiflac::{CheckTimes, MornyeCheck, MornyeCheckStore, SpotiflacClient};
@@ -3793,6 +3793,9 @@ impl AppState {
             Some(config_dir.join("octo-playlists")),
             Some(workers.as_ref()),
         );
+        // The held service starts after the Soulseek one, so it says now where its snapshots
+        // live: a getSong answer fills its missing fields from a held entry's snapshot.
+        soulseek.metadata.set_held_snapshots(Some(Arc::clone(&held_playlists) as Arc<dyn HeldSongSnapshots>));
         let family_requests = FamilyRequests::build(
             &settings,
             &stores,
@@ -4306,6 +4309,7 @@ impl AppState {
             None,
             None,
         );
+        soulseek.metadata.set_held_snapshots(Some(Arc::clone(&held_playlists) as Arc<dyn HeldSongSnapshots>));
         let family_requests = FamilyRequests::build(
             &settings,
             &stores,

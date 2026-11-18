@@ -2218,3 +2218,78 @@ async fn the_catalog_track_search_answers_its_rows_lookups() {
     assert_eq!(songs[0].album, "25");
     assert_eq!(h.calls("/search?"), 1);
 }
+
+/// A fake held snapshot store: the snapshots the seam answers, by id.
+struct HeldSnapshots(HashMap<String, crate::services::playlists::held_store::SongSnapshot>);
+
+impl HeldSongSnapshots for HeldSnapshots {
+    fn recover_snapshot(&self, external_id: &str) -> Option<crate::services::playlists::held_store::SongSnapshot> {
+        self.0.get(external_id).cloned()
+    }
+}
+
+/// getSong fills the fields the routing alone never had from a held entry's snapshot, and
+/// never over the routing's own words: a song a held playlist holds still answers with its
+/// album, year, genre and length after a restart or an eviction, while one no playlist holds
+/// answers from the routing alone.
+#[tokio::test]
+async fn get_song_fills_its_missing_fields_from_a_held_snapshot() {
+    let h = build_service(Vec::new()).await;
+    let held_id = h.registry.register(octo_core::soulseek::SoulseekRouting {
+        kind: octo_core::soulseek::RoutingKind::Song,
+        artist: Some("Kate Bush".into()),
+        title: Some("Cloudbusting".into()),
+        ..Default::default()
+    });
+    let plain_id = h.registry.register(octo_core::soulseek::SoulseekRouting {
+        kind: octo_core::soulseek::RoutingKind::Song,
+        artist: Some("Talk Talk".into()),
+        title: Some("I Believe in You".into()),
+        ..Default::default()
+    });
+    h.service.set_held_snapshots(Some(Arc::new(HeldSnapshots(
+        [(
+            held_id.clone(),
+            crate::services::playlists::held_store::SongSnapshot {
+                // The routing's own words win: the snapshot's title and artist are never
+                // written over them.
+                title: "Wrong Words".into(),
+                artist: "Ignored".into(),
+                album: "Hounds of Love".into(),
+                seconds: Some(253),
+                track: Some(3),
+                disc: Some(1),
+                year: Some(1985),
+                genre: Some("Art pop".into()),
+                isrcs: vec!["GBAAA8500031".into()],
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+    ))));
+    let song = h
+        .service
+        .get_song("soulseek", &held_id)
+        .await
+        .expect("the song");
+    assert_eq!(song.title, "Cloudbusting");
+    assert_eq!(song.artist, "Kate Bush");
+    assert_eq!(song.album, "Hounds of Love");
+    assert_eq!(song.duration, Some(253));
+    assert_eq!(song.track, Some(3));
+    assert_eq!(song.disc_number, Some(1));
+    assert_eq!(song.year, Some(1985));
+    assert_eq!(song.genre.as_deref(), Some("Art pop"));
+    assert_eq!(song.isrc.as_deref(), Some("GBAAA8500031"));
+
+    // A song no playlist holds answers from the routing alone.
+    let plain = h
+        .service
+        .get_song("soulseek", &plain_id)
+        .await
+        .expect("the song");
+    assert_eq!(plain.album, "");
+    assert_eq!(plain.duration, None);
+    assert_eq!(plain.year, None);
+}

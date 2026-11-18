@@ -21,7 +21,7 @@ pub use radio_queue_store::RadioQueueStore;
 pub use rejected_peer_registry::RejectedPeerRegistry;
 pub use soulseek_client::{SoulseekClient, SoulseekClientError};
 pub use soulseek_link::{ISoulseekLink, SoulseekLink};
-pub use soulseek_metadata_service::{LastFmTrackLengths, SoulseekMetadataService};
+pub use soulseek_metadata_service::{HeldSongSnapshots, LastFmTrackLengths, SoulseekMetadataService};
 pub use soulseek_share_switch::{ISlskdShares, SoulseekShareSwitch};
 pub use soulseek_sharing::{SoulseekPortCheck, SoulseekSharing};
 pub use soulseek_startup_validator::SoulseekStartupValidator;

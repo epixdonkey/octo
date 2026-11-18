@@ -445,6 +445,30 @@ impl HeldStore {
         self.lock().replaced.get(id).cloned()
     }
 
+    /// A held entry's kept snapshot for an outside id the registry resolved the song by
+    /// (`external_id` or `seed_id`): what a getSong answer fills its missing fields from. Every
+    /// held playlist and `Replaced` record is searched; the first match wins.
+    pub fn recover_snapshot(&self, external_id: &str) -> Option<SongSnapshot> {
+        let by_id = |entry: &HeldEntry| {
+            entry.external_id.as_deref() == Some(external_id)
+                || entry.seed_id.as_deref() == Some(external_id)
+        };
+        let inner = self.lock();
+        inner
+            .playlists
+            .values()
+            .flat_map(|playlist| playlist.entries.iter())
+            .chain(
+                inner
+                    .replaced
+                    .values()
+                    .flat_map(|record| record.entries.iter()),
+            )
+            .find(|entry| by_id(entry))?
+            .song
+            .clone()
+    }
+
     /// Every record, by playlist.
     pub fn records(&self) -> Vec<ReplacedRecord> {
         let mut all: Vec<ReplacedRecord> = self.lock().replaced.values().cloned().collect();
