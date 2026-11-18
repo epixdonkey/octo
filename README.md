@@ -12,6 +12,8 @@ Search any song and play it right away. Keep the ones you love as files on your 
 [![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED)](https://docs.docker.com/compose/)
 [![CI](https://github.com/winters27/octo/actions/workflows/ci.yml/badge.svg)](https://github.com/winters27/octo/actions/workflows/ci.yml)
 
+**[Get the Octo apps](https://github.com/winters27/octo-player/releases/latest)** for Android, iPhone, Windows and Linux · [Octo Player on GitHub](https://github.com/winters27/octo-player)
+
 </div>
 
 ---
@@ -48,7 +50,7 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 - **Radio that learns.** Your Radio, discovery, artist and genre stations grow from what you play, plus optional genre and decade mixes from your own library.
 - **Keep what you love.** Press **+** or heart a song and Octo downloads the best copy it can find from Soulseek or your own Lidarr, FLAC first, catches a "lossless" file that was made from an MP3, tags it, adds the cover and lyrics, and files it in your library. Whole albums work too.
 - **Bring your music.** Import your liked songs and playlists from Spotify or any other service, see what you already have, and let Octo fetch the rest a few songs an hour. See [Importing your music](#importing-your-music).
-- **Apps for every device.** [Octo's own apps](#octos-own-apps) for Windows, Linux and Android, and [any Subsonic app](#compatible-apps) on iPhone, Mac and everywhere else.
+- **Apps for every device.** [Octo's own apps](#octos-own-apps) for Android, iPhone, Windows and Linux, and [any Subsonic app](#compatible-apps) on Mac and everywhere else.
 - **Yours to run.** The files are on your disk, everyone in the house gets their own login and their own stations, and there is nothing to pay each month.
 
 > If you pay for Qobuz, Deezer or Yandex Music and want that catalog in your library, [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta) fits better, since it downloads from those services directly. Octo needs no paid streaming account.
@@ -93,9 +95,37 @@ On the starter stack Navidrome runs from the same `docker-compose.yml`, turned o
 
 </details>
 
+## Try it in the cloud
+
+No server at home? Each button below rents you a small server and starts Octo on it, with the starter Navidrome beside it. Octo is free; the host bills you for the server.
+
+[![Deploy on Hostinger](https://assets.hostinger.com/vps/deploy.svg)](https://www.hostinger.com/docker-hosting?compose_url=https://raw.githubusercontent.com/winters27/octo/main/deploy/cloud/docker-compose.yml)
+[![Deploy on Elestio](https://docs.elest.io/img/deploy-on-elestio.png)](https://dash.elest.io/deploy?source=cicd&social=dockerCompose&url=https://github.com/winters27/octo)
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/Octo/)
+
+- **Hostinger** runs [`deploy/cloud/docker-compose.yml`](deploy/cloud/docker-compose.yml) on one of its VPS plans.
+- **Elestio** runs the same file on a server of its own, with HTTPS in front, and makes up both passwords for you.
+- **RepoCloud** has an AI agent read this repository and set Octo up on a VPS for you, billed by RepoCloud. It is not a fixed template, so check what it made.
+
+Before you start:
+
+- **Set the two passwords** in the host's environment settings, unless it makes them up for you: `NAVIDROME_ADMIN_PASSWORD` (the `admin` login for Navidrome, the dashboard and your apps) and `SLSKD_PASSWORD` (Octo's own login for slskd). Without them the deploy stops and says which is missing. Add `LASTFM_API_KEY` and your Soulseek login too, or set them later on the dashboard.
+- **The disk fills with music.** Every song you keep is a file on that server, so pick a plan with room to grow.
+- **Put HTTPS in front** before you sign in to the dashboard over the public internet. Octo itself serves plain HTTP on port 5274 (Elestio already adds HTTPS).
+- **You are responsible** for what you download and for your host's terms of service.
+
 ## Octo's own apps
 
-Any Subsonic app works with Octo. Its own apps for desktop and Android are made for it: the music Octo finds sits beside your library, and keeping a song is just **Add to library**.
+Any Subsonic app works with Octo. Its own apps, [Octo Player](https://github.com/winters27/octo-player) for Android, iPhone, Windows and Linux, are made for it: the music Octo finds sits beside your library, and keeping a song is just **Add to library**.
+
+| Device | Get it from the [latest Octo Player release](https://github.com/winters27/octo-player/releases/latest) |
+| --- | --- |
+| Android 10 and newer | the `.apk`, or add [Octo's F-Droid repository](https://winters27.github.io/octo/fdroid/) so it updates through F-Droid, Droid-ify or Neo Store |
+| iPhone, iOS 26 and newer | the `.ipa`, installed with a sideloading app such as AltStore or SideStore (TestFlight is coming) |
+| Windows | the `.msi` installer or the portable zip |
+| Linux | the AppImage, the Flatpak, the `.deb` or `.rpm`, the Arch Linux package or the portable zip |
+
+Each version is one release with every device's file and what changed, and the apps you have installed update themselves.
 
 ![Home in the Octo desktop app](docs/images/players/desktop-home.webp)
 
@@ -116,13 +146,13 @@ Any Subsonic app works with Octo. Its own apps for desktop and Android are made 
 <tr><td width="33%"><img src="docs/images/players/phone-search.webp" alt="Search in the Octo Android app"></td><td width="33%"><img src="docs/images/players/phone-album.webp" alt="An album in the Octo Android app"></td><td width="33%"><img src="docs/images/players/phone-player.webp" alt="The player in the Octo Android app"></td></tr>
 </table>
 
-The desktop app runs on Windows and Linux, and the Android app on Android 10 and newer. They need Octo 2026.09.29 or newer, and they work as regular players with Navidrome too. Download them from [Octo for Windows and Linux](https://github.com/winters27/octo/releases/tag/desktop-v1.6.0) and [Octo for Android](https://github.com/winters27/octo/releases/tag/android-v1.6.0), or add [Octo's F-Droid repository](https://winters27.github.io/octo/fdroid/) so the Android app updates through F-Droid, Droid-ify or Neo Store. The source is at [winters27/octo-player](https://github.com/winters27/octo-player).
+The apps work as regular players with Navidrome too. The newest features (playlist folders, songs found online in your playlists, Try another version) need Octo 2026.11.15 or newer. The source is at [winters27/octo-player](https://github.com/winters27/octo-player).
 
 ## Compatible apps
 
 | Works | App | Platform |
 |---|---|---|
-| ✅ | [Octo's own apps](#octos-own-apps) | Windows, Linux, Android |
+| ✅ | [Octo's own apps](#octos-own-apps) | Android, iPhone, Windows, Linux |
 | ✅ | [Feishin](https://github.com/jeffvli/feishin) | desktop |
 | ✅ | [Supersonic](https://github.com/dweymouth/supersonic) | desktop |
 | ✅ | [Sublime Music](https://github.com/sublime-music/sublime-music) | Linux |
@@ -206,7 +236,7 @@ scripts/updater/install-updater.sh --remove
 Without the helper, **About** shows the command for the new release. From the Octo folder:
 
 ```bash
-git fetch --tags && git checkout --detach 2026.11.13
+git fetch --tags && git checkout --detach 2026.11.15
 docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source
 docker compose up -d
 ```
@@ -1013,6 +1043,8 @@ Set `WAIT_FOR_LOSSLESS_ON_PLAY=true` if you would rather the first play wait for
 
 Set `DOWNLOAD_ON_PLAY=true` to keep a copy of every song played from outside your library, radio included. The copy comes from the first song source in the heart download priority that Octo fetches itself (Soulseek or YouTube, never Lidarr), and playback still starts from YouTube at once. Only the start of a play counts, not a seek. Hearts always go ahead of these downloads, and at most one played song waits its turn: a song played while another is waiting is skipped, and tried again the next time it is played. Each one shows in the app's download list like a heart, and hearting a song that is already downloading this way makes it a heart. `LIDARR_ALBUM_ON_PLAY=true` hands the album of every played song to Lidarr, once per song until Octo restarts; one Lidarr turns down is tried again on the next play. Every hand-off makes Lidarr search all its indexers, so on radio it pulls in an album per song. Both are off by default and have switches under **Streams & hearts, Playing songs you don't own**.
 
+`DOWNLOAD_ON_PLAY_AFTER_SECONDS` (0 by default, which downloads at once) makes Download on play wait until a song has played that many seconds, so a song you skip in the first half minute leaves nothing behind. The wait runs on the player that started the song: starting another song there first drops it, and so does a skip the app reports (a finished scrobble within 30 seconds of the start). An app that reports the song finished later than that starts the download right away, and a song shorter than twice the wait downloads once half of it has played. Buffered bytes never count as listening, since players read ahead. While it is set, songs coming up are fetched ahead as usual but only kept once they have been listened to. It is the **Listen first** field under **Keep what is played** in the dashboard.
+
 Octo sends plays to Last.fm itself: songs from outside your library, which Navidrome has never heard of, and your library songs too (the dashboard's "Also send library plays", on by default). Octo also sends outside plays to ListenBrainz when a token is set. For Last.fm, paste your API key and its shared secret on the dashboard's Last.fm page (or set `LASTFM_API_KEY` and `LASTFM_API_SECRET`); Save checks both with Last.fm. Then press **Connect** next to a listener and allow access on last.fm while signed in as that person. The dashboard notices by itself when that is done, and for someone else you can copy the link and send it to them. Each listener has their own connection. If Navidrome is also linked to the same Last.fm, or an app scrobbles to Last.fm itself, turn that off (or turn off "Also send library plays") or plays count twice.
 
 ### Folder layouts
@@ -1082,6 +1114,8 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `getTranscodeDecision` | OpenSubsonic: return direct-play for Octo IDs |
 | `getLyricsBySongId`, `getLyrics` | lyrics for outside songs and for library songs Navidrome has none for; chosen or hidden lyrics for every client; word cues with `enhanced=true` |
 | `getLyricsCandidates`, `setLyricsChoice` | the `octoLyrics` extension: every lyrics entry for a song, and pinning one, hiding lyrics, or going back to automatic |
+| `getStreamVersions`, `setStreamVersion` | the `octoStreamVersions` extension: the YouTube videos a song found online can stream from (title, channel, length and kind, the one playing marked with who picked it), and choosing the one it plays for everyone on the server, on every device and in every app, from each play's next start; `video=auto` goes back to Octo's own pick. A play already under way keeps its video to its end. A family's Listener and Kid accounts cannot choose (error 50); while the chooser's own heart or request of the song is being added to their library, its version waits until that finishes |
+| `getStreamVersionChanges` | the `octoStreamVersionChanges` extension: the songs found online whose chosen version changed after a cursor (`epoch`, `since`), with every id each has, so an app drops its saved copies of them; `complete: false` means drop every saved song found online |
 | `getLibraryActions`, `libraryAction`, `getLibraryTrash` | the `octoLibraryActions` extension: what the caller may do to library files, removing one song the way the Delete playlist does, putting it back, and the tag, album and cover fixes of Library health |
 | `getAcquisitions`, `getAcquisition`, `clearAcquisitions` | the `octoAcquisitions` extension: the caller's downloads; version 2 adds each one's log and clearing finished ones; version 4 adds `keepAnyway: true` on a row the caller may keep anyway (a song held while AcoustID is off, or a hearted album's held tracks; only for someone waiting in its hold, and dropped once they asked), and `heldTracks` (how many tracks a hearted album's row holds: the button reads Keep these anyway at 2 or more, else Keep anyway); each is left out otherwise |
 | `keepAcquisitionAnyway` | `octoAcquisitions` 4, by the row's `key`: keeps a held row for the caller (a song keeps the version they heard, a hearted album lands its held tracks, each marked "kept by you, version not proven", and a copy proven later still replaces it). It acts for the caller alone: a hearted album's held tracks land in the caller's library, and stay held for the others who hearted it. It answers a plain `ok` only once the keep is saved, so a restart in the middle still finishes it. An admin may add `user` to keep for someone. Errors: 10 for a missing `key`, and "Name the person whose copy to keep" for an admin who named nobody on a row others wait in; 50 "Only someone who hearted this can keep it" for someone the row is not theirs; 70 "Nothing is waiting to be kept" when nothing waits for the caller (or, for the admin, nothing waits at all) |
@@ -1092,7 +1126,7 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `setChartCountry`, `pinChartCountry` | `octoTopSongs` 3: the caller's own chart country (`country`, or `auto` to follow the server's), and pinning (`pinned=true` or `1`) or unpinning (`pinned=false` or `0`) one more `country`, at most 3; error 10 for a country Apple does not have, error 0 while two other countries are already loading for the caller, which frees as they finish; each answers like `getCharts`, which then says the caller's `setting`, `pinned`, the `serverCountry`, Apple's `countries` and `maxPinned` |
 | `getPlace` | the `octoPlaces` extension, for the apps' Live radio near you: a postal code (`code` and `country`, any case or spacing, `UK` for `GB`; a full UK, Canadian or Dutch code finds the part GeoNames keeps, and a ZIP+4 its five digits), a city (`name`, optional `state` by name or code, and `country`; of the towns with that name, and that state when one is sent, the one with the most postal codes, at the postal code nearest its others) or a coordinate (`latitude` and `longitude` in decimal degrees: the nearest place within 30 km), in that order when several are sent, answered as `place` with `code`, `name`, `state` (when known), `country`, `latitude` and `longitude` (2 decimals). Error 70 for a place Octo does not know, error 10 for missing parameters or coordinates that are not decimal degrees. Answered from GeoNames' postal codes, built into the image; nothing is sent anywhere |
 | `/api/artist/{id}`, `/api/album?artist_id=` | Navidrome's own API, for clients that use it (Feishin): an outside artist's page and its albums |
-| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 to 4, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` 1 to 3 (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`), `octoPlaces` (while the place data can be read, so an app without it keeps to its own lookup) and `songLyrics` 1 and 2 |
+| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 to 4, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` 1 to 3 (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`), `octoPlaces` (while the place data can be read, so an app without it keeps to its own lookup), `octoStreamVersions` (for every account but a family's Listener and Kid accounts), `octoStreamVersionChanges` and `songLyrics` 1 and 2 |
 
 ### Soulseek download details
 
@@ -1226,6 +1260,11 @@ Project layout:
 ## License
 
 [GPL-3.0](LICENSE)
+
+Octo ships [Inter](https://github.com/rsms/inter) 4.1 under the SIL Open Font License: the
+dashboard and Family pages load it from Octo itself (`octo/wwwroot/fonts/`, license in
+`octo/wwwroot/fonts/OFL.txt`), and list covers are drawn with it (`licenses/Inter-OFL.txt` in
+the image).
 
 ## Acknowledgments
 

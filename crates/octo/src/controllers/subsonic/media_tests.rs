@@ -20,6 +20,7 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 use super::caller_checks::is_first_byte_request;
 use super::media::draws_its_own_marks_in;
 use super::test_app::*;
+use crate::services::common::listening_plays::ListeningPlays;
 use crate::services::fingerprint::music_brainz_client::MusicBrainzClient;
 
 /// Navidrome accepting every sign-in: these tests are about what plays, not who.
@@ -428,6 +429,77 @@ async fn streaming_an_outside_song_queues_its_download_only_from_the_first_byte(
             "{range:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn listen_first_holds_the_plays_download_until_the_player_starts_another_song() {
+    let navidrome = ping_ok().await;
+    let downloads = Arc::new(FakeStreams::streaming(
+        "soulseek",
+        "track-id",
+        &[1, 2, 3],
+        "audio/mp4",
+    ));
+    let library = Arc::new(FakeLibrary::with_external(
+        "external-track",
+        "soulseek",
+        "track-id",
+    ));
+    let mut settings = playback_settings(&navidrome.uri(), false, true);
+    settings.subsonic.download_on_play_after_seconds = 30;
+    let state = state_with(settings, |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = library.clone();
+    });
+    let app = app(&state);
+    let listening = state.heart_acquisition_coordinator.listening();
+    let player = ListeningPlays::player_key("alice", None, "test");
+
+    let response = get(
+        &app,
+        "/rest/stream?id=external-track&f=json&u=alice&t=good&s=salt&v=1.16.1&c=test",
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(listening.waiting_song(&player).as_deref(), Some("external-track"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        state.track_acquisition_queue.waiting_plays(),
+        0,
+        "not before it is listened to"
+    );
+
+    // A later range of the same song, a download and another app's stream are not this player
+    // starting another song.
+    send(
+        &app,
+        Method::GET,
+        "/rest/stream?id=external-track&f=json&u=alice&t=good&s=salt&v=1.16.1&c=test",
+        &[("Range", "bytes=4096-")],
+        Body::empty(),
+    )
+    .await;
+    get(
+        &app,
+        "/rest/download?id=library-track&u=alice&t=good&s=salt&v=1.16.1&c=test",
+    )
+    .await;
+    get(
+        &app,
+        "/rest/stream?id=library-track&u=alice&t=good&s=salt&v=1.16.1&c=other",
+    )
+    .await;
+    assert_eq!(listening.waiting_song(&player).as_deref(), Some("external-track"));
+
+    get(
+        &app,
+        "/rest/stream?id=library-track&u=alice&t=good&s=salt&v=1.16.1&c=test",
+    )
+    .await;
+    assert!(
+        listening.waiting_song(&player).is_none(),
+        "another song started first"
+    );
 }
 
 #[test]
@@ -1907,6 +1979,177 @@ async fn an_octo_app_play_served_its_lossless_copy_keeps_it_on_the_next_range() 
     assert_eq!(later.header("content-type"), Some("audio/flac"));
     assert_eq!(later.body.as_ref(), [6]);
     assert!(downloads.stream_calls().is_empty(), "never the preview");
+}
+
+/// The app's state with an outside song (`outside-song`) the registry holds, whose stream the
+/// fake answers from `video`; with Navidrome, the fake streams and the song's registry id.
+async fn outside_with_video(
+    video: &'static str,
+) -> (MockServer, crate::app::AppState, Arc<FakeStreams>, String) {
+    let navidrome = ping_ok().await;
+    let downloads = Arc::new(FakeStreams::default());
+    let library = Arc::new(FakeLibrary::default());
+    let state = state_with(playback_settings(&navidrome.uri(), false, false), |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = library.clone();
+    });
+    let id = state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("Drake".into()),
+        title: Some("Started".into()),
+        ..Default::default()
+    });
+    library.add_external("outside-song", "soulseek", &id);
+    downloads.answer_with(
+        "soulseek",
+        &id,
+        Box::new(move || {
+            let chunk: std::io::Result<bytes::Bytes> = Ok(bytes::Bytes::from_static(&[1, 2, 3]));
+            Some(crate::services::i_download_service::DirectStreamInfo {
+                audio_stream: Box::pin(futures::stream::iter([chunk])),
+                content_type: "audio/mp4".into(),
+                content_length: Some(3),
+                quality: None,
+                status_code: 200,
+                content_range: None,
+                video_id: Some(video.to_string()),
+                itag: None,
+            })
+        }),
+    );
+    (navidrome, state, downloads, id)
+}
+
+#[tokio::test]
+async fn an_outside_stream_names_its_video_and_hands_the_service_its_play() {
+    let (_navidrome, state, downloads, id) = outside_with_video("v1").await;
+    let app = app(&state);
+    let url = format!(
+        "/rest/stream?id=outside-song&{}&octoPlay=e7.0",
+        auth("alice", "good", "Octo")
+    );
+    let reply = send(
+        &app,
+        Method::GET,
+        &url,
+        &[("X-Octo-Device-Id", "install-1")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.header("x-octo-video"), Some("v1"));
+
+    let offline = send(
+        &app,
+        Method::GET,
+        &url,
+        &[("X-Octo-Device-Id", "install-1"), ("X-Octo-Purpose", "offline")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(offline.status, StatusCode::OK);
+
+    let plays: Vec<_> = downloads.stream_plays().into_iter().flatten().collect();
+    assert_eq!(plays.len(), 2, "every outside stream hands its play on");
+    assert_eq!(plays[0].token.as_deref(), Some("e7.0"));
+    assert!(plays[0].octo_device);
+    assert!(
+        !plays[0].key.contains('\n'),
+        "an Octo device's key carries no address"
+    );
+    assert_eq!(
+        plays[1].key,
+        format!("{}\noffline", plays[0].key),
+        "an offline copy is a play of its own"
+    );
+    let heard = state
+        .external_id_registry
+        .heard_by(&id, "alice")
+        .and_then(|record| record.source.video_id().map(str::to_string));
+    assert_eq!(heard.as_deref(), Some("v1"), "heard names the video served");
+}
+
+#[tokio::test]
+async fn a_scout_read_is_heard_by_nobody() {
+    let (_navidrome, state, downloads, id) = outside_with_video("v1").await;
+    let app = app(&state);
+    let url = format!(
+        "/rest/stream?id=outside-song&{}&octoPlay=e7.0",
+        auth("alice", "good", "Octo")
+    );
+    let reply = send(
+        &app,
+        Method::GET,
+        &url,
+        &[
+            ("X-Octo-Device-Id", "install-1"),
+            ("X-Octo-Purpose", "scout"),
+            ("Range", "bytes=0-"),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.header("x-octo-video"), Some("v1"));
+    assert_eq!(
+        state.external_id_registry.heard_by(&id, "alice"),
+        None,
+        "a look is heard by nobody"
+    );
+    let plays: Vec<_> = downloads.stream_plays().into_iter().flatten().collect();
+    assert!(plays[0].peeks());
+}
+
+#[tokio::test]
+async fn the_flac_stand_in_keeps_a_running_plays_video_and_gives_a_new_play_the_choice() {
+    let (_navidrome, state, _downloads, id) = outside_with_video("v1").await;
+    let registry = &state.external_id_registry;
+    registry.set_you_tube_id(&id, "old");
+    let running = crate::services::i_download_service::StreamPlay {
+        key: "x_phone".into(),
+        token: Some("e1.0".into()),
+        method: "GET".into(),
+        ..Default::default()
+    };
+    registry.bind_play(&id, &running, "old");
+    registry.confirm_play_size(&id, &running, 4_000_000);
+    registry
+        .choose_stream_video(
+            &id,
+            crate::services::soulseek::StreamChoice {
+                video: "new".into(),
+                by: "alice".into(),
+                at: chrono::Utc::now(),
+                ..Default::default()
+            },
+        )
+        .expect("stored");
+
+    let (decision, video, size) = super::media::stand_in_video(&state, &running, Some("bytes=500-"), &id);
+    assert_eq!(
+        decision,
+        crate::services::you_tube::pin_recheck::PlayStart::Continue
+    );
+    assert_eq!(
+        (video.as_deref(), size),
+        (Some("old"), Some(4_000_000)),
+        "the running play's FLAC"
+    );
+
+    let restarted = crate::services::i_download_service::StreamPlay {
+        token: Some("e1.1".into()),
+        ..running.clone()
+    };
+    let (decision, video, size) = super::media::stand_in_video(&state, &restarted, Some("bytes=0-"), &id);
+    assert_eq!(
+        decision,
+        crate::services::you_tube::pin_recheck::PlayStart::Start { switch: true }
+    );
+    assert_eq!(
+        (video.as_deref(), size),
+        (Some("new"), None),
+        "the choice's FLAC, of no known size yet"
+    );
 }
 
 #[test]

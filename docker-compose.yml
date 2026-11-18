@@ -62,6 +62,7 @@ services:
       Subsonic__WaitForLosslessOnPlay: ${WAIT_FOR_LOSSLESS_ON_PLAY:-false}
       Subsonic__LosslessWaitTimeoutSeconds: ${LOSSLESS_WAIT_TIMEOUT_SECONDS:-0}
       Subsonic__DownloadOnPlay: ${DOWNLOAD_ON_PLAY:-false}
+      Subsonic__DownloadOnPlayAfterSeconds: ${DOWNLOAD_ON_PLAY_AFTER_SECONDS:-0}
       Subsonic__LidarrAlbumOnPlay: ${LIDARR_ALBUM_ON_PLAY:-false}
       Subsonic__FolderStructure: ${FOLDER_STRUCTURE:-Flat}
       Subsonic__FolderTemplate: ${FOLDER_TEMPLATE:-}
@@ -639,10 +640,10 @@ services:
     # VERSION (CI checks it), so every release gets its own Mornye image ready.
     # SPOTIFLAC_BUILD_CONTEXT builds it from somewhere else, such as ./mornye in a checkout
     # that is not a release yet.
-    image: octo-mornye:2026.11.13
+    image: octo-mornye:2026.11.15
     pull_policy: never
     build:
-      context: ${SPOTIFLAC_BUILD_CONTEXT:-https://github.com/winters27/octo.git#2026.11.13:mornye}
+      context: ${SPOTIFLAC_BUILD_CONTEXT:-https://github.com/winters27/octo.git#2026.11.15:mornye}
       args:
         # Blank: the Mornye image mornye/Dockerfile pins.
         MORNYE_IMAGE: ${SPOTIFLAC_IMAGE:-}

@@ -76,16 +76,17 @@ jobs:
 
       # docker-compose.yml pulls Octo and its sidecars at Octo's own version unless
       # OCTO_IMAGE_TAG says otherwise, so a release bump that missed it would leave
-      # installs pulling the last release, Octo included. Checked on main too, so a
-      # missed bump shows up before anyone tags it.
+      # installs pulling the last release, Octo included. The cloud compose behind the
+      # README's deploy buttons is read from main, so it moves with every release too.
+      # Checked on main as well, so a missed bump shows up before anyone tags it.
       - name: Compose pulls this version's images
         run: |
           version="$(tr -d ' \r\n' < VERSION)"
-          # This fork pulls its images at the dev tag until it cuts a release of its own.
+          # This fork pulls its own images at the dev tag until it cuts a release of its own.
           default_tag=dev
           stale="$(grep -o 'OCTO_IMAGE_TAG:-[^}]*' docker-compose.yml | sed 's/^OCTO_IMAGE_TAG:-//' | grep -Fvx "$default_tag" | paste -sd ' ' || true)"
           if [ -n "$stale" ]; then
-            echo "::error::docker-compose.yml pulls images tagged $stale, but VERSION says $version. Bump the OCTO_IMAGE_TAG defaults with it."
+            echo "::error::docker-compose.yml pulls images tagged $stale, but the fork serves the $default_tag tag. Bump the OCTO_IMAGE_TAG defaults with it."
             exit 1
           fi
           for image in octo octo-yt-dlp-shim octo-sonic; do
@@ -94,6 +95,13 @@ jobs:
               exit 1
             fi
           done
+          # The cloud compose behind the README's deploy buttons still serves upstream's
+          # images, so it must agree with VERSION.
+          stale="$(grep -o 'OCTO_IMAGE_TAG:-[^}]*' deploy/cloud/docker-compose.yml | sed 's/^OCTO_IMAGE_TAG:-//' | grep -Fvx "$version" | paste -sd ' ' || true)"
+          if [ -n "$stale" ]; then
+            echo "::error::deploy/cloud/docker-compose.yml pulls images tagged $stale, but VERSION says $version. Bump the OCTO_IMAGE_TAG defaults with it."
+            exit 1
+          fi
           # The spotiflac service gets Octo's Mornye image ready from this repository at the
           # release, under a tag of its own: both name the number itself, never OCTO_IMAGE_TAG.
           if ! grep -Fqx "    image: octo-mornye:$version" docker-compose.yml \

@@ -61,6 +61,7 @@ use crate::services::common::TopSongsService;
 use crate::services::common::album_gates::AlbumGates;
 use crate::services::cover_art::{AnimatedArt, ArtworkHints, HintedArtwork};
 use crate::services::family::LibraryWriteGate as FamilyWriteGate;
+use crate::services::family::family_playlist_store::FamilyKept;
 use crate::services::family::request_service::{
     FamilyEvents, LiveRequestCatalog, LiveRequestFetcher, RequestParts, RequestService,
 };
@@ -144,6 +145,13 @@ use crate::services::metadata::{
 };
 use crate::services::metadata::{GenreBackfillJournal, GenreBackfillStore, GenreBackfillWorker};
 use crate::services::notifications::{DiscordSink, INotificationSink, NotificationService, NtfySink};
+use crate::services::playlists::caps::PlaylistCaps;
+use crate::services::playlists::held_playlists::{
+    AdminNavidrome, AppHeldLibrary, HeldParts, HeldPlaylists, HeldSlot, HeldTiming,
+};
+use crate::services::playlists::held_store::HeldStore;
+use crate::services::playlists::seed_index::SeedIndex;
+use crate::services::prefetch::converted_copies::ConvertedCopies;
 use crate::services::prefetch::{
     AppKeepReadySources, HeardSampleParts, HeardSamples, KeepReadyService, KeepReadyStore, PrefetchParts,
     PrefetchService, PrefetchStore, PrefetchedFiles, PreviewCopies,
@@ -174,6 +182,7 @@ use crate::services::updates::UpdateHost;
 use crate::services::validation::{
     IStartupValidator, StartupValidationOrchestrator, SubsonicStartupValidator,
 };
+use crate::services::you_tube::stream_versions::{ListCaps, StreamVersions};
 use crate::services::you_tube::{PinRecheck, StreamSizeWarmer, YouTubeMusicClient, YouTubeResolver};
 use crate::workers::WorkerSupervisor;
 use octo_core::notifications::{NotificationEvent, NotificationEventType};
@@ -329,6 +338,9 @@ pub struct AppInner {
     pub live_radio_slots: Arc<tokio::sync::Semaphore>,
     /// `ExternalIdRegistry`: short external ids, `external-ids.json` (flushed by a worker).
     pub external_id_registry: Arc<ExternalIdRegistry>,
+    /// `StreamVersions`: the videos an outside song can stream from, listed for choosing one, and
+    /// what each answer offered.
+    pub stream_versions: Arc<StreamVersions>,
     /// `StreamSizeWarmer`: learns the true size of outside songs listed without one; a worker.
     pub stream_size_warmer: Arc<StreamSizeWarmer>,
     /// `LocalCoverCache`: library covers kept on disk in `<config>/cover-cache/`, each size cut
@@ -341,6 +353,11 @@ pub struct AppInner {
     pub prefetch: Arc<PrefetchService>,
     /// `PreviewCopies`: whole copies of outside songs' previews, `<config>/preview-copies`.
     pub preview_copies: Arc<PreviewCopies>,
+    /// `ConvertedCopies`: songs found online made in the format a client asks for,
+    /// `<config>/preview-copies/converted`.
+    pub converted_copies: Arc<ConvertedCopies>,
+    /// The time seeks of songs found online running now, one per play.
+    pub seek_runs: Arc<crate::controllers::subsonic::media_convert::SeekRuns>,
     /// `HeardSamples`: the prints of what each person heard, `<config>/heard-samples`, with
     /// scratch files under `<config>/preview-copies/scratch`; the `fpcalc` queue and the shim's
     /// rounds.
@@ -579,6 +596,10 @@ pub struct AppInner {
     pub personal_playlists: Arc<PersonalPlaylistStore>,
     /// Where family playlist additions that wait for approval are reported.
     pub family_playlist_requests: crate::services::family::family_playlists::PlaylistAddHook,
+    /// `octo-playlists/`: playlists that hold songs found online, and every writer's lock.
+    pub held_playlists: Arc<HeldPlaylists>,
+    /// `playlist-folders.json`: each person's playlist folders and which playlists sit in them.
+    pub playlist_folders: Arc<crate::services::playlists::PlaylistFolderStore>,
     /// `family-pool.json`: the one copy of each member download and who links it.
     pub family_pool: Arc<FamilyPoolStore>,
     /// `listening/`: each person's completed plays, for their Listening page.
@@ -777,6 +798,8 @@ fn keep_ready_service(
     metadata: &Arc<dyn IMusicMetadataService>,
     library: &Arc<dyn ILocalLibraryService>,
     prefetch: &Arc<PrefetchService>,
+    held: &crate::services::playlists::held_playlists::HeldSlot,
+    playlists: &Arc<crate::services::library::NavidromePlaylistApi>,
 ) -> Arc<KeepReadyService> {
     let sources = AppKeepReadySources {
         settings: settings.clone(),
@@ -789,6 +812,8 @@ fn keep_ready_service(
         listening: stores.listening.clone(),
         metadata: metadata.clone(),
         library: library.clone(),
+        held: Arc::clone(held),
+        playlists: Arc::clone(playlists),
     };
     KeepReadyService::new(
         settings.clone(),
@@ -1024,6 +1049,7 @@ impl Acquisition {
                         arrivals: Some(stores.download_arrivals.clone()),
                         prefetched: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
                         album_gates: Some(album_gates.clone()),
+                        id_registry: Some(stores.external_id_registry.clone()),
                     },
                     SoulseekDownloadParts {
                         slskd: downloads.soulseek_client.clone(),
@@ -1660,6 +1686,7 @@ struct Stores {
     radio_queues: Arc<RadioQueueStore>,
     prefetch_store: Arc<PrefetchStore>,
     preview_copies: Arc<PreviewCopies>,
+    converted_copies: Arc<ConvertedCopies>,
     heard_samples: Arc<HeardSamples>,
     directory_browser: Arc<DirectoryBrowser>,
     browse_sessions: Arc<BrowseSessionStore>,
@@ -1738,6 +1765,14 @@ impl Stores {
             Clock::system(),
             move || copies_settings.current().prefetch.effective_min_free_bytes(),
         );
+        // Songs found online made in the format a client asks for, beside the copies they are
+        // made from, under the same free-space floor.
+        let converted_settings = settings.clone();
+        let converted_copies = ConvertedCopies::new(
+            config_dir.join("preview-copies").join("converted"),
+            Clock::system(),
+            move || converted_settings.current().prefetch.effective_min_free_bytes(),
+        );
         let cover_settings = settings.clone();
         let local_cover_cache = Arc::new(LocalCoverCache::new(
             config_dir.join("cover-cache"),
@@ -1777,6 +1812,7 @@ impl Stores {
             radio_queues: Arc::new(RadioQueueStore::new()),
             prefetch_store,
             preview_copies,
+            converted_copies,
             heard_samples,
             directory_browser: Arc::new(DirectoryBrowser::new()),
             browse_sessions: Arc::new(BrowseSessionStore::new(Some(
@@ -2362,6 +2398,8 @@ struct Imports {
     service: Arc<crate::services::imports::ImportService>,
     trickle: Arc<crate::services::imports::TrickleWorker>,
     reconciler: Arc<PersonalPlaylistReconciler>,
+    /// Filled with the held playlists once they are built, so the keeper syncs under their locks.
+    held_slot: HeldSlot,
 }
 
 impl Imports {
@@ -2406,6 +2444,7 @@ impl Imports {
                 spotiflac: Some(acquisition.spotiflac.clone()),
             },
         );
+        let held_slot: HeldSlot = Arc::default();
         let service = ImportService::new(ImportParts {
             store: Arc::new(ImportStore::new(file("imports.json"))),
             queue,
@@ -2414,7 +2453,8 @@ impl Imports {
             playlists: ImportPlaylists::new(Arc::new(NavidromePlaylists {
                 api: navidrome.navidrome_playlist_api.clone(),
                 identity: navidrome.navidrome_identity.clone(),
-            })),
+            }))
+            .with_held(Arc::clone(&held_slot)),
             links: Arc::new(SpotifyLinkReader::new(SpotifyLinkReader::client())),
             settings: settings.clone(),
             tracker: Some(acquisition.acquisition_tracker.clone()),
@@ -2438,6 +2478,7 @@ impl Imports {
             service,
             trickle,
             reconciler,
+            held_slot,
         }
     }
 
@@ -2455,6 +2496,75 @@ impl Imports {
             reconciler.clone().run(stopping)
         });
     }
+}
+
+/// Starts the held playlists in their order: the held store and its kept ids (held files and
+/// `Replaced` records), the family seeds backfilled from the registry and their kept ids, the caps
+/// counted, the registry's start finished (releasing keys nothing named again), then the recovery
+/// sources (the playlists' seed index, asked before the imports hook the import group set). Then
+/// binding listens to the tracker, and keep-marks and the import keeper write under the
+/// playlists' locks. With `workers`, the start sweep, the attach pass and the store's flush pass
+/// run as a worker.
+#[allow(clippy::too_many_arguments)] // one argument per group the held playlists read from
+fn start_held(
+    stores: &Stores,
+    navidrome: &NavidromeServices,
+    acquisition: &Acquisition,
+    metadata: &Arc<dyn IMusicMetadataService>,
+    imports: &Imports,
+    library_health: &Arc<LibraryHealthService>,
+    dir: Option<PathBuf>,
+    workers: Option<&WorkerSupervisor>,
+) -> Arc<HeldPlaylists> {
+    let registry = Arc::clone(&stores.external_id_registry);
+    let seed_index = Arc::new(SeedIndex::new());
+    let caps = Arc::new(PlaylistCaps::with_limits(
+        PlaylistCaps::PERSON,
+        PlaylistCaps::SERVER,
+    ));
+    let held = HeldPlaylists::start(HeldParts {
+        store: HeldStore::new(dir),
+        navidrome: Arc::new(AdminNavidrome {
+            api: Arc::clone(&navidrome.navidrome_playlist_api),
+        }),
+        library: Arc::new(AppHeldLibrary {
+            local: Arc::clone(&navidrome.local_library),
+            resolver: Arc::clone(&navidrome.navidrome_song_path_resolver),
+            scope: navidrome.library_scope.clone(),
+            metadata: Arc::clone(metadata),
+            history: Arc::clone(&stores.download_history),
+        }),
+        registry: Arc::clone(&registry),
+        seed_index: Arc::clone(&seed_index),
+        caps: Arc::clone(&caps),
+        family: Some(Arc::clone(&stores.family_playlists)),
+        timing: HeldTiming::default(),
+        clock: Clock::system(),
+    });
+    stores.family_playlists.attach_kept(FamilyKept {
+        registry: Arc::clone(&registry),
+        seed_index: Arc::clone(&seed_index),
+        caps: Arc::clone(&caps),
+    });
+    stores.family_playlists.backfill_seeds();
+    stores.family_playlists.publish_kept();
+    let mut counts = held.counted_by_owner();
+    for (owner, n) in stores.family_playlists.counted_by_owner() {
+        *counts.entry(owner).or_default() += n;
+    }
+    caps.reset(counts);
+    registry.finish_start();
+    registry.set_recovery_sources(vec![seed_index.recovery()]);
+    held.listen(&acquisition.acquisition_tracker);
+    if let Some(keep) = library_health.keep_marks() {
+        keep.use_held(Arc::clone(&held));
+    }
+    *imports.held_slot.write() = Some(Arc::clone(&held));
+    if let Some(workers) = workers {
+        let worker = Arc::clone(&held);
+        workers.register("HeldPlaylists", move |stopping| Arc::clone(&worker).run(stopping));
+    }
+    held
 }
 
 /// The Soulseek services, over the stores and clients they read.
@@ -3554,6 +3664,7 @@ impl AppState {
         );
         prefetch.use_mixes(radio.generated_playlists.clone());
         prefetch.use_preview_copies(stores.preview_copies.clone());
+        prefetch.use_converted_copies(stores.converted_copies.clone());
         {
             let prefetch = prefetch.clone();
             workers.register("PrefetchService", move |stopping| prefetch.clone().run(stopping));
@@ -3703,6 +3814,16 @@ impl AppState {
             Some(clients.music_brainz.clone()),
         );
         imports.register_workers(&workers);
+        let held_playlists = start_held(
+            &stores,
+            &navidrome,
+            &acquisition,
+            &metadata_service,
+            &imports,
+            &library_health,
+            Some(config_dir.join("octo-playlists")),
+            Some(workers.as_ref()),
+        );
         let family_requests = FamilyRequests::build(
             &settings,
             &stores,
@@ -3727,6 +3848,8 @@ impl AppState {
             &metadata_service,
             &navidrome.local_library,
             &prefetch,
+            &imports.held_slot,
+            &navidrome.navidrome_playlist_api,
         );
         {
             let keep_ready = keep_ready.clone();
@@ -3762,6 +3885,11 @@ impl AppState {
             download_concurrency: stores.download_concurrency,
             download_picks: stores.download_picks,
             soulseek_holds: stores.soulseek_holds,
+            stream_versions: Arc::new(StreamVersions::new(
+                stores.you_tube_resolver.clone(),
+                Clock::system(),
+                ListCaps::default(),
+            )),
             you_tube_resolver: stores.you_tube_resolver,
             live_radio_slots: crate::controllers::subsonic::live_radio::live_stream_slots(),
             external_id_registry: stores.external_id_registry,
@@ -3770,6 +3898,8 @@ impl AppState {
             radio_queues: stores.radio_queues,
             prefetch,
             preview_copies: stores.preview_copies,
+            converted_copies: stores.converted_copies,
+            seek_runs: Default::default(),
             heard_samples: stores.heard_samples,
             keep_ready,
             directory_browser: stores.directory_browser,
@@ -3893,6 +4023,10 @@ impl AppState {
             family_playlists: stores.family_playlists,
             personal_playlists: stores.personal_playlists,
             family_playlist_requests: Default::default(),
+            held_playlists,
+            playlist_folders: Arc::new(crate::services::playlists::PlaylistFolderStore::new(Some(
+                config_dir.join("playlist-folders.json"),
+            ))),
             family_pool: stores.family_pool,
             listening: stores.listening,
             navidrome_admin: family_navidrome.0,
@@ -4095,6 +4229,7 @@ impl AppState {
         );
         prefetch.use_mixes(radio.generated_playlists.clone());
         prefetch.use_preview_copies(stores.preview_copies.clone());
+        prefetch.use_converted_copies(stores.converted_copies.clone());
         // Apple's pages from the test's mock server, else an address that refuses at once (a
         // port the system handed out and let go: never port 1, which WSL's mirrored networking
         // lets time out). The warm worker is not run.
@@ -4193,6 +4328,16 @@ impl AppState {
             soulseek.link.clone(),
             None,
         );
+        let held_playlists = start_held(
+            &stores,
+            &navidrome,
+            &acquisition,
+            &metadata_service,
+            &imports,
+            &library_health,
+            None,
+            None,
+        );
         let family_requests = FamilyRequests::build(
             &settings,
             &stores,
@@ -4217,6 +4362,8 @@ impl AppState {
             &metadata_service,
             &navidrome.local_library,
             &prefetch,
+            &imports.held_slot,
+            &navidrome.navidrome_playlist_api,
         );
         let inner = AppInner {
             restart_tracker,
@@ -4246,6 +4393,11 @@ impl AppState {
             download_concurrency: stores.download_concurrency,
             download_picks: stores.download_picks,
             soulseek_holds: stores.soulseek_holds,
+            stream_versions: Arc::new(StreamVersions::new(
+                stores.you_tube_resolver.clone(),
+                Clock::system(),
+                ListCaps::default(),
+            )),
             you_tube_resolver: stores.you_tube_resolver,
             live_radio_slots: crate::controllers::subsonic::live_radio::live_stream_slots(),
             external_id_registry: stores.external_id_registry,
@@ -4254,6 +4406,8 @@ impl AppState {
             radio_queues: stores.radio_queues,
             prefetch,
             preview_copies: stores.preview_copies,
+            converted_copies: stores.converted_copies,
+            seek_runs: Default::default(),
             heard_samples: stores.heard_samples,
             keep_ready,
             directory_browser: stores.directory_browser,
@@ -4377,6 +4531,10 @@ impl AppState {
             family_playlists: stores.family_playlists,
             personal_playlists: stores.personal_playlists,
             family_playlist_requests: Default::default(),
+            held_playlists,
+            playlist_folders: Arc::new(crate::services::playlists::PlaylistFolderStore::new(Some(
+                config_dir.join("playlist-folders.json"),
+            ))),
             family_pool: stores.family_pool,
             listening: stores.listening,
             navidrome_admin: family_navidrome.0,

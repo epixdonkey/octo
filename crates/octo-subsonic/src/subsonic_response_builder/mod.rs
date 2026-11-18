@@ -136,6 +136,86 @@ pub const STATIONS_EXTENSION_VERSION: i32 = 1;
 pub const ANIMATED_ART_EXTENSION: &str = "octoAnimatedArt";
 pub const ANIMATED_ART_EXTENSION_VERSION: i32 = 1;
 
+/// octoPlaylistSongs: a person's own playlist keeps songs found online in their places (the
+/// playlist stays Navidrome's, with the same id), `getPlaylists` and `getPlaylist` rows carry
+/// `octoUpkeep` and `octoImport`, a replace takes `octoIfStamp` and `octoOwnIds`, an answer that
+/// skipped ids carries `octoSkipped`, and `updatePlaylist` takes `octoSongToRemove` on every
+/// playlist the caller owns.
+pub const PLAYLIST_SONGS_EXTENSION: &str = "octoPlaylistSongs";
+pub const PLAYLIST_SONGS_EXTENSION_VERSION: i32 = 1;
+
+/// octoPlaylistFolders: getPlaylistFolders, savePlaylistFolder, deletePlaylistFolder and
+/// setPlaylistFolder, each answering the caller's `playlistFolders`.
+pub const PLAYLIST_FOLDERS_EXTENSION: &str = "octoPlaylistFolders";
+pub const PLAYLIST_FOLDERS_EXTENSION_VERSION: i32 = 1;
+
+/// OpenSubsonic's formPost: Octo reads form posts itself, so a client can send a long playlist
+/// replace in one call.
+pub const FORM_POST_EXTENSION: &str = "formPost";
+
+/// What every Octo lists whatever its settings, added to the merged extension list. A list that
+/// already names one keeps its own entry (formPost is added only when Navidrome leaves it out).
+pub const PLAYLIST_EXTENSIONS: &[(&str, &[i32])] = &[
+    (PLAYLIST_SONGS_EXTENSION, &[PLAYLIST_SONGS_EXTENSION_VERSION]),
+    (PLAYLIST_FOLDERS_EXTENSION, &[PLAYLIST_FOLDERS_EXTENSION_VERSION]),
+    (FORM_POST_EXTENSION, &[1]),
+];
+
+/// A getOpenSubsonicExtensions answer (already merged with Octo's own) with
+/// [`PLAYLIST_EXTENSIONS`] added. A failed or unreadable answer goes out as it came.
+pub fn with_playlist_extensions(reply: SubsonicReply, format: &str) -> SubsonicReply {
+    let merged = if format.eq_ignore_ascii_case("json") {
+        merge_extensions_json(&reply.body, PLAYLIST_EXTENSIONS)
+    } else {
+        merge_extensions_xml(&reply.body, PLAYLIST_EXTENSIONS)
+    };
+    let Some(text) = merged else {
+        return reply;
+    };
+    SubsonicReply {
+        body: text.into_bytes(),
+        ..reply
+    }
+}
+
+/// octoStreamVersions: getStreamVersions and setStreamVersion, the YouTube videos an outside
+/// song can stream from and choosing the one it plays for everyone on the server (`video=auto`
+/// goes back to Octo's own pick). Listed only for callers who may choose.
+pub const STREAM_VERSIONS_EXTENSION: &str = "octoStreamVersions";
+pub const STREAM_VERSIONS_EXTENSION_VERSION: i32 = 1;
+
+/// octoStreamVersionChanges: getStreamVersionChanges, the outside songs whose chosen version
+/// changed after a cursor, with every id each has, so a device drops its saved copies of them.
+/// Listed for every caller.
+pub const STREAM_VERSION_CHANGES_EXTENSION: &str = "octoStreamVersionChanges";
+pub const STREAM_VERSION_CHANGES_EXTENSION_VERSION: i32 = 1;
+
+/// A getOpenSubsonicExtensions answer (already merged with Octo's own) with
+/// [`STREAM_VERSION_CHANGES_EXTENSION`] added, and [`STREAM_VERSIONS_EXTENSION`] too when the
+/// caller `may_pick`. A failed or unreadable answer goes out as it came.
+pub fn with_stream_versions_extensions(reply: SubsonicReply, format: &str, may_pick: bool) -> SubsonicReply {
+    const ALL: &[(&str, &[i32])] = &[
+        (STREAM_VERSIONS_EXTENSION, &[STREAM_VERSIONS_EXTENSION_VERSION]),
+        (
+            STREAM_VERSION_CHANGES_EXTENSION,
+            &[STREAM_VERSION_CHANGES_EXTENSION_VERSION],
+        ),
+    ];
+    let own = if may_pick { ALL } else { &ALL[1..] };
+    let merged = if format.eq_ignore_ascii_case("json") {
+        merge_extensions_json(&reply.body, own)
+    } else {
+        merge_extensions_xml(&reply.body, own)
+    };
+    let Some(text) = merged else {
+        return reply;
+    };
+    SubsonicReply {
+        body: text.into_bytes(),
+        ..reply
+    }
+}
+
 /// Fields only a file in the library can truthfully have.
 pub const FILE_ONLY_FIELDS: &[&str] = &[
     "path",

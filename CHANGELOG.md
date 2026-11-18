@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026.11.18 — Sync with upstream 2026.11.15: held playlists, asked-for formats, another version
+
+### 1. Everything upstream 2026.11.15, on top of this fork's stations (`chore`)
+
+This fork now carries the whole of upstream release 2026.11.15. The big
+pieces: playlists that hold songs found online beside Navidrome's own
+library copies (held playlists, served and changed through both the
+Subsonic API and Navidrome's native API), every answer for a song found
+online in the format and size the client asked for (the funnel, time
+seeks, OpenSubsonic transcoding), "Try another version" listing the other
+YouTube videos of a song found online, Listen first — a sub-setting of
+Keep what is played that downloads a played song only once it has been
+listened to (off by default) — family music going to the shared library
+with members leaving keeping their account, and a pile of fixes:
+multi-artist albums filed under the album's own artist, alternative
+artist names counting as owned on charts and radio, a bare title asked of
+radio after an empty search, the Inter font shipped with Octo, and rustix
+past RUSTSEC-2026-0486. Nothing of the fork gave way: personal mixed
+playlists and `#family` in both protocols answer first and keep their
+exact semantics (a getPlaylist knows the personal overlay before a held
+one), the genre badge of an outside row keeps its kept source label, and
+streaming hearts still queue their fetch on `save=1` downloads, now
+through upstream's new `serve_stream`. The owner's FLAC request playlist
+rides upstream's new UpkeepTitles structure as its own upkeep kind, and
+upstream's refusal of an add past the songs-found-online cap answers the
+prefixed family create as a plain refusal. One behavior did move to
+upstream's side: a plain playlist an outside song was first added to is
+no longer adopted by the overlay — upstream's held routes take it over,
+and only its owner's add takes it (an outside add from anyone else now
+answers "Only the playlist's owner can change it.", upstream's own rule
+their tests name). The compose still pulls this fork's ghcr.io images at
+the dev tag; upstream's new one-click cloud deploy is carried beside
+them.
+
 ## 2026.11.14 — Sync with upstream 2026.11.13: AcoustID hearts, Apple albums, Mornye, imports to playlists
 
 ### 1. Everything upstream 2026.11.13, on top of this fork's stations (`chore`)

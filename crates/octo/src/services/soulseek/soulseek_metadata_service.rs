@@ -548,20 +548,23 @@ impl Inner {
         // video keeps the length it arrived with (D13); `remember_length` below is safe either
         // way, as a catalog length never outranks a video's.
         if let Some(routing) = self.lookup(id) {
-            let mut r = routing.lock();
-            if !r.you_tube_id.as_deref().is_some_and(|y| !y.is_empty())
-                && let Some(d) = meta.duration.filter(|&d| d > 0)
             {
-                r.duration = Some(d);
+                let mut r = routing.lock();
+                if !r.you_tube_id.as_deref().is_some_and(|y| !y.is_empty())
+                    && let Some(d) = meta.duration.filter(|&d| d > 0)
+                {
+                    r.duration = Some(d);
+                }
+                if r.album.as_deref().is_none_or(dotnet::is_blank)
+                    && let Some(album) = meta.album_title.as_deref().filter(|a| !dotnet::is_blank(a))
+                {
+                    r.album = Some(album.to_string());
+                }
+                if let Some(said) = meta.explicit_content {
+                    r.explicit_content = Some(said);
+                }
             }
-            if r.album.as_deref().is_none_or(dotnet::is_blank)
-                && let Some(album) = meta.album_title.as_deref().filter(|a| !dotnet::is_blank(a))
-            {
-                r.album = Some(album.to_string());
-            }
-            if let Some(said) = meta.explicit_content {
-                r.explicit_content = Some(said);
-            }
+            self.id_registry.mark_changed(id);
         }
         self.id_registry
             .remember_length(id, meta.duration, LengthSource::Deezer);
@@ -628,6 +631,13 @@ impl Inner {
     /// Nothing is kept for a video the song refuses.
     fn keep_video(&self, song_id: &str, hit: &YouTubeHit, background: bool) -> Option<i32> {
         let d = hit.duration.filter(|&d| d > 0)?;
+        // A song whose version a person chose keeps its video and the length it has.
+        if self
+            .lookup(song_id)
+            .is_some_and(|routing| self.id_registry.pin_guarded(&routing.snapshot()))
+        {
+            return None;
+        }
         if self
             .lookup(song_id)
             .is_some_and(|r| r.lock().refuses_video(&hit.video_id))
@@ -638,6 +648,7 @@ impl Inner {
             self.id_registry.remember_pick(song_id, &hit.video_id, hit.pick);
             if let Some(routing) = self.lookup(song_id) {
                 routing.lock().duration = Some(d);
+                self.id_registry.mark_changed(song_id);
             }
         } else if background && self.lookup(song_id).is_some() {
             return None;
@@ -706,6 +717,7 @@ impl Inner {
         self.id_registry.remember_pick(id, &hit.video_id, hit.pick);
         if let Some(d) = hit.duration {
             routing.lock().duration = Some(d);
+            self.id_registry.mark_changed(id);
         }
         self.id_registry
             .remember_length(id, hit.duration, LengthSource::Video);
@@ -1392,6 +1404,11 @@ impl IMusicMetadataService for SoulseekMetadataService {
         self.inner
             .id_registry
             .remember_length(external_id, Some(seconds), LengthSource::File);
+    }
+
+    fn song_video(&self, external_id: &str) -> Option<String> {
+        let routing = self.inner.id_registry.resolve_song(external_id, false)?;
+        self.inner.id_registry.song_video(&routing.snapshot())
     }
 
     fn complete_song_lengths(&self, songs: &mut [Song]) {

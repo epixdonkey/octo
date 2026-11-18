@@ -137,6 +137,9 @@ pub const REST_ENDPOINTS: &[(&str, EndpointClass)] = &[
     ("getLibraryTrash", Read),
     ("getLyricsCandidates", Read),
     ("getStationSongs", Read),
+    // octoStreamVersions and octoStreamVersionChanges; setStreamVersion checks the caller's role.
+    ("getStreamVersionChanges", Read),
+    ("getStreamVersions", Read),
     ("getPlace", Read),
     ("getAnimatedArt", Read),
     ("getTopChart", Read),
@@ -152,6 +155,7 @@ pub const REST_ENDPOINTS: &[(&str, EndpointClass)] = &[
     ("pinChartCountry", Read),
     ("setChartCountry", Read),
     ("setLyricsChoice", LibraryWrite),
+    ("setStreamVersion", LibraryWrite),
     ("testPing", Read),
     // Octo Family (`octoFamily`): each checks the caller's own rights.
     ("getFamily", Read),
@@ -173,6 +177,11 @@ pub const REST_ENDPOINTS: &[(&str, EndpointClass)] = &[
     ("decideFamilySignIn", Read),
     ("putFamilySignInBox", Read),
     ("getFamilySignInRedeem", Read),
+    // Playlist folders (`octoPlaylistFolders`): each reads or changes only the caller's own.
+    ("getPlaylistFolders", Read),
+    ("savePlaylistFolder", Read),
+    ("deletePlaylistFolder", Read),
+    ("setPlaylistFolder", Read),
 ];
 
 /// The `/rest` endpoint a path names (`/rest/getAlbum.view` is `getAlbum`), or None for any
@@ -405,6 +414,39 @@ mod tests {
     }
 
     #[test]
+    fn playlist_folder_endpoints_are_reads_even_for_strict_callers() {
+        for name in [
+            "getPlaylistFolders",
+            "savePlaylistFolder",
+            "deletePlaylistFolder",
+            "setPlaylistFolder",
+        ] {
+            assert_eq!(rest_class(name), Some(Read), "{name}");
+            assert_eq!(
+                classify_for(&format!("/rest/{name}.view"), &Method::POST, true),
+                Read,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_version_endpoints_keep_their_classes_for_strict_callers() {
+        for (name, class) in [
+            ("getStreamVersions", Read),
+            ("getStreamVersionChanges", Read),
+            ("setStreamVersion", LibraryWrite),
+        ] {
+            assert_eq!(rest_class(name), Some(class), "{name}");
+            assert_eq!(
+                classify_for(&format!("/rest/{name}.view"), &Method::GET, true),
+                class,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn library_writes_are_library_writes() {
         for name in [
             "star",
@@ -416,6 +458,7 @@ mod tests {
             "setLyricsChoice",
             "findSongs",
             "keepAcquisitionAnyway",
+            "setStreamVersion",
         ] {
             assert_eq!(rest_class(name), Some(LibraryWrite), "{name}");
         }

@@ -22,6 +22,7 @@ use super::acquisition_tracker::key_of;
 use super::album_gates::{
     AlbumGate, AlbumGateHold, AlbumGateTrack, AlbumGates, TrackFiling, tracks_wait_line,
 };
+use super::listening_plays::ListeningPlays;
 use super::soulseek_hold_store::{HeldAlbumTrack, HeldLidarrFile, Holder};
 use super::{
     AcquisitionHeld, AcquisitionState, AcquisitionTarget, AcquisitionTracker, HeldAcquisition, HeldFiles,
@@ -414,6 +415,42 @@ pub struct HeartAcquisitionCoordinator {
     // For each hold filed while Deezer was answering, how many times Deezer had answered again
     // then: one that answered since runs it once more, and no more until it answers again.
     deezer_seen: Mutex<HashMap<String, u64>>,
+
+    // Plays whose download waits until they have played DownloadOnPlayAfterSeconds.
+    listening: Arc<ListeningPlays>,
+
+    // The song chains running now, each under a number of its own, which choosing a song's
+    // version asks whether a person's own download of it runs.
+    chains: Mutex<HashMap<u64, RunningChain>>,
+    next_chain: std::sync::atomic::AtomicU64,
+}
+
+/// A song chain that runs now: the song's id, the people it runs for and why it runs.
+struct RunningChain {
+    external_id: String,
+    users: Vec<String>,
+    origin: AcquisitionOrigin,
+}
+
+/// Takes a running chain off the list when it ends, however it ends.
+pub(crate) struct ChainRun<'a> {
+    chains: &'a Mutex<HashMap<u64, RunningChain>>,
+    id: u64,
+}
+
+impl Drop for ChainRun<'_> {
+    fn drop(&mut self) {
+        self.chains.lock().remove(&self.id);
+    }
+}
+
+/// Which of a play's acquisitions start now. A play waiting to be listened to hands its album to
+/// Lidarr at once and starts its download once the wait ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayParts {
+    Both,
+    LidarrOnly,
+    DownloadOnly,
 }
 
 /// How long the album walk that follows a song heart waits for the hearted song to show in the
@@ -464,7 +501,15 @@ impl HeartAcquisitionCoordinator {
             deezer_turns: Mutex::new(HashMap::new()),
             deezer_events: std::sync::atomic::AtomicU64::new(0),
             deezer_seen: Mutex::new(HashMap::new()),
+            listening: Arc::new(ListeningPlays::default()),
+            chains: Mutex::new(HashMap::new()),
+            next_chain: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The plays waiting to be listened to, which players' other songs and scrobbles end.
+    pub fn listening(&self) -> &Arc<ListeningPlays> {
+        &self.listening
     }
 
     /// Changes how long a song heart's album waits for the hearted song.
@@ -480,7 +525,7 @@ impl HeartAcquisitionCoordinator {
 
     /// Where an import list's song goes for `user`, or the words that say why it may not be
     /// fetched now. A member who must ask first has songs queued only for a list an approver
-    /// said yes to, so theirs go to their own library too.
+    /// said yes to, so theirs go where their approved requests go.
     pub fn import_target(&self, user: &str) -> Result<AcquisitionTarget, String> {
         let Some(family) = self.family.get() else {
             return Ok(AcquisitionTarget::Shared);
@@ -488,9 +533,18 @@ impl HeartAcquisitionCoordinator {
         match family.gate.decide(Some(user)) {
             WriteDecision::Shared => Ok(AcquisitionTarget::Shared),
             WriteDecision::Member(user) => Ok(AcquisitionTarget::Member(user)),
-            WriteDecision::Request { user, full: None } => Ok(AcquisitionTarget::Member(user)),
+            WriteDecision::Request { user, full: None } => Ok(family.gate.request_target(&user)),
             WriteDecision::Request { full: Some(full), .. } => Err(full),
             WriteDecision::Refuse { message, .. } => Err(message),
+        }
+    }
+
+    /// Where an approved request of `user`'s lands: their own library, or the shared library
+    /// when their music goes there.
+    pub fn request_target(&self, user: &str) -> AcquisitionTarget {
+        match self.family.get() {
+            Some(family) => family.gate.request_target(user),
+            None => AcquisitionTarget::Member(user.to_string()),
         }
     }
 
@@ -536,7 +590,16 @@ impl HeartAcquisitionCoordinator {
         client_id: Option<&str>,
         owner: Option<&str>,
     ) {
-        self.queue_play_as(provider, external_id, requested_by, client_id, owner, false, None);
+        self.queue_play_as(
+            provider,
+            external_id,
+            requested_by,
+            client_id,
+            owner,
+            false,
+            None,
+            PlayParts::Both,
+        );
     }
 
     /// [`Self::queue_play`] carrying what this play itself played, which its gate is built from.
@@ -557,12 +620,96 @@ impl HeartAcquisitionCoordinator {
             owner,
             false,
             heard,
+            PlayParts::Both,
         );
+    }
+
+    /// [`Self::queue_play_heard`] from `player` ([`ListeningPlays::player_key`]). The play is a
+    /// new song on that player, which ends the wait of the song it played before. With
+    /// DownloadOnPlayAfterSeconds set, its download waits until it has played that long (half
+    /// the song at most, when its length is known), and is dropped when the player starts
+    /// another song first or scrobbles a skip; its album goes to Lidarr at once, as always.
+    #[allow(clippy::too_many_arguments)] // the play's facts, who played it and what it played
+    pub fn queue_play_from(
+        self: &Arc<Self>,
+        player: &str,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        client_id: Option<&str>,
+        owner: Option<&str>,
+        heard: Option<HeardRecord>,
+    ) {
+        let song = client_id.unwrap_or(external_id).to_string();
+        self.listening.started(player, &song);
+        let settings = self.settings.current().subsonic.clone();
+        let wait = settings
+            .download_on_play_wait()
+            .filter(|_| !settings.wait_for_lossless_on_play && !player.trim().is_empty());
+        let Some(wait) = wait else {
+            self.queue_play_heard(provider, external_id, requested_by, client_id, owner, heard);
+            return;
+        };
+        let wait = self.listening_wait(external_id, wait);
+        self.queue_play_as(
+            provider,
+            external_id,
+            requested_by,
+            client_id,
+            owner,
+            false,
+            heard.clone(),
+            PlayParts::LidarrOnly,
+        );
+        let Some(ticket) = self.listening.hold(player, &song, wait) else {
+            return;
+        };
+        info!(
+            "Download on play: {provider}:{external_id} downloads once it has played {} s",
+            wait.as_secs()
+        );
+        let coordinator = Arc::clone(self);
+        let (provider, external_id, requested_by) = owned3(provider, external_id, requested_by);
+        let (client_id, owner) = (client_id.map(str::to_string), owner.map(str::to_string));
+        tokio::spawn(async move {
+            if !ticket.listened().await {
+                return;
+            }
+            info!("Download on play: {provider}:{external_id} was listened to; its download starts");
+            coordinator.queue_play_as(
+                &provider,
+                &external_id,
+                requested_by.as_deref(),
+                client_id.as_deref(),
+                owner.as_deref(),
+                false,
+                heard,
+                PlayParts::DownloadOnly,
+            );
+        });
+    }
+
+    /// How long a play waits to be listened to: `wait`, or half the song when that is shorter
+    /// (at least a second), so a short song played through counts before the player opens the
+    /// next one.
+    fn listening_wait(&self, external_id: &str, wait: Duration) -> Duration {
+        let length = self
+            .extras
+            .id_registry
+            .as_ref()
+            .and_then(|registry| registry.lookup(external_id))
+            .and_then(|routing| routing.snapshot().duration)
+            .filter(|seconds| *seconds > 0);
+        match length {
+            Some(seconds) => wait.min(Duration::from_secs((seconds as u64 / 2).max(1))),
+            None => wait,
+        }
     }
 
     /// A song coming up next, queued with DownloadOnPlay on as the play it will be, only
     /// earlier. Unlike a play under way, it is queued with Wait for lossless on play on too,
-    /// since that waits only for the song playing.
+    /// since that waits only for the song playing. Never while DownloadOnPlayAfterSeconds is set:
+    /// a song is downloaded only once it has been listened to.
     pub fn queue_play_ahead(
         self: &Arc<Self>,
         provider: &str,
@@ -571,7 +718,16 @@ impl HeartAcquisitionCoordinator {
         client_id: Option<&str>,
         owner: Option<&str>,
     ) {
-        self.queue_play_as(provider, external_id, requested_by, client_id, owner, true, None);
+        self.queue_play_as(
+            provider,
+            external_id,
+            requested_by,
+            client_id,
+            owner,
+            true,
+            None,
+            PlayParts::Both,
+        );
     }
 
     #[allow(clippy::too_many_arguments)] // the play's facts and what it played
@@ -584,10 +740,11 @@ impl HeartAcquisitionCoordinator {
         owner: Option<&str>,
         ahead: bool,
         heard: Option<HeardRecord>,
+        parts: PlayParts,
     ) {
         let settings = self.settings.current().subsonic.clone();
-        // A family member's play keeps a copy only when they may add songs at once, and then in
-        // their own library; `owner` is who signed in. Everyone else plays as always.
+        // A family member's play keeps a copy only when they may add songs at once, and then where
+        // their music goes; `owner` is who signed in. Everyone else plays as always.
         let target = match self.family.get() {
             Some(family) => match family.gate.play_target(owner) {
                 Some(target) => target,
@@ -603,18 +760,27 @@ impl HeartAcquisitionCoordinator {
             );
             return;
         }
-        // WaitForLosslessOnPlay acquires the track itself, from its own source.
-        let download = settings.download_on_play && (ahead || !settings.wait_for_lossless_on_play);
+        // WaitForLosslessOnPlay acquires the track itself, from its own source. A song coming up
+        // is never downloaded early while a play must be listened to first.
+        let download = parts != PlayParts::LidarrOnly
+            && if ahead {
+                settings.download_on_play_at_start()
+            } else {
+                settings.download_on_play && !settings.wait_for_lossless_on_play
+            };
         let source = self.play_source().filter(|_| download);
         // Lidarr adds whole albums to the shared library, never to a member's own, once per song.
         let lidarr_key = format!("{provider}:{external_id}");
-        let lidarr = settings.lidarr_album_on_play && target == AcquisitionTarget::Shared && {
-            let mut plays = self.lidarr_plays.lock();
-            if plays.len() >= Self::LIDARR_PLAY_MEMORY {
-                plays.clear();
-            }
-            plays.insert(lidarr_key.clone())
-        };
+        let lidarr = parts != PlayParts::DownloadOnly
+            && settings.lidarr_album_on_play
+            && target == AcquisitionTarget::Shared
+            && {
+                let mut plays = self.lidarr_plays.lock();
+                if plays.len() >= Self::LIDARR_PLAY_MEMORY {
+                    plays.clear();
+                }
+                plays.insert(lidarr_key.clone())
+            };
         let holds = self
             .extras
             .soulseek
@@ -1242,9 +1408,10 @@ impl HeartAcquisitionCoordinator {
         }
     }
 
-    /// Every song of an outside album into `user`'s own library, one heart chain each (no
-    /// Lidarr, which fills the shared library), each run for `origin`. With `star`, each song is
-    /// starred for them once it shows in their library. Answers where each song that landed is.
+    /// Every song of an outside album where `user`'s music goes (their own library, or the shared
+    /// one), one heart chain each with no Lidarr, which hands back no file to wait on, each run
+    /// for `origin`. With `star`, each song is starred for them once it shows in their library.
+    /// Answers where each song that landed is.
     pub async fn acquire_album_for_member(
         &self,
         provider: &str,
@@ -1286,12 +1453,16 @@ impl HeartAcquisitionCoordinator {
                 .collect();
             tracker.announce(provider, Some(album_external_id), None, &listed);
         }
+        let target = family.gate.request_target(user);
         info!(
-            "Album '{}' for {user}: {} song(s) into their own library",
+            "Album '{}' for {user}: {} song(s) into {}",
             album.title,
-            tracks.len()
+            tracks.len(),
+            match target {
+                AcquisitionTarget::Shared => "the shared library",
+                AcquisitionTarget::Member(_) => "their own library",
+            }
         );
-        let target = AcquisitionTarget::Member(user.to_string());
         let mut landed = Vec::new();
         // Each song's chain carries the album's gate: its track's own recording, filed by sound.
         let _gate = match self
@@ -1307,7 +1478,7 @@ impl HeartAcquisitionCoordinator {
             let track_provider = song.external_provider.as_deref().unwrap_or(provider);
             let track_id = song.external_id.as_deref().unwrap_or_default();
             match self
-                .acquire_track_outcome(track_provider, track_id, requested_by, None, &target, origin)
+                .acquire_track_waiting(track_provider, track_id, requested_by, None, &target, origin)
                 .await
             {
                 Ok(TrackOutcome::Landed(path) | TrackOutcome::KeptAsHeard(path)) => {
@@ -2348,6 +2519,7 @@ impl HeartAcquisitionCoordinator {
                                 &target,
                                 route_origin(holder, record),
                                 vec![holder.clone()],
+                                true,
                                 held,
                                 &mut filed,
                             )
@@ -2378,6 +2550,7 @@ impl HeartAcquisitionCoordinator {
                         &target,
                         origin,
                         record.holders.clone(),
+                        true,
                         HeldFiles::of(record.held_files.clone(), record.lidarr_files.clone()),
                         &mut filed,
                     )
@@ -2853,6 +3026,104 @@ impl HeartAcquisitionCoordinator {
         }
     }
 
+    /// Whether `user`'s own heart, album heart or request of any of `ids` runs now: its gate holds
+    /// what they heard before, and landed it is a library file.
+    pub fn running_own(&self, ids: &[String], user: &str) -> bool {
+        let user = user.trim();
+        if user.is_empty() {
+            return false;
+        }
+        self.chains.lock().values().any(|chain| {
+            matches!(
+                chain.origin,
+                AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart | AcquisitionOrigin::Request
+            ) && ids.contains(&chain.external_id)
+                && chain.users.iter().any(|known| eq_ignore_case(known, user))
+        })
+    }
+
+    /// Notes a song chain of `external_id` for `requested_by` and `holders`, run for `origin`,
+    /// for as long as the returned guard lives.
+    pub(crate) fn note_chain(
+        &self,
+        external_id: &str,
+        requested_by: Option<&str>,
+        holders: &[Holder],
+        origin: AcquisitionOrigin,
+    ) -> ChainRun<'_> {
+        let mut users: Vec<String> = Vec::new();
+        for user in holders
+            .iter()
+            .map(|holder| holder.user.trim())
+            .chain(requested_by.map(str::trim))
+        {
+            if !user.is_empty() && !users.iter().any(|known| eq_ignore_case(known, user)) {
+                users.push(user.to_string());
+            }
+        }
+        let id = self.next_chain.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.chains.lock().insert(
+            id,
+            RunningChain {
+                external_id: external_id.to_string(),
+                users,
+                origin,
+            },
+        );
+        ChainRun {
+            chains: &self.chains,
+            id,
+        }
+    }
+
+    /// `user` chose another version of the song whose ids are `ids`: in each of their holds of it,
+    /// the copy their old heard record held is let go first (so it can be deleted and fetched
+    /// again), then the record goes. A hold left without a heard record stands in with the song's
+    /// video, and one waiting on heard audio takes their next play's record as newer. How many
+    /// holds changed.
+    pub fn forget_heard_of_song(&self, ids: &[String], user: &str) -> usize {
+        let Some(holds) = self.extras.holds.as_ref() else {
+            return 0;
+        };
+        let user = user.trim();
+        let mut changed = 0;
+        for record in holds.snapshot() {
+            if record.kind != HeldKind::Track {
+                continue;
+            }
+            let of_song = ids.contains(&record.external_id)
+                || record
+                    .album_track
+                    .as_ref()
+                    .is_some_and(|track| track.song_ids.iter().any(|id| ids.contains(id)));
+            if !of_song {
+                continue;
+            }
+            let Some(old) = record
+                .holders
+                .iter()
+                .find(|holder| eq_ignore_case(holder.user.trim(), user))
+                .and_then(|holder| holder.heard.as_ref())
+            else {
+                continue;
+            };
+            if let Some(heard) = &self.extras.heard {
+                heard.release_heard(&old.source, &record.copy_holder_id(user));
+            }
+            holds.update(&record.key(), |kept| {
+                if let Some(holder) = kept
+                    .holders
+                    .iter_mut()
+                    .find(|holder| eq_ignore_case(holder.user.trim(), user))
+                {
+                    holder.heard = None;
+                }
+            });
+            changed += 1;
+        }
+        changed
+    }
+
     /// `user` took their heart of the song back: they leave every hold of the song it keeps them
     /// in, whatever it waits for (a hearted album's held track keeps them while their heart of the
     /// album does), and each hold nobody is left in ends, its files with it. Once nothing of the
@@ -3132,6 +3403,53 @@ impl HeartAcquisitionCoordinator {
         target: &AcquisitionTarget,
         origin: AcquisitionOrigin,
     ) -> anyhow::Result<TrackOutcome> {
+        self.acquire_track_via(
+            provider,
+            external_id,
+            requested_by,
+            held_since_utc,
+            target,
+            origin,
+            true,
+        )
+        .await
+    }
+
+    /// [`Self::acquire_track_outcome`] for a caller that waits for the file (an approved request,
+    /// an album fetched for one member): Lidarr is skipped even into the shared library, since
+    /// it hands back no file.
+    pub async fn acquire_track_waiting(
+        &self,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        held_since_utc: Option<DateTime<Utc>>,
+        target: &AcquisitionTarget,
+        origin: AcquisitionOrigin,
+    ) -> anyhow::Result<TrackOutcome> {
+        self.acquire_track_via(
+            provider,
+            external_id,
+            requested_by,
+            held_since_utc,
+            target,
+            origin,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // the chain's facts and whether Lidarr may take the song
+    async fn acquire_track_via(
+        &self,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        held_since_utc: Option<DateTime<Utc>>,
+        target: &AcquisitionTarget,
+        origin: AcquisitionOrigin,
+        lidarr: bool,
+    ) -> anyhow::Result<TrackOutcome> {
         // A heart of a song is one of the events its kept-as-heard files are checked again on, and
         // a Lidarr follow of it reads whether its download moved.
         if matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart) {
@@ -3155,6 +3473,7 @@ impl HeartAcquisitionCoordinator {
             target,
             origin,
             holders,
+            lidarr,
             HeldFiles::default(),
             &mut Vec::new(),
         )
@@ -3765,12 +4084,14 @@ impl HeartAcquisitionCoordinator {
         target: &AcquisitionTarget,
         origin: AcquisitionOrigin,
         holders: Vec<Holder>,
+        lidarr: bool,
         mut held: HeldFiles,
         filed: &mut Vec<(String, String)>,
     ) -> anyhow::Result<TrackOutcome> {
         // What each person heard is kept for as long as the chain runs, from before their gate is
         // built: no sweep takes the copy or the sample its checks compare with.
         let _heard = self.hold_while_running(provider, external_id, &holders, false);
+        let _running = self.note_chain(external_id, requested_by, &holders, origin);
         let scope = match target {
             AcquisitionTarget::Shared => LibraryScope::Shared,
             AcquisitionTarget::Member(user) => LibraryScope::Viewer(user.clone()),
@@ -3915,7 +4236,9 @@ impl HeartAcquisitionCoordinator {
         let steps: Vec<HeartDownloadSource> = self
             .enabled_steps(false)
             .into_iter()
-            .filter(|step| *target == AcquisitionTarget::Shared || *step != HeartDownloadSource::Lidarr)
+            .filter(|step| {
+                *step != HeartDownloadSource::Lidarr || (lidarr && *target == AcquisitionTarget::Shared)
+            })
             .collect();
         // A file one of these gates could not tell apart from another version was passed over.
         let mut undecided = false;

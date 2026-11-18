@@ -88,7 +88,9 @@ use crate::services::common::{
 use crate::services::cover_art::DownloadCoverResolver;
 use crate::services::family::FamilyPlacement;
 use crate::services::fingerprint::MusicBrainzClient;
-use crate::services::i_download_service::{Ahead, AudioStream, DirectStreamInfo, IDownloadService};
+use crate::services::i_download_service::{
+    Ahead, AudioStream, DirectStreamInfo, IDownloadService, StreamPlay,
+};
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::last_fm::LastFmService;
 use crate::services::library::library_write_gate::LibraryWriteGate;
@@ -119,6 +121,8 @@ pub struct RequestedIdentity {
     pub album_pick: Arc<OnceLock<(String, String)>>,
     /// The download's layout and root, read once before identify.
     pub placing: Arc<OnceLock<Placing>>,
+    /// The id the download was asked for by (the backend's own track id); empty when unknown.
+    pub track_id: String,
 }
 
 impl RequestedIdentity {
@@ -130,6 +134,7 @@ impl RequestedIdentity {
             track,
             album_pick: Arc::default(),
             placing: Arc::default(),
+            track_id: String::new(),
         }
     }
 }
@@ -256,6 +261,7 @@ pub trait DownloadBackend: Send + Sync + 'static {
         _external_provider: &str,
         _external_id: &str,
         _range_header: Option<&str>,
+        _play: Option<&StreamPlay>,
         _cancellation_token: &CancellationToken,
     ) -> anyhow::Result<Option<DirectStreamInfo>> {
         Ok(None)
@@ -280,6 +286,14 @@ pub trait DownloadBackend: Send + Sync + 'static {
     /// before its turn comes. Ids are a pure hash of the routing fields, so re-registering the
     /// SAME fields restores the SAME id and is idempotent.
     fn ensure_routing_registered(&self, _track: &Song) {}
+
+    /// The catalog's ids of the albums the song `external_id` was played or listed from that
+    /// carry the name `album`, the most recent play first, then the most recent listing, then
+    /// the album its routing was made from (whose name is not known here). The default knows
+    /// none.
+    fn listed_album_ids(&self, _external_id: &str, _album: &str) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Queue what an album walk can take from one place in one go, before the walk starts, and
     /// say which tracks that covers. Each of those tracks still goes through its own download,
@@ -429,6 +443,9 @@ pub struct DownloadServices {
     /// The gates of the album chains that run now: a walk of a hearted album files each track by
     /// its own sound against its own recording.
     pub album_gates: Option<Arc<AlbumGates>>,
+    /// What each outside song plays from: a song fetched ahead is taken only when it is the
+    /// version chosen for the song.
+    pub id_registry: Option<Arc<crate::services::soulseek::ExternalIdRegistry>>,
 }
 
 /// Everything a single download is asked with beyond its provider and id: the optional
@@ -1446,7 +1463,10 @@ impl BaseDownloadService {
 
         // Snapshot before anything can correct it: with NameFromMatch off this is still what
         // names the file, which is how every existing library was built.
-        let requested = RequestedIdentity::new(&song.artist, &song.title, &song.album, song.track);
+        let requested = RequestedIdentity {
+            track_id: external_id.to_string(),
+            ..RequestedIdentity::new(&song.artist, &song.title, &song.album, song.track)
+        };
         self.start_album_pick(&song, &requested);
 
         // A song fetched ahead earlier is taken from its folder instead of downloaded again, with
@@ -1459,7 +1479,7 @@ impl BaseDownloadService {
         {
             None
         } else {
-            self.promote_ahead(external_provider, external_id, &mut song)
+            self.promote_ahead(external_provider, external_id, &mut song, &options.place)
         };
 
         // A heart's or a play's gates judge a song fetched ahead before it is kept; one they pass
@@ -2034,12 +2054,15 @@ impl BaseDownloadService {
     /// Takes a song fetched ahead into a staging folder of its own under the incoming folder (a
     /// copy, when the song is playing now), and gives the song back what its download learned.
     /// The staged path and the source that brought it, or None when there is no such song (or
-    /// it could not be taken, and the song is downloaded as usual).
+    /// it could not be taken, and the song is downloaded as usual). While a person's pick stands
+    /// for the song, a copy judged against another video is not taken (and goes), unless one of
+    /// `place`'s gates heard that very copy.
     fn promote_ahead(
         &self,
         external_provider: &str,
         external_id: &str,
         song: &mut Song,
+        place: &AcquisitionPlace,
     ) -> Option<(String, Option<String>, HeardSource)> {
         let prefetched = self.services.prefetched.as_ref()?;
         if !prefetched.has(external_provider, external_id) {
@@ -2061,6 +2084,33 @@ impl BaseDownloadService {
             let _ = std::fs::remove_dir(&staging);
             return None;
         };
+        // The copy's own identity, as a heard copy of it is recorded: the same entry under the same
+        // key, made ready from the same file.
+        let identity = HeardSource::Copy {
+            key: format!("{external_provider}:{external_id}"),
+            ready_at: taken.sidecar.ready_at,
+            source_file: taken.sidecar.source_file.clone(),
+        };
+        let heard_it = place
+            .gates
+            .iter()
+            .any(|gate| gate.heard.as_ref().is_some_and(|heard| heard.source == identity));
+        if !heard_it
+            && let Some(registry) = &self.services.id_registry
+            && crate::services::you_tube::stream_versions::copy_is_another_version(
+                registry,
+                external_id,
+                taken.sidecar.judged_video.as_deref(),
+            )
+        {
+            info!(
+                "'{} - {}' was downloaded ahead as another version than the one chosen; downloading the chosen one",
+                song.artist, song.title
+            );
+            let _ = std::fs::remove_file(&taken.path);
+            let _ = std::fs::remove_dir(&staging);
+            return None;
+        }
         song.transcoded_from = taken.sidecar.transcoded_from.clone();
         song.source_peer = taken.sidecar.source_peer.clone().or(song.source_peer.take());
         song.source_file = taken.sidecar.source_file.clone().or(song.source_file.take());
@@ -2078,13 +2128,6 @@ impl BaseDownloadService {
                 None,
             )
         });
-        // The copy's own identity, as a heard copy of it is recorded: the same entry under the same
-        // key, made ready from the same file.
-        let identity = HeardSource::Copy {
-            key: format!("{external_provider}:{external_id}"),
-            ready_at: taken.sidecar.ready_at,
-            source_file: taken.sidecar.source_file.clone(),
-        };
         Some((
             taken.path.to_string_lossy().into_owned(),
             taken.sidecar.fetched_from.clone(),
@@ -2114,6 +2157,9 @@ impl BaseDownloadService {
         }
         let sidecar = AheadSidecar {
             video_id: fetched_video.map(str::to_string),
+            // The song's video as its identity was checked now: a person's choice is served only
+            // from a copy judged against it.
+            judged_video: self.metadata.song_video(external_id),
             ..AheadSidecar::of(
                 external_provider,
                 external_id,
@@ -3268,6 +3314,7 @@ impl IDownloadService for BaseDownloadService {
         external_provider: &str,
         external_id: &str,
         range_header: Option<&str>,
+        play: Option<&StreamPlay>,
         cancellation_token: &CancellationToken,
     ) -> anyhow::Result<Option<DirectStreamInfo>> {
         self.backend
@@ -3276,6 +3323,7 @@ impl IDownloadService for BaseDownloadService {
                 external_provider,
                 external_id,
                 range_header,
+                play,
                 cancellation_token,
             )
             .await

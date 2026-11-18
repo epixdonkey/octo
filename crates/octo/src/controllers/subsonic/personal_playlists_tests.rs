@@ -868,10 +868,10 @@ async fn a_purely_local_replacement_on_a_plain_playlist_is_navidromes_own() {
     assert!(t.nothing_downloads());
 }
 
-/// The same replacement with a registry id among the rows is the overlay's: Navidrome would
-/// refuse that id whole (Fakt A1), so the playlist is adopted — its own local row kept first,
-/// the mixed list stored, the local half mirrored alone — and the answer is the overlay's own
-/// detail row, while the PUT itself never reaches Navidrome.
+/// Fork: the overlay no longer adopts a plain playlist on a registry id — that takeover is the
+/// held routes' (upstream 2026.11.15). The overlay's own mixed path starts at a create and is
+/// covered by the mixed-create tests.
+#[ignore = "fork: a registry id on a plain playlist is the held routes' to take over"]
 #[tokio::test]
 async fn a_replacement_carrying_a_registry_id_adopts_the_plain_playlist() {
     let t = PersonalApp::new_with_a_plain_playlist().await;
@@ -1163,9 +1163,9 @@ async fn taking_a_position_off_the_flac_playlist_queues_no_fetch() {
 
 /// A FLAC-named playlist that is not the caller's own never reaches the fetch queue (O2): the
 /// fetch is a download into the shared library, so the branch is the playlist owner's alone.
-/// Someone else's FLAC-named playlist (public playlists can be read by any account) and a row
-/// that names no owner at all are ordinary edits — relayed to Navidrome as they came, nothing
-/// fetched, nothing emptied.
+/// What an outside add to such a playlist answers is the held routes' to say now (upstream
+/// 2026.11.15): a named owner's playlist refuses anyone else, an ownerless row's answer is
+/// theirs too. Both ways, nothing is fetched and the FLAC branch never empties the list.
 #[tokio::test]
 async fn someone_elses_flac_playlist_is_an_ordinary_edit() {
     let t = PersonalApp::new().await;
@@ -1191,29 +1191,23 @@ async fn someone_elses_flac_playlist_is_an_ordinary_edit() {
             ),
         )
         .await;
+        // Upstream's own rule (their t19): an outside add takes a playlist only from its
+        // owner — a named owner's or an ownerless row's, measured alike.
         assert_eq!(
-            reply.envelope()["status"],
-            "ok",
+            reply.envelope()["error"]["code"],
+            50,
+            "owner '{row_owner}': {}",
+            reply.text()
+        );
+        assert_eq!(
+            reply.envelope()["error"]["message"],
+            "Only the playlist's owner can change it.",
             "owner '{row_owner}': {}",
             reply.text()
         );
         assert!(
             t.nothing_downloads(),
             "owner '{row_owner}': no fetch for a playlist that is not the caller's own"
-        );
-        // The client's own add was relayed for Navidrome to do — the intercepted branch would
-        // have answered without a relay and emptied the playlist instead.
-        assert!(
-            t.navidrome
-                .received_requests()
-                .await
-                .unwrap_or_default()
-                .iter()
-                .any(|request| {
-                    request.url.path().ends_with("/rest/updatePlaylist")
-                        && request.url.query_pairs().any(|(key, _)| key == "songIdToAdd")
-                }),
-            "owner '{row_owner}': the add is Navidrome's to do"
         );
     }
 }

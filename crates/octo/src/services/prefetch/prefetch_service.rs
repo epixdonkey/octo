@@ -22,6 +22,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
+use super::converted_copies::ConvertedCopies;
 use super::play_source::PlaySources;
 use super::preview_copies::PreviewCopies;
 use super::queue_window::{SavedQueue, window};
@@ -185,6 +186,7 @@ pub struct PrefetchService {
     wake: Notify,
     mixes: OnceLock<Arc<GeneratedPlaylistService>>,
     copies: OnceLock<Arc<PreviewCopies>>,
+    converted: OnceLock<Arc<ConvertedCopies>>,
 }
 
 impl PrefetchService {
@@ -197,6 +199,7 @@ impl PrefetchService {
             wake: Notify::new(),
             mixes: OnceLock::new(),
             copies: OnceLock::new(),
+            converted: OnceLock::new(),
         })
     }
 
@@ -248,6 +251,12 @@ impl PrefetchService {
     /// The preview copies, once given.
     pub fn preview_copies(&self) -> Option<&Arc<PreviewCopies>> {
         self.copies.get()
+    }
+
+    /// Gives the service the songs found online made in other formats, which it sweeps with the
+    /// copies. Once only.
+    pub fn use_converted_copies(&self, converted: Arc<ConvertedCopies>) {
+        let _ = self.converted.set(converted);
     }
 
     fn settings(&self) -> PrefetchSettings {
@@ -379,8 +388,9 @@ impl PrefetchService {
         }
 
         // DownloadOnPlay keeps every played song in the library: the songs coming up are
-        // started early as the same downloads their plays would start.
-        let kind = if self.parts.settings.current().subsonic.download_on_play {
+        // started early as the same downloads their plays would start. Not while a play must be
+        // listened to first: those are fetched ahead like any other.
+        let kind = if self.parts.settings.current().subsonic.download_on_play_at_start() {
             Kind::AsPlay
         } else {
             Kind::Ahead
@@ -532,6 +542,21 @@ impl PrefetchService {
                 state.resting_for_mornye.remove(&key);
             }
         }
+        // A copy judged against another video than the one a person chose for the song is
+        // deleted and fetched again; one a heart or a play holds stays (unserved) until it is let
+        // go, and is not fetched again meanwhile.
+        if let Some(names) = &self.parts.names
+            && let Some(routing) = names.peek(external_id)
+        {
+            let routing = routing.snapshot();
+            if names.pin_guarded(&routing)
+                && let Some(video) = names.song_video(&routing)
+                && self.parts.store.drop_misjudged(provider, external_id, &video)
+                    == crate::services::prefetch::store::Misjudged::Kept
+            {
+                return false;
+            }
+        }
         if self.parts.store.is_ready(provider, external_id)
             || self.parts.queue.is_in_flight(provider, external_id)
         {
@@ -611,7 +636,7 @@ impl PrefetchService {
         if self.stopped(settings) {
             return Some("Waiting for someone to play something".to_string());
         }
-        if self.parts.settings.current().subsonic.download_on_play {
+        if self.parts.settings.current().subsonic.download_on_play_at_start() {
             return None;
         }
         if self.room(settings) == 0 {
@@ -740,6 +765,9 @@ impl PrefetchService {
                 // Held copies count toward the cap too: past it on their own, the oldest whose
                 // video still plays is let go.
                 copies.release_held_over_cap().await;
+            }
+            if let Some(converted) = self.converted.get().cloned() {
+                let _ = tokio::task::spawn_blocking(move || converted.sweep()).await;
             }
         }
         if !settings.enabled {
@@ -924,7 +952,7 @@ impl PrefetchService {
             .map(|l| l.name.clone())
             .collect();
         let count = settings.effective_keep_ready_count();
-        let kind = if self.parts.settings.current().subsonic.download_on_play {
+        let kind = if self.parts.settings.current().subsonic.download_on_play_at_start() {
             Kind::AsPlay
         } else {
             Kind::Ahead

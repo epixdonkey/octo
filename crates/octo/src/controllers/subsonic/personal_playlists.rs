@@ -498,31 +498,6 @@ async fn mirror_local_ids(
         .await;
 }
 
-/// Adopts a playlist Navidrome holds and the overlay does not: its rows become local positions,
-/// so a mixed mutation on a plain playlist keeps everything it already had. `None` when
-/// Navidrome cannot be asked.
-async fn adopt(state: &AppState, id: &str) -> Option<PersonalPlaylist> {
-    let rows = state.navidrome_playlist_api.list_playlists().await;
-    let row = rows.iter().find(|row| row.id == id)?;
-    let mut entries = Vec::new();
-    for track in state.navidrome_playlist_api.list_tracks(id).await {
-        entries.push(PersonalPlaylistEntry {
-            occurrence_id: new_occurrence_id(),
-            library_id: Some(track.media_file_id),
-            ..Default::default()
-        });
-    }
-    let (base_name, _base_comment, folder) = take_folder(Some(&row.name), None);
-    Some(PersonalPlaylist {
-        id: id.to_string(),
-        owner: row.owner.clone(),
-        name: base_name.unwrap_or_else(|| row.name.clone()),
-        folder,
-        entries,
-        ..Default::default()
-    })
-}
-
 /// The playlist rows of a `getPlaylists` answer with the counts the overlay holds — not the
 /// local-only mirror's. `None` when the body is not one this reads, or nothing was corrected.
 pub(crate) fn correct_playlist_rows(state: &AppState, body: &[u8], format: &str) -> Option<Vec<u8>> {
@@ -698,9 +673,8 @@ fn playlist_fields(
 }
 
 /// The REST mutations (`createPlaylist`, `updatePlaylist`, `deletePlaylist`) for a playlist the
-/// overlay holds — and for a plain one the moment a client puts an outside id on it (the overlay
-/// adopts the playlist first). `None` when the call is none of the overlay's business: a plain
-/// passthrough.
+/// overlay holds. `None` when the call is none of the overlay's business — a playlist it never
+/// held is the held routes' to take over (upstream 2026.11.15), not the overlay's to adopt.
 pub(crate) async fn rest_mutate(
     state: &AppState,
     call: &SubsonicCall,
@@ -715,19 +689,12 @@ pub(crate) async fn rest_mutate(
         .into_iter()
         .chain(song_ids(call, "songIdToAdd"))
         .collect();
-    let mixed = || adding.iter().any(|id| state.local_library.parse_song_id(id).0);
     if endpoint.eq_ignore_ascii_case("createPlaylist") {
         return rest_create(state, call, playlist_id, &adding, failure).await;
     }
     let known = state.personal_playlists.knows(playlist_id);
-    if !known && !mixed() {
-        return None;
-    }
     if !known {
-        // Two parallel mixed edits can both adopt the playlist; the first adoption stands and
-        // every edit lands on it through the store's own atomic edit (O3).
-        let adopted = adopt(state, playlist_id).await?;
-        state.personal_playlists.insert_if_absent(adopted);
+        return None;
     }
 
     if endpoint.eq_ignore_ascii_case("deletePlaylist") {
@@ -841,14 +808,10 @@ async fn rest_create(
         playlist
     } else {
         let known = state.personal_playlists.knows(playlist_id);
-        if !known && !mixed {
-            return None;
-        }
         if !known {
-            // Insert-if-absent, so a parallel adoption's playlist stands and this replace
-            // lands on it (O3).
-            let adopted = adopt(state, playlist_id).await?;
-            state.personal_playlists.insert_if_absent(adopted);
+            // A playlist the overlay never held is the held routes' to take over, not the
+            // overlay's to adopt (upstream 2026.11.15).
+            return None;
         }
         let (playlist, ()) = state
             .personal_playlists
@@ -936,37 +899,16 @@ pub(crate) async fn answer_native(
     if !known && is_get {
         return Ok(None);
     }
-    // The gate is the create's own, symmetric: the overlay takes a plain playlist over only
-    // when the body really carries a registry id — the one thing Navidrome would refuse whole
-    // (Fakt A1). A purely local body, a `tracks` row list or not, is an ordinary edit:
-    // Navidrome's own to do, a faithful passthrough — so the 403 of an unreachable adoption
-    // never stands between a client and an edit Navidrome could have made.
-    let mut carried = ids.iter().chain(track_ids.iter());
-    let carries_a_registry_id = carried.any(|id| state.local_library.parse_song_id(id).0);
-    if !known && !carries_a_registry_id {
+    // The gate is the create's own, symmetric: the overlay answers only a playlist it holds.
+    // One it never held — an ordinary edit Navidrome could make, or an outside add that would
+    // take it over — is the held routes' (upstream 2026.11.15), never the overlay's to adopt.
+    if !known {
         return Ok(None);
     }
-    let playlist = if known {
-        match state.personal_playlists.find(id) {
-            Some(playlist) => playlist,
-            // Held a moment ago and gone now: nothing to answer from.
-            None => return Ok(Some(native_error(StatusCode::NOT_FOUND, "Playlist not found"))),
-        }
-    } else {
-        // The overlay does not hold it, but the mutation is mixed: adopt first, so nothing the
-        // playlist already had is lost. Insert-if-absent, so a parallel adoption's playlist
-        // stands and every edit below lands on it (O3).
-        let Some(adopted) = adopt(state, id).await else {
-            return Ok(Some(native_error(
-                StatusCode::FORBIDDEN,
-                "Playlist is unavailable",
-            )));
-        };
-        state.personal_playlists.insert_if_absent(adopted);
-        match state.personal_playlists.find(id) {
-            Some(standing) => standing,
-            None => return Ok(Some(native_error(StatusCode::NOT_FOUND, "Playlist not found"))),
-        }
+    let playlist = match state.personal_playlists.find(id) {
+        Some(playlist) => playlist,
+        // Held a moment ago and gone now: nothing to answer from.
+        None => return Ok(Some(native_error(StatusCode::NOT_FOUND, "Playlist not found"))),
     };
     // Every mutation below changes the playlist through the store's one atomic
     // read-modify-write, so parallel requests cannot lose each other's change (O3); the
